@@ -327,7 +327,7 @@ h1 {
 .search {
   width: 100%;
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(160px, 1fr) minmax(118px, .45fr) auto;
+  grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) minmax(96px, .35fr) minmax(128px, .45fr) auto;
   gap: 10px;
   align-items: end;
   padding: 10px;

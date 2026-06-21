@@ -9,7 +9,7 @@
    ============================================================ */
 
 window.ChessChain = class ChessChain {
-  constructor(cache = null) {
+  constructor(cache = null, options = {}) {
     this.API = "https://api.chess.com/pub/player/";
     this._gamesCache = new Map();  // username -> games[]
     this._edgesCache = new Map();  // username -> {beatenByMe, beatMe}
@@ -22,6 +22,9 @@ window.ChessChain = class ChessChain {
     this._cache = cache;           // optional GameCache (IndexedDB)
     this._lastReqTs = 0;           // throttle: min ms between request starts
     this._minSpacing = 120;        // ~8 req/sec sustained, well under the limit
+    this._archiveLimit = Number.isFinite(options.archiveLimit)
+      ? Math.max(1, options.archiveLimit)
+      : Infinity;
   }
 
   /** Acquire a concurrency slot AND enforce min spacing between starts. */
@@ -83,27 +86,45 @@ window.ChessChain = class ChessChain {
     return results;
   }
 
-  /** All standard-chess games for a user (cached in memory + IndexedDB). */
+  _cacheKey(username) {
+    const u = username.toLowerCase();
+    return Number.isFinite(this._archiveLimit)
+      ? `${u}:recent:${this._archiveLimit}`
+      : `${u}:all`;
+  }
+
+  _archiveLabel() {
+    return Number.isFinite(this._archiveLimit)
+      ? `latest ${this._archiveLimit} month${this._archiveLimit === 1 ? "" : "s"}`
+      : "full history";
+  }
+
+  /** Standard-chess games for a user (cached in memory + IndexedDB). */
   async getGames(username) {
     const u = username.toLowerCase();
-    if (this._gamesCache.has(u)) {
+    const cacheKey = this._cacheKey(u);
+    if (this._gamesCache.has(cacheKey)) {
       this.stats.cached++;
-      return this._gamesCache.get(u);
+      return this._gamesCache.get(cacheKey);
     }
     // try persistent (IndexedDB) cache first
     if (this._cache) {
-      const hit = await this._cache.get(u);
+      const hit = await this._cache.get(cacheKey);
       if (hit) {
         this.stats.cached++;
-        this._gamesCache.set(u, hit);
-        this.log(`(already had ${u}'s games saved)`);
+        this._gamesCache.set(cacheKey, hit);
+        this.log(`(already had ${u}'s ${this._archiveLabel()} saved)`);
         return hit;
       }
     }
-    const { archives } = await this.fetchJSON(this.API + u + "/games/archives");
+    const { archives = [] } = await this.fetchJSON(this.API + u + "/games/archives");
+    const selectedArchives = Number.isFinite(this._archiveLimit)
+      ? archives.slice(-this._archiveLimit)
+      : archives;
+    this.log(`reading ${u}'s ${this._archiveLabel()} (${selectedArchives.length}/${archives.length} archives)…`);
     const games = [];
     // fetch archives with throttling to respect rate limits
-    const tasks = archives.map((a) => async () => {
+    const tasks = selectedArchives.map((a) => async () => {
       try { return await this.fetchJSON(a); }
       catch { return { games: [] }; }
     });
@@ -122,8 +143,8 @@ window.ChessChain = class ChessChain {
       }
     }
     this.stats.fetched++;
-    this._gamesCache.set(u, games);
-    if (this._cache) await this._cache.set(u, games); // persist
+    this._gamesCache.set(cacheKey, games);
+    if (this._cache) await this._cache.set(cacheKey, games); // persist
     return games;
   }
 
@@ -172,13 +193,10 @@ window.ChessChain = class ChessChain {
    *
    * @returns { path, hops } or null.
    */
-  async findChain(start, target, maxDepth = 4) {
+  async findChain(start, target, maxDepth = 3) {
     start = start.toLowerCase(); target = target.toLowerCase();
     this.stats = { fetched: 0, apiCalls: 0, cached: 0, depth: 0 };
-
-    // ---- load the two anchor players ----
-    this.log(`reading ${start}'s games…`);
-    await Promise.all([ this.edges(start), this.edges(target) ]);
+    this.log(`starting ${this._archiveLabel()} search…`);
 
     // FORWARD state: nodes reachable from `start` via "beat" edges.
     //   forwardVisited: node -> { prev, hopUrl }  (how we got here)

@@ -14,6 +14,7 @@
   const DATA_BASE = new URL("./data/", document.baseURI).href;
   const LS_KEY = "chess-connections:username";
   const LS_THEME_KEY = "chess-connections:theme";
+  const LS_RANGE_KEY = "chess-connections:range";
 
   const state = {
     chains: null,
@@ -99,6 +100,12 @@
     $("#chain-length").textContent = chain.found ? chain.length : "—";
     renderGraph(chain);
     renderCards(chain);
+  }
+
+  function precomputedChain(start, target) {
+    if (!state.chains?.chains?.length) return null;
+    if ((state.chains.start || "").toLowerCase() !== start) return null;
+    return state.chains.chains.find((c) => c.target.toLowerCase() === target) || null;
   }
 
   // ---------- graph ----------
@@ -393,12 +400,16 @@
   }
 
   // ---------- live search ----------
-  async function runSearch(startRaw, targetRaw, depth) {
+  async function runSearch(startRaw, targetRaw, depth, range) {
     const start = startRaw.trim().toLowerCase();
     const target = targetRaw.trim().toLowerCase();
     const status = $("#search-status");
     const logEl = $("#search-log");
     const btn = $(".search__btn");
+    const archiveLimit = range === "all" ? Infinity : parseInt(range, 10) || 6;
+    const rangeLabel = Number.isFinite(archiveLimit)
+      ? `latest ${archiveLimit} months`
+      : "full history";
 
     if (!start || !target) {
       showStatus("error", "put in both usernames first.");
@@ -411,7 +422,23 @@
 
     // remember the username for next time
     localStorage.setItem(LS_KEY, start);
+    localStorage.setItem(LS_RANGE_KEY, range);
     $("#setting-username").value = start;
+
+    const savedChain = precomputedChain(start, target);
+    if (savedChain) {
+      showStatus("done", `loaded the saved ${savedChain.display || target} chain instantly.`);
+      renderChain({
+        target: savedChain.target,
+        display: savedChain.display || nameOf(savedChain.target),
+        found: savedChain.found,
+        length: savedChain.length,
+        path: savedChain.path,
+        hops: savedChain.hops,
+      });
+      document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+      return;
+    }
 
     btn.disabled = true;
     status.hidden = false;
@@ -420,7 +447,7 @@
     logEl.innerHTML = "";
 
     const cache = new window.GameCache();
-    const engine = new window.ChessChain(cache);
+    const engine = new window.ChessChain(cache, { archiveLimit });
 
     // prominent running log of users scanned + API calls
     let lastScanMsg = "";
@@ -451,7 +478,7 @@
       }
     };
     showStatus("working", "looking up the players…");
-    logLine(`connecting ${start} → ${target}  (up to ${depth} steps deep)`);
+    logLine(`connecting ${start} → ${target}  (${rangeLabel}, up to ${depth} steps deep)`);
 
     try {
       // check both players exist + grab their info for the display
@@ -477,7 +504,9 @@
       if (!result) {
         showStatus("error",
           `no connection found within ${depth} steps. ` +
-          `maybe ${esc(target)} barely ever loses? ` +
+          (Number.isFinite(archiveLimit)
+            ? `Fast mode only checked the ${esc(rangeLabel)}. Try Full slow if you want a deeper crawl. `
+            : "") +
           `(looked through ${engine.stats.fetched} players)`);
         renderChain({
           target, display: targetMeta.name || target,
@@ -645,8 +674,8 @@
 
   $("#search-form").addEventListener("submit", (e) => {
     e.preventDefault();
-    const depth = parseInt($("#search-depth").value, 10) || 4;
-    runSearch($("#search-start").value, $("#search-target").value, depth);
+    const depth = parseInt($("#search-depth").value, 10) || 3;
+    runSearch($("#search-start").value, $("#search-target").value, depth, $("#search-range").value);
   });
 
   document.querySelectorAll(".chip").forEach((chip) => {
@@ -680,6 +709,10 @@
     if (saved) $("#search-start").value = saved;
     const savedDepth = localStorage.getItem(LS_DEPTH_KEY);
     if (savedDepth) $("#search-depth").value = savedDepth;
+    const savedRange = localStorage.getItem(LS_RANGE_KEY);
+    if (savedRange && $("#search-range").querySelector(`option[value="${savedRange}"]`)) {
+      $("#search-range").value = savedRange;
+    }
     loadShowcase();
   });
 })();

@@ -64,9 +64,17 @@
           <div class="search__field search__field--narrow">
             <label for="search-depth">Depth</label>
             <select id="search-depth">
-              <option value="3">3 steps</option>
-              <option value="4" selected>4 steps</option>
+              <option value="3" selected>3 steps</option>
+              <option value="4">4 steps</option>
               <option value="5">5 steps</option>
+            </select>
+          </div>
+          <div class="search__field search__field--range">
+            <label for="search-range">Range</label>
+            <select id="search-range">
+              <option value="6" selected>Recent fast</option>
+              <option value="12">Last year</option>
+              <option value="all">Full slow</option>
             </select>
           </div>
           <button class="search__btn" type="submit">

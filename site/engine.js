@@ -161,138 +161,147 @@ window.ChessChain = class ChessChain {
   }
 
   /**
-   * BFS shortest beaten-chain from `start` to `target`.
+   * Bidirectional BFS shortest beaten-chain from `start` to `target`.
+   *
+   * Forward search (from `start`): follows "X beat Y" edges.
+   * Backward search (from `target`): follows "Y beat target-side" edges,
+   *   i.e. expands the set of players that can reach the target.
+   *
+   * Each iteration we expand whichever frontier is SMALLER, so we do the
+   * least API work. The two searches meet when a node appears in both.
+   *
    * @returns { path, hops } or null.
    */
   async findChain(start, target, maxDepth = 4) {
     start = start.toLowerCase(); target = target.toLowerCase();
     this.stats = { fetched: 0, apiCalls: 0, cached: 0, depth: 0 };
 
-    this.log(`Loading target ${target} (who beat them)…`);
-    const { beatMe: beatTarget } = await this.edges(target);
-    const beatTargetMap = beatTarget;  // opp -> [urls]
-    const beatTargetSet = new Set(beatTarget.keys());
-    this.log(`${beatTargetSet.size} players have beaten ${target}`);
+    // ---- load the two anchor players ----
+    this.log(`Loading ${start} and ${target}…`);
+    await Promise.all([ this.edges(start), this.edges(target) ]);
 
-    this.log(`Loading ${start} (who they've beaten)…`);
-    const { beatenByMe: beatenStart } = await this.edges(start);
-    this.log(`${beatenStart.size} players ${start} has beaten`);
+    // FORWARD state: nodes reachable from `start` via "beat" edges.
+    //   forwardVisited: node -> { prev, hopUrl }  (how we got here)
+    //   forwardFrontier: nodes whose "beatenByMe" we haven't expanded yet
+    const forwardVisited = new Map();
+    forwardVisited.set(start, { prev: null, hopUrl: null });
+    const forwardFrontier = [start];
 
-    // ---- CHEAP SHORTCUTS (no extra fetches) ----
-    // Depth 1: start beat target directly
-    if (beatenStart.has(target)) {
-      this.log(`✓ Found! Direct win: ${start} beat ${target}`);
-      return {
-        path: [start, target],
-        hops: [{ from: start, to: target, url: beatenStart.get(target)[0] }],
-      };
-    }
-    // Depth 2: start beat someone who beat target (already-loaded sets)
-    for (const [opp, urls] of beatenStart) {
-      if (beatTargetSet.has(opp)) {
-        this.log(`✓ Found! Chain length 2 (via ${opp})`);
-        return {
-          path: [start, opp, target],
-          hops: [
-            { from: start, to: opp, url: urls[0] },
-            { from: opp, to: target, url: beatTargetMap.get(opp)[0] },
-          ],
-        };
-      }
-    }
+    // BACKWARD state: nodes that can REACH `target` via "beat" edges
+    //   (i.e. "X beat ... beat target").
+    //   backwardVisited: node -> { next, hopUrl }
+    //   backwardFrontier: nodes whose "beatMe" we haven't expanded yet
+    const backwardVisited = new Map();
+    backwardVisited.set(target, { next: null, hopUrl: null });
+    const backwardFrontier = [target];
 
-    // ---- BFS for depth >= 3 ----
-    // frontier: array of { node, path, hops }
-    let frontier = [{
-      node: start, path: [start], hops: []
-    }];
-    const visited = new Set([start]);
+    const totalVisited = () => forwardVisited.size + backwardVisited.size;
 
     for (let depth = 0; depth < maxDepth; depth++) {
+      this.stats.depth = depth;
+
+      // ---- expand the SMALLER frontier each iteration ----
+      const expandForward = forwardFrontier.length <= backwardFrontier.length;
+      const side = expandForward ? "forward" : "backward";
+      const frontier = expandForward ? forwardFrontier : backwardFrontier;
+      this.log(`Depth ${depth}: ${side} expand ${frontier.length} player(s) ` +
+               `(forward=${forwardVisited.size}, backward=${backwardVisited.size})`);
+
       if (frontier.length === 0) {
-        this.log("No more players to explore.");
+        this.log(`${side} frontier exhausted — no path exists.`);
         break;
       }
-      this.stats.depth = depth;
-      this.log(`Depth ${depth}: expanding ${frontier.length} player(s)…`);
 
-      // load edges for whole frontier with throttling.
-      // Early-exit: as soon as ANY task finds a hit, cancel the rest.
-      let found = null;
-      const tasks = frontier.map((f) => async () => {
-        if (found) return; // short-circuit after a hit
-        const beaten = (await this.edges(f.node)).beatenByMe;
-        if (found) return;
-        // Pass 1 — this node beat target directly
-        if (beaten.has(target)) {
-          found = {
-            f, beaten,
-            path: [...f.path, target],
-            hops: [...f.hops, { from: f.node, to: target, url: beaten.get(target)[0] }],
-          };
-          return;
-        }
-        // Pass 2 — this node beat someone who beat target
-        for (const [opp, urls] of beaten) {
-          if (beatTargetSet.has(opp)) {
-            found = {
-              f, beaten,
-              path: [...f.path, opp, target],
-              hops: [
-                ...f.hops,
-                { from: f.node, to: opp, url: urls[0] },
-                { from: opp, to: target, url: beatTargetMap.get(opp)[0] },
-              ],
-            };
-            return;
+      // expand this frontier's nodes, watching for a meeting point
+      const nextFrontier = [];
+      let meeting = null;  // details of where the two searches meet
+
+      let idx = 0;
+      const expandOne = async () => {
+        while (!meeting && idx < frontier.length) {
+          const node = frontier[idx++];
+          if (expandForward) {
+            // forward: node beat these players
+            const { beatenByMe } = await this.edges(node);
+            for (const [opp, urls] of beatenByMe) {
+              if (forwardVisited.has(opp)) continue;
+              // meeting? opp already reaches target backward
+              if (backwardVisited.has(opp)) {
+                // record the forward link that completes the meeting
+                forwardVisited.set(opp, { prev: node, hopUrl: urls[0] });
+                meeting = { node: opp };
+                return;
+              }
+              forwardVisited.set(opp, { prev: node, hopUrl: urls[0] });
+              nextFrontier.push(opp);
+            }
+          } else {
+            // backward: who beat `node`? those players can reach target via node
+            const { beatMe } = await this.edges(node);
+            for (const [opp, urls] of beatMe) {
+              if (backwardVisited.has(opp)) continue;
+              // meeting? opp already reached from start forward
+              if (forwardVisited.has(opp)) {
+                // record the backward link that completes the meeting
+                backwardVisited.set(opp, { next: node, hopUrl: urls[0] });
+                meeting = { node: opp };
+                return;
+              }
+              backwardVisited.set(opp, { next: node, hopUrl: urls[0] });
+              nextFrontier.push(opp);
+            }
           }
         }
-        // no hit — record edges for frontier expansion (Pass 3)
-        return { f, beaten };
-      });
-
-      // run with a small concurrency so we can bail the moment we find
-      const frontierEdges = [];
-      const concurrency = 4;
-      let next = 0;
-      const worker = async () => {
-        while (!found && next < tasks.length) {
-          const i = next++;
-          const r = await tasks[i]();
-          if (r && r.f) frontierEdges.push(r);
-          this.log(
-            `${frontierEdges.length}/${frontier.length} players expanded` +
-            (this.stats.cached ? ` (${this.stats.cached} cached)` : "")
-          );
-        }
       };
-      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      await Promise.all(Array.from({ length: 4 }, expandOne));
 
-      if (found) {
-        this.log(`✓ Found! Chain length ${found.path.length - 1}`);
-        return { path: found.path, hops: found.hops };
+      // report progress roughly every ~50 nodes
+      this.log(`Depth ${depth} ${side}: expanded ${frontier.length}, ` +
+               `${totalVisited()} total visited, ${this.stats.apiCalls} API calls`);
+
+      if (meeting) {
+        const result = this.reconstructPath(
+          meeting, forwardVisited, backwardVisited);
+        this.log(`✓ Found! Chain length ${result.path.length - 1} ` +
+                 `(visited ${totalVisited()} nodes, ${this.stats.apiCalls} API calls)`);
+        return result;
       }
 
-      // Pass 3 — expand frontier by one 'beat' hop
-      const expanded = [];
-      for (const { f, beaten } of frontierEdges) {
-        for (const [opp, urls] of beaten) {
-          if (visited.has(opp)) continue;
-          visited.add(opp);
-          expanded.push({
-            node: opp,
-            path: [...f.path, opp],
-            hops: [...f.hops, { from: f.node, to: opp, url: urls[0] }],
-          });
-        }
+      // replace the expanded frontier
+      if (expandForward) {
+        forwardFrontier.length = 0;
+        forwardFrontier.push(...nextFrontier);
+      } else {
+        backwardFrontier.length = 0;
+        backwardFrontier.push(...nextFrontier);
       }
-      // cap to prevent runaway searches on near-unbeatable targets
-      if (expanded.length > 3000) {
-        this.log(`Search too large (${expanded.length} candidates) — stopping.`);
-        break;
-      }
-      frontier = expanded;
     }
+    this.log(`No chain found within ${maxDepth} hops. ` +
+             `(scanned ${totalVisited()} users total)`);
     return null;
+  }
+
+  /** Reconstruct the full path + hops from a bidirectional meeting point. */
+  reconstructPath(meeting, forwardVisited, backwardVisited) {
+    const mid = meeting.node;
+    // forward half: start -> ... -> mid
+    const fwdHops = [];
+    let cur = mid;
+    while (forwardVisited.get(cur) && forwardVisited.get(cur).prev) {
+      const info = forwardVisited.get(cur);
+      fwdHops.unshift({ from: info.prev, to: cur, url: info.hopUrl });
+      cur = info.prev;
+    }
+    // backward half: mid -> ... -> target
+    const bwdHops = [];
+    cur = mid;
+    while (backwardVisited.get(cur) && backwardVisited.get(cur).next) {
+      const info = backwardVisited.get(cur);
+      bwdHops.push({ from: cur, to: info.next, url: info.hopUrl });
+      cur = info.next;
+    }
+    const hops = [...fwdHops, ...bwdHops];
+    const path = hops.length ? [hops[0].from, ...hops.map(h => h.to)] : [mid];
+    return { path, hops };
   }
 };

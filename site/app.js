@@ -435,10 +435,10 @@
         `<span class="spinner"></span>${esc(msg)}` +
         `<span class="counters">scanned <b>${stats.fetched}</b> users · ` +
         `${stats.apiCalls} API calls · ${stats.cached} cached</span>`;
-      // log significant events
-      if (msg.startsWith("Depth") || msg.includes("Found") ||
-          msg.includes("beaten") || msg.includes("have beaten") ||
-          msg.startsWith("Loading") || msg.includes("Rate limited")) {
+      // log significant events (filter out only the high-frequency
+      // per-node progress lines to keep the log readable)
+      const isPerNodeLine = /^  (forward|backward) \d+\/\d+ expanded/.test(msg);
+      if (!isPerNodeLine) {
         if (msg !== lastScanMsg) {
           lastScanMsg = msg;
           logLine(`[${new Date().toLocaleTimeString()}] ${msg}  ` +

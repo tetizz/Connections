@@ -49,9 +49,9 @@ window.ChessChain = class ChessChain {
       try {
         const res = await fetch(url, { headers: { "Accept": "application/json" } });
         if (res.status === 429) {
-          // rate limited — exponential backoff then retry
+          // rate limited — back off then try again
           const wait = 1000 * Math.pow(2, attempt);
-          this.log(`Rate limited, backing off ${wait}ms…`);
+          this.log(`chess.com is busy, waiting ${Math.round(wait/1000)}s before retrying…`);
           await new Promise(r => setTimeout(r, wait));
           continue;
         }
@@ -96,7 +96,7 @@ window.ChessChain = class ChessChain {
       if (hit) {
         this.stats.cached++;
         this._gamesCache.set(u, hit);
-        this.log(`(cache hit) ${u}`);
+        this.log(`(already had ${u}'s games saved)`);
         return hit;
       }
     }
@@ -177,7 +177,7 @@ window.ChessChain = class ChessChain {
     this.stats = { fetched: 0, apiCalls: 0, cached: 0, depth: 0 };
 
     // ---- load the two anchor players ----
-    this.log(`Loading ${start} and ${target}…`);
+    this.log(`reading ${start}'s games…`);
     await Promise.all([ this.edges(start), this.edges(target) ]);
 
     // FORWARD state: nodes reachable from `start` via "beat" edges.
@@ -204,11 +204,11 @@ window.ChessChain = class ChessChain {
       const expandForward = forwardFrontier.length <= backwardFrontier.length;
       const side = expandForward ? "forward" : "backward";
       const frontier = expandForward ? forwardFrontier : backwardFrontier;
-      this.log(`Depth ${depth}: ${side} expand ${frontier.length} player(s) ` +
-               `(forward=${forwardVisited.size}, backward=${backwardVisited.size})`);
+      this.log(`step ${depth + 1}: looking through ${frontier.length} player's games ` +
+               `(checked ${totalVisited()} so far)`);
 
       if (frontier.length === 0) {
-        this.log(`${side} frontier exhausted — no path exists.`);
+        this.log(`ran out of players to check — no connection exists.`);
         break;
       }
 
@@ -256,14 +256,13 @@ window.ChessChain = class ChessChain {
       await Promise.all(Array.from({ length: 4 }, expandOne));
 
       // report progress roughly every ~50 nodes
-      this.log(`Depth ${depth} ${side}: expanded ${frontier.length}, ` +
-               `${totalVisited()} total visited, ${this.stats.apiCalls} API calls`);
+      this.log(`checked ${frontier.length} more players — ${totalVisited()} total, ${this.stats.apiCalls} requests so far`);
 
       if (meeting) {
         const result = this.reconstructPath(
           meeting, forwardVisited, backwardVisited);
-        this.log(`✓ Found! Chain length ${result.path.length - 1} ` +
-                 `(visited ${totalVisited()} nodes, ${this.stats.apiCalls} API calls)`);
+        this.log(`✓ found a connection! ${result.path.length - 1} steps long ` +
+                 `(looked at ${totalVisited()} players, ${this.stats.apiCalls} requests)`);
         return result;
       }
 
@@ -276,8 +275,8 @@ window.ChessChain = class ChessChain {
         backwardFrontier.push(...nextFrontier);
       }
     }
-    this.log(`No chain found within ${maxDepth} hops. ` +
-             `(scanned ${totalVisited()} users total)`);
+    this.log(`no connection found within ${maxDepth} steps. ` +
+             `(looked through ${totalVisited()} players in total)`);
     return null;
   }
 

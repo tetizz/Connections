@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chess Connections — Who beat who beat who?</title>
-  <meta name="description" content="Trace the chain of chess victories from any player to the world's top grandmasters. A six-degrees-of-separation explorer for Chess.com." />
+  <title>Chess Connections — who beat who beat who?</title>
+  <meta name="description" content="Pick any two Chess.com players and we'll show you the chain of real games that connects them." />
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -17,40 +17,48 @@
 
   <header class="hero">
     <div class="hero__inner">
-      <div class="badge">♟ Live games only · No variants · No correspondence</div>
+      <div class="hero__top">
+        <div class="badge">♟ real games only · no variants · no daily</div>
+        <button class="settings-btn" id="settings-open" type="button" title="Settings" aria-label="Settings">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" fill="currentColor"/>
+          </svg>
+        </button>
+      </div>
       <h1 class="hero__title">
         Chess <span class="grad">Connections</span>
       </h1>
       <p class="hero__subtitle">
-        Six degrees of chess separation. Find the chain of real
-        <em>recorded wins</em> that links any player to a grandmaster.
+        Ever wonder how you're connected to a grandmaster?
+        Put in two Chess.com usernames and we'll trace the real games
+        that link one player to the other.
       </p>
 
-      <!-- interactive search -->
+      <!-- search -->
       <form class="search" id="search-form" autocomplete="off">
         <div class="search__field">
           <label for="search-start">Your username</label>
-          <input id="search-start" type="text" placeholder="e.g. trixize1234"
+          <input id="search-start" type="text" placeholder="chess.com username"
                  spellcheck="false" autocapitalize="none" />
         </div>
         <div class="search__field">
-          <label for="search-target">Target (GM or anyone)</label>
-          <input id="search-target" type="text" placeholder="e.g. hikaru"
+          <label for="search-target">Connect to</label>
+          <input id="search-target" type="text" placeholder="any player, e.g. hikaru"
                  spellcheck="false" autocapitalize="none" />
         </div>
         <div class="search__field search__field--narrow">
-          <label for="search-depth">Max depth</label>
+          <label for="search-depth">Search depth</label>
           <select id="search-depth">
-            <option value="3">3 hops</option>
-            <option value="4" selected>4 hops</option>
-            <option value="5">5 hops (slow)</option>
+            <option value="3">3 steps</option>
+            <option value="4" selected>4 steps</option>
+            <option value="5">5 steps (slow)</option>
           </select>
         </div>
         <button class="search__btn" type="submit">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
             <path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 5L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z" fill="currentColor"/>
           </svg>
-          Find chain
+          Find connection
         </button>
       </form>
 
@@ -60,11 +68,11 @@
 
       <!-- quick target chips -->
       <div class="quick-targets">
-        <span class="quick-label">Try:</span>
+        <span class="quick-label">popular targets:</span>
         <button class="chip" data-target="hikaru">hikaru</button>
-        <button class="chip" data-target="magnuscarlsen">magnuscarlsen</button>
-        <button class="chip" data-target="fabianocaruana">fabianocaruana</button>
-        <button class="chip" data-target="danielnaroditsky">danielnaroditsky</button>
+        <button class="chip" data-target="magnuscarlsen">magnus carlsen</button>
+        <button class="chip" data-target="fabianocaruana">fabiano caruana</button>
+        <button class="chip" data-target="danielnaroditsky">daniel naroditsky</button>
       </div>
     </div>
   </header>
@@ -75,7 +83,7 @@
       <div class="graph-header">
         <div>
           <div class="graph-length" id="chain-length">—</div>
-          <div class="graph-length-label">hops to <span id="target-name">…</span></div>
+          <div class="graph-length-label">games between you and <span id="target-name">…</span></div>
         </div>
         <button class="replay-btn" id="replay" type="button" title="Replay animation">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -92,22 +100,22 @@
 
     <!-- hop detail cards -->
     <section class="cards-section">
-      <h2 class="section-title">The chain, hop by hop</h2>
+      <h2 class="section-title">how you're connected</h2>
       <div class="cards" id="cards"></div>
     </section>
 
-    <!-- "compute your own" callout -->
+    <!-- callout -->
     <section class="cta">
       <div class="cta__card">
-        <h3>How it works</h3>
+        <h3>how this works</h3>
         <p>
-          The search runs entirely in your browser against the public
-          Chess.com API. Each link is a real win in a live game (rapid,
-          blitz, or bullet) — no daily/correspondence games, no variants.
-          BFS guarantees the shortest chain.
+          Every link is a real win from a real game on Chess.com —
+          rapid, blitz, or bullet. No daily games, no variants.
+          We read the moves off the public Chess.com data and trace
+          who beat who all the way to your target.
         </p>
         <a class="cta__btn" href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">
-          Source on GitHub →
+          see the code →
         </a>
       </div>
     </section>
@@ -115,26 +123,49 @@
 
   <footer class="footer">
     <p>
-      Built with the public
-      <a href="https://www.chess.com/news/view/published-data-api" target="_blank" rel="noopener">Chess.com pubapi</a>.
-      Data refreshed weekly by GitHub Actions.
+      Uses the public
+      <a href="https://www.chess.com/news/view/published-data-api" target="_blank" rel="noopener">Chess.com data feed</a>.
+      Runs in your browser — nothing is sent to a server.
     </p>
     <p>
-      <a href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">Source on GitHub →</a>
+      <a href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">code on github →</a>
     </p>
   </footer>
 
-  <!-- hidden templates -->
-  <template id="tpl-node">
-    <g class="node">
-      <circle class="node__ring" />
-      <circle class="node__pulse" />
-      <image class="node__img" clip-path="url(#clip)" />
-      <text class="node__icon"></text>
-      <text class="node__label"></text>
-      <text class="node__title"></text>
-    </g>
-  </template>
+  <!-- settings modal -->
+  <div class="modal-overlay" id="settings-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="modal__header">
+        <h2 id="settings-title">settings</h2>
+        <button class="modal__close" id="settings-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="modal__body">
+        <label class="setting">
+          <span class="setting__label">saved username</span>
+          <input id="setting-username" type="text" placeholder="chess.com username"
+                 spellcheck="false" autocapitalize="none" />
+          <span class="setting__hint">we remember this so you don't have to type it every time</span>
+        </label>
+        <label class="setting">
+          <span class="setting__label">default search depth</span>
+          <select id="setting-depth">
+            <option value="3">3 steps</option>
+            <option value="4">4 steps</option>
+            <option value="5">5 steps (slow)</option>
+          </select>
+          <span class="setting__hint">how many links deep to look. deeper = slower</span>
+        </label>
+        <div class="setting">
+          <span class="setting__label">cache</span>
+          <div class="cache-controls">
+            <button class="setting__btn" id="setting-clear-cache" type="button">clear saved data</button>
+            <span class="setting__hint" id="setting-cache-size">…</span>
+          </div>
+          <span class="setting__hint">your browser stores game data so repeat searches are faster</span>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="cache.js"></script>
   <script src="engine.js"></script>

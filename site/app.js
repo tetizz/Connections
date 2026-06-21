@@ -56,11 +56,11 @@
     } catch (e) {
       console.error(e);
       $("#graph-hint").textContent =
-        "Showcase data not available yet — try the search above!";
+        "no example loaded yet — try the search above to see your own connection";
       return;
     }
     renderShowcaseTabs();
-    // auto-load the first chain so the page isn't empty
+    // show an example chain so the page isn't blank on first visit
     const first = state.chains.chains.find((c) => c.found) || state.chains.chains[0];
     if (first) selectTarget(first.target);
   }
@@ -120,10 +120,10 @@
         x: 500, y: 160, "text-anchor": "middle",
         fill: "#9aa0b4", "font-size": "18", "font-family": "Inter, sans-serif",
       });
-      t.textContent = `No chain to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} hops.`;
+      t.textContent = `couldn't find a connection to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} steps.`;
       svg.appendChild(t);
       $("#graph-hint").textContent =
-        "Try a different target, or a start player with a longer game history.";
+        "try a different target, or pick someone who plays a lot of games.";
       return;
     }
 
@@ -203,7 +203,7 @@
     svg.appendChild(traveller);
 
     $("#graph-hint").textContent =
-      `Each link is a real recorded win in a live game. ${n - 1} hop${n - 1 === 1 ? "" : "s"} total.`;
+      `every arrow is a real win from a real game. ${n - 1} link${n - 1 === 1 ? "" : "s"} in total.`;
 
     animateGraph(svg, positions, traveller);
   }
@@ -309,7 +309,7 @@
     const wrap = $("#cards");
     wrap.innerHTML = "";
     if (!chain.found) {
-      wrap.innerHTML = `<p style="color:var(--text-faint)">No chain found for ${esc(chain.display || chain.target)}.</p>`;
+      wrap.innerHTML = `<p style="color:var(--text-faint)">no connection found for ${esc(chain.display || chain.target)}.</p>`;
       return;
     }
     chain.hops.forEach((hop, i) => {
@@ -338,7 +338,7 @@
       body.appendChild(line);
       const sub = document.createElement("div");
       sub.className = "card__sub";
-      sub.textContent = `Hop ${i + 1} of ${chain.hops.length}`;
+      sub.textContent = `link ${i + 1} of ${chain.hops.length}`;
       body.appendChild(sub);
 
       const proof = document.createElement("a");
@@ -346,7 +346,7 @@
       proof.href = hop.url;
       proof.target = "_blank";
       proof.rel = "noopener";
-      proof.innerHTML = `View game <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3z" fill="currentColor"/></svg>`;
+      proof.innerHTML = `see the game <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3z" fill="currentColor"/></svg>`;
 
       card.appendChild(avatars);
       card.appendChild(body);
@@ -398,16 +398,17 @@
     const btn = $(".search__btn");
 
     if (!start || !target) {
-      showStatus("error", "Enter both your username and a target.");
+      showStatus("error", "put in both usernames first.");
       return;
     }
     if (start === target) {
-      showStatus("error", "Start and target must be different players.");
+      showStatus("error", "those are the same player — pick two different ones.");
       return;
     }
 
-    // save the username for next time
+    // remember the username for next time
     localStorage.setItem(LS_KEY, start);
+    $("#setting-username").value = start;
 
     btn.disabled = true;
     status.hidden = false;
@@ -446,35 +447,35 @@
         }
       }
     };
-    showStatus("working", "Starting search…");
-    logLine(`Searching: ${start} → ${target}  (max depth ${depth})`);
+    showStatus("working", "looking up the players…");
+    logLine(`connecting ${start} → ${target}  (up to ${depth} steps deep)`);
 
     try {
-      // validate both players exist + grab their meta for nicer rendering
+      // check both players exist + grab their info for the display
       const [startMeta, targetMeta] = await Promise.all([
         engine.fetchJSON(engine.API + start).catch(() => null),
         engine.fetchJSON(engine.API + target).catch(() => null),
       ]);
       if (!startMeta) {
-        showStatus("error", `Player "${esc(start)}" not found on Chess.com.`);
+        showStatus("error", `couldn't find "${esc(start)}" on chess.com — check the spelling?`);
         return;
       }
       if (!targetMeta) {
-        showStatus("error", `Target "${esc(target)}" not found on Chess.com.`);
+        showStatus("error", `couldn't find "${esc(target)}" on chess.com — check the spelling?`);
         return;
       }
       state.players = state.players || {};
       state.players[start] = metaShape(startMeta);
       state.players[target] = metaShape(targetMeta);
 
-      showStatus("working", "Searching game histories…");
+      showStatus("working", "reading through game histories…");
       const result = await engine.findChain(start, target, depth);
 
       if (!result) {
         showStatus("error",
-          `No chain found within ${depth} hops. ` +
-          `${esc(target)} may have very few recorded losses. ` +
-          `(scanned ${engine.stats.fetched} users)`);
+          `no connection found within ${depth} steps. ` +
+          `maybe ${esc(target)} barely ever loses? ` +
+          `(looked through ${engine.stats.fetched} players)`);
         renderChain({
           target, display: targetMeta.name || target,
           found: false, length: null, path: [], hops: [],
@@ -482,7 +483,7 @@
         return;
       }
 
-      // fetch avatars/titles for the intermediate hops
+      // grab avatars/titles for the players in between
       const intermediates = result.path.slice(1, -1);
       await Promise.all(intermediates.map(async (u) => {
         if (state.players[u]) return;
@@ -491,9 +492,9 @@
       }));
 
       showStatus("done",
-        `✓ Found! ${esc(start)} → ${esc(target)} in ${result.path.length - 1} hops. ` +
-        `Scanned ${engine.stats.fetched} users, ` +
-        `${engine.stats.apiCalls} API calls, ${engine.stats.cached} cached.`);
+        `✓ found it — ${esc(start)} connects to ${esc(target)} in ${result.path.length - 1} steps. ` +
+        `looked at ${engine.stats.fetched} players, made ${engine.stats.apiCalls} requests` +
+        (engine.stats.cached ? `, ${engine.stats.cached} from cache` : "") + ".");
 
       renderChain({
         target,
@@ -506,17 +507,16 @@
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
     } catch (e) {
       console.error(e);
-      showStatus("error", `Search failed: ${esc(e.message)}`);
+      showStatus("error", `something went wrong: ${esc(e.message)}`);
     } finally {
       btn.disabled = false;
-      // show cache usage info
       const est = await cache.estimate();
       if (est) {
         const info = $("#cache-info");
         info.hidden = false;
         info.textContent =
-          `📦 Cache: ${(est.usage / 1048576).toFixed(1)} MB used / ` +
-          `${(est.quota / 1048576).toFixed(0)} MB available`;
+          `saved ${(est.usage / 1048576).toFixed(1)} MB of game data locally ` +
+          `(of ${(est.quota / 1048576).toFixed(0)} MB available)`;
       }
     }
   }
@@ -582,6 +582,74 @@
     if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) tick();
   }
 
+  // ---------- settings modal ----------
+  const LS_DEPTH_KEY = "chess-connections:depth";
+
+  function openSettings() {
+    const modal = $("#settings-modal");
+    modal.hidden = false;
+    // populate fields from current state / storage
+    $("#setting-username").value = localStorage.getItem(LS_KEY) || "";
+    const savedDepth = localStorage.getItem(LS_DEPTH_KEY) || $("#search-depth").value;
+    $("#setting-depth").value = savedDepth;
+    refreshCacheSize();
+  }
+  function closeSettings() {
+    $("#settings-modal").hidden = true;
+  }
+  async function refreshCacheSize() {
+    const el = $("#setting-cache-size");
+    const cache = new window.GameCache();
+    const est = await cache.estimate();
+    if (est && est.usage) {
+      el.textContent = `${(est.usage / 1048576).toFixed(1)} MB stored`;
+    } else {
+      el.textContent = "nothing stored yet";
+    }
+  }
+
+  $("#settings-open").addEventListener("click", openSettings);
+  $("#settings-close").addEventListener("click", closeSettings);
+  $("#settings-modal").addEventListener("click", (e) => {
+    if (e.target.id === "settings-modal") closeSettings(); // click backdrop
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("#settings-modal").hidden) closeSettings();
+  });
+
+  // persist username typed in settings
+  $("#setting-username").addEventListener("change", (e) => {
+    const v = e.target.value.trim();
+    if (v) {
+      localStorage.setItem(LS_KEY, v);
+      $("#search-start").value = v;
+    } else {
+      localStorage.removeItem(LS_KEY);
+      $("#search-start").value = "";
+    }
+  });
+  // persist default depth
+  $("#setting-depth").addEventListener("change", (e) => {
+    localStorage.setItem(LS_DEPTH_KEY, e.target.value);
+    $("#search-depth").value = e.target.value;
+  });
+  // clear cache button
+  $("#setting-clear-cache").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = "clearing…";
+    try {
+      const cache = new window.GameCache();
+      await cache.clear();
+      btn.textContent = "cleared ✓";
+      refreshCacheSize();
+      setTimeout(() => { btn.disabled = false; btn.textContent = "clear saved data"; }, 1500);
+    } catch (err) {
+      btn.textContent = "clear saved data";
+      btn.disabled = false;
+    }
+  });
+
   // ---------- wire up ----------
   $("#replay").addEventListener("click", () => {
     const svg = $("#graph");
@@ -612,9 +680,12 @@
 
   document.addEventListener("DOMContentLoaded", () => {
     starfield();
-    // restore saved username
+    // only restore the username if they saved one before
+    // (don't pre-fill with any default)
     const saved = localStorage.getItem(LS_KEY);
     if (saved) $("#search-start").value = saved;
+    const savedDepth = localStorage.getItem(LS_DEPTH_KEY);
+    if (savedDepth) $("#search-depth").value = savedDepth;
     loadShowcase();
   });
 })();

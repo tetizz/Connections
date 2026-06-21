@@ -22,6 +22,12 @@ window.ChessChain = class ChessChain {
     this._cache = cache;           // optional GameCache (IndexedDB)
     this._lastReqTs = 0;           // throttle: min ms between request starts
     this._minSpacing = 120;        // ~8 req/sec sustained, well under the limit
+    this._maxRetries = Number.isFinite(options.maxRetries)
+      ? Math.max(1, options.maxRetries)
+      : 5;
+    this._fetchTimeout = Number.isFinite(options.fetchTimeout)
+      ? Math.max(1000, options.fetchTimeout)
+      : 0;
     this._archiveLimit = Number.isFinite(options.archiveLimit)
       ? Math.max(1, options.archiveLimit)
       : Infinity;
@@ -46,11 +52,18 @@ window.ChessChain = class ChessChain {
 
   async fetchJSON(url) {
     this.stats.apiCalls++;
-    const MAX_RETRIES = 5;
+    const MAX_RETRIES = this._maxRetries;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       await this._acquire();
+      const controller = this._fetchTimeout ? new AbortController() : null;
+      const timeout = controller
+        ? setTimeout(() => controller.abort(), this._fetchTimeout)
+        : null;
       try {
-        const res = await fetch(url, { headers: { "Accept": "application/json" } });
+        const res = await fetch(url, {
+          headers: { "Accept": "application/json" },
+          signal: controller?.signal,
+        });
         if (res.status === 429) {
           // rate limited — back off then try again
           const wait = 1000 * Math.pow(2, attempt);
@@ -61,9 +74,13 @@ window.ChessChain = class ChessChain {
         if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
         return await res.json();
       } catch (e) {
+        if (e.name === "AbortError") {
+          e = new Error(`Timed out waiting for ${url}`);
+        }
         if (attempt === MAX_RETRIES - 1) throw e;
         await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
       } finally {
+        if (timeout) clearTimeout(timeout);
         this._release();
       }
     }

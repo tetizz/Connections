@@ -14,7 +14,7 @@ Live site: https://tetizz.github.io/Connections/
 - Shows the chain as an animated graph.
 - Lists every hop with a link back to the original Chess.com game.
 - Saves fetched game histories in the browser for a week so repeated searches are faster.
-- Defaults to a recent-games search so the browser does not crawl years of archives unless you ask it to.
+- Defaults to an instant bridge check so a random username gets a fast answer instead of a long crawl.
 - Ships with precomputed example chains so the page has something useful to show immediately.
 
 ## Dialogue changes
@@ -109,6 +109,7 @@ Commit the updated JSON if you want the hosted examples to change.
 - Data comes from the public Chess.com Published Data API.
 - Searches can get expensive quickly because each player can add many more players to the graph.
 - Depth 3 is the practical default for a browser session.
+- `Instant bridge` checks the starting player's latest two monthly archives for a direct win or a known connector into a saved master-player route. It returns fast and stops there.
 - `Recent fast` checks the latest six monthly archives for each player it touches.
 - `Full slow` checks all available archives and can take much longer, especially for famous players.
 - If no chain is found, that means no chain was found inside the chosen depth, not that no chain exists.

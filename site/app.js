@@ -15,6 +15,7 @@
   const LS_KEY = "chess-connections:username";
   const LS_THEME_KEY = "chess-connections:theme";
   const LS_RANGE_KEY = "chess-connections:range";
+  const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
 
   const state = {
     chains: null,
@@ -105,7 +106,124 @@
   function precomputedChain(start, target) {
     if (!state.chains?.chains?.length) return null;
     if ((state.chains.start || "").toLowerCase() !== start) return null;
-    return state.chains.chains.find((c) => c.target.toLowerCase() === target) || null;
+    return state.chains.chains.find((c) => c.found && c.target.toLowerCase() === target) || null;
+  }
+
+  function bridgeSuffixesFor(target) {
+    const suffixes = new Map();
+    for (const chain of state.chains?.chains || []) {
+      if (!chain.found || chain.target.toLowerCase() !== target) continue;
+      for (let i = 0; i < chain.path.length - 1; i++) {
+        const node = chain.path[i].toLowerCase();
+        const path = chain.path.slice(i).map((u) => u.toLowerCase());
+        const hops = chain.hops.slice(i).map((hop) => ({
+          from: hop.from.toLowerCase(),
+          to: hop.to.toLowerCase(),
+          url: hop.url,
+        }));
+        const suffix = {
+          target: chain.target.toLowerCase(),
+          display: chain.display || nameOf(chain.target),
+          found: true,
+          length: hops.length,
+          path,
+          hops,
+          source: "saved-bridge",
+        };
+        const current = suffixes.get(node);
+        if (!current || suffix.length < current.length) suffixes.set(node, suffix);
+      }
+    }
+    return suffixes;
+  }
+
+  function parseSearchMode(range) {
+    if (range === "instant") {
+      return {
+        key: "instant",
+        archiveLimit: 2,
+        bridgeLimit: 2,
+        label: "instant bridge",
+        crawlLabel: "latest 2 months",
+        instantOnly: true,
+      };
+    }
+    if (range === "all") {
+      return {
+        key: "all",
+        archiveLimit: Infinity,
+        bridgeLimit: 2,
+        label: "full history",
+        crawlLabel: "full history",
+        instantOnly: false,
+      };
+    }
+    const archiveLimit = parseInt(range, 10) || 6;
+    return {
+      key: String(archiveLimit),
+      archiveLimit,
+      bridgeLimit: Math.min(archiveLimit, 2),
+      label: `latest ${archiveLimit} months`,
+      crawlLabel: `latest ${archiveLimit} months`,
+      instantOnly: false,
+    };
+  }
+
+  async function quickBridge(start, target, targetDisplay, engine, label, logLine) {
+    const suffixes = bridgeSuffixesFor(target);
+    const suffixFromStart = suffixes.get(start);
+    if (suffixFromStart) {
+      logLine(`instant bridge: ${start} is already on a saved route to ${target}`);
+      return {
+        ...suffixFromStart,
+        display: suffixFromStart.display || targetDisplay || target,
+      };
+    }
+
+    logLine(`instant bridge: checking ${start}'s ${label} for direct wins and known connectors`);
+    const { beatenByMe } = await engine.edges(start);
+
+    const directUrls = beatenByMe.get(target);
+    if (directUrls?.length) {
+      return {
+        target,
+        display: targetDisplay || target,
+        found: true,
+        length: 1,
+        path: [start, target],
+        hops: [{ from: start, to: target, url: directUrls[0] }],
+        source: "direct-recent-win",
+      };
+    }
+
+    if (!suffixes.size) return null;
+
+    let best = null;
+    for (const [opponent, urls] of beatenByMe) {
+      const suffix = suffixes.get(opponent);
+      if (!suffix || !urls?.length) continue;
+      const hops = [{ from: start, to: opponent, url: urls[0] }, ...suffix.hops];
+      const candidate = {
+        target,
+        display: suffix.display || targetDisplay || target,
+        found: true,
+        length: hops.length,
+        path: [start, ...suffix.path],
+        hops,
+        source: "recent-bridge",
+      };
+      if (!best || candidate.length < best.length) best = candidate;
+    }
+    return best;
+  }
+
+  async function hydratePlayers(path, engine) {
+    state.players = state.players || {};
+    await Promise.all([...new Set(path)].map(async (u) => {
+      if (state.players[u]) return;
+      const m = await engine.fetchJSON(engine.API + u).catch(() => null);
+      if (m) state.players[u] = metaShape(m);
+    }));
   }
 
   // ---------- graph ----------
@@ -406,10 +524,7 @@
     const status = $("#search-status");
     const logEl = $("#search-log");
     const btn = $(".search__btn");
-    const archiveLimit = range === "all" ? Infinity : parseInt(range, 10) || 6;
-    const rangeLabel = Number.isFinite(archiveLimit)
-      ? `latest ${archiveLimit} months`
-      : "full history";
+    const mode = parseSearchMode(range);
 
     if (!start || !target) {
       showStatus("error", "put in both usernames first.");
@@ -447,7 +562,16 @@
     logEl.innerHTML = "";
 
     const cache = new window.GameCache();
-    const engine = new window.ChessChain(cache, { archiveLimit });
+    const quickOptions = mode.instantOnly ? { fetchTimeout: 6500, maxRetries: 1 } : {};
+    const engine = new window.ChessChain(cache, {
+      archiveLimit: mode.archiveLimit,
+      ...quickOptions,
+    });
+    const bridgeEngine = new window.ChessChain(cache, {
+      archiveLimit: mode.bridgeLimit,
+      fetchTimeout: 6500,
+      maxRetries: 1,
+    });
 
     // prominent running log of users scanned + API calls
     let lastScanMsg = "";
@@ -460,25 +584,29 @@
       while (logEl.children.length > 12) logEl.removeChild(logEl.firstChild);
       logEl.scrollTop = logEl.scrollHeight;
     };
-    engine.onProgress = (msg, stats) => {
+    const attachProgress = (activeEngine) => {
+      activeEngine.onProgress = (msg, stats) => {
       // status line: current action + counters
-      status.innerHTML =
-        `<span class="spinner"></span>${esc(msg)}` +
-        `<span class="counters">scanned <b>${stats.fetched}</b> users · ` +
-        `${stats.apiCalls} API calls · ${stats.cached} cached</span>`;
-      // log significant events (filter out only the high-frequency
-      // per-node progress lines to keep the log readable)
-      const isPerNodeLine = /^  (forward|backward) \d+\/\d+ expanded/.test(msg);
-      if (!isPerNodeLine) {
-        if (msg !== lastScanMsg) {
-          lastScanMsg = msg;
-          logLine(`[${new Date().toLocaleTimeString()}] ${msg}  ` +
-            `(scanned ${stats.fetched} users total)`);
+        status.innerHTML =
+          `<span class="spinner"></span>${esc(msg)}` +
+          `<span class="counters">scanned <b>${stats.fetched}</b> users · ` +
+          `${stats.apiCalls} API calls · ${stats.cached} cached</span>`;
+        // log significant events (filter out only the high-frequency
+        // per-node progress lines to keep the log readable)
+        const isPerNodeLine = /^  (forward|backward) \d+\/\d+ expanded/.test(msg);
+        if (!isPerNodeLine) {
+          if (msg !== lastScanMsg) {
+            lastScanMsg = msg;
+            logLine(`[${new Date().toLocaleTimeString()}] ${msg}  ` +
+              `(scanned ${stats.fetched} users total)`);
+          }
         }
-      }
+      };
     };
+    attachProgress(engine);
+    attachProgress(bridgeEngine);
     showStatus("working", "looking up the players…");
-    logLine(`connecting ${start} → ${target}  (${rangeLabel}, up to ${depth} steps deep)`);
+    logLine(`connecting ${start} → ${target}  (${mode.label}${mode.instantOnly ? "" : `, up to ${depth} steps deep`})`);
 
     try {
       // check both players exist + grab their info for the display
@@ -498,14 +626,60 @@
       state.players[start] = metaShape(startMeta);
       state.players[target] = metaShape(targetMeta);
 
-      showStatus("working", "reading through game histories…");
+      showStatus("working", "checking instant bridge…");
+      let bridged = null;
+      try {
+        bridged = await quickBridge(
+          start, target, targetMeta.name || target, bridgeEngine, bridgeEngine._archiveLabel(), logLine);
+      } catch (bridgeError) {
+        logLine(`instant bridge skipped: ${bridgeError.message}`);
+        if (mode.instantOnly) {
+          showStatus("error",
+            `instant bridge timed out for ${esc(start)} → ${esc(target)}. ` +
+            `Chess.com did not answer the small recent-games check fast enough; try again or switch to Recent fast.`);
+          renderChain({
+            target, display: targetMeta.name || target,
+            found: false, length: null, path: [], hops: [],
+          });
+          return;
+        }
+      }
+      if (bridged) {
+        await hydratePlayers(bridged.path, bridgeEngine);
+        const bridgeWork = bridgeEngine.stats.apiCalls
+          ? `made ${bridgeEngine.stats.apiCalls} quick requests` +
+            (bridgeEngine.stats.cached ? `, ${bridgeEngine.stats.cached} from cache` : "")
+          : "used the saved bridge index";
+        showStatus("done",
+          `✓ found it fast — ${esc(start)} connects to ${esc(target)} in ${bridged.length} steps. ` +
+          `checked ${esc(mode.instantOnly ? mode.label : "the instant bridge first")} and ${bridgeWork}.`);
+        setActiveChip(target);
+        renderChain(bridged);
+        document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+        return;
+      }
+
+      if (mode.instantOnly) {
+        showStatus("error",
+          `no instant bridge found for ${esc(start)} → ${esc(target)}. ` +
+          `I only checked ${esc(mode.crawlLabel)} for a direct win or a known connector; ` +
+          `switch to Recent fast or Full slow for a wider crawl.`);
+        renderChain({
+          target, display: targetMeta.name || target,
+          found: false, length: null, path: [], hops: [],
+        });
+        return;
+      }
+
+      showStatus("working", "no instant bridge yet; widening the search…");
+      logLine(`no instant bridge found; continuing with ${mode.crawlLabel}`);
       const result = await engine.findChain(start, target, depth);
 
       if (!result) {
         showStatus("error",
           `no connection found within ${depth} steps. ` +
-          (Number.isFinite(archiveLimit)
-            ? `Fast mode only checked the ${esc(rangeLabel)}. Try Full slow if you want a deeper crawl. `
+          (Number.isFinite(mode.archiveLimit)
+            ? `Fast mode only checked the ${esc(mode.crawlLabel)}. Try Full slow if you want a deeper crawl. `
             : "") +
           `(looked through ${engine.stats.fetched} players)`);
         renderChain({
@@ -516,12 +690,7 @@
       }
 
       // grab avatars/titles for the players in between
-      const intermediates = result.path.slice(1, -1);
-      await Promise.all(intermediates.map(async (u) => {
-        if (state.players[u]) return;
-        const m = await engine.fetchJSON(engine.API + u).catch(() => null);
-        if (m) state.players[u] = metaShape(m);
-      }));
+      await hydratePlayers(result.path.slice(1, -1), engine);
 
       showStatus("done",
         `✓ found it — ${esc(start)} connects to ${esc(target)} in ${result.path.length - 1} steps. ` +
@@ -709,9 +878,14 @@
     if (saved) $("#search-start").value = saved;
     const savedDepth = localStorage.getItem(LS_DEPTH_KEY);
     if (savedDepth) $("#search-depth").value = savedDepth;
-    const savedRange = localStorage.getItem(LS_RANGE_KEY);
+    const migratedRange = localStorage.getItem(LS_RANGE_MIGRATION_KEY);
+    const savedRange = migratedRange ? localStorage.getItem(LS_RANGE_KEY) : "instant";
     if (savedRange && $("#search-range").querySelector(`option[value="${savedRange}"]`)) {
       $("#search-range").value = savedRange;
+    }
+    if (!migratedRange) {
+      localStorage.setItem(LS_RANGE_KEY, "instant");
+      localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
     }
     loadShowcase();
   });

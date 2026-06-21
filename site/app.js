@@ -13,6 +13,7 @@
   const SVG_NS = "http://www.w3.org/2000/svg";
   const DATA_BASE = new URL("./data/", document.baseURI).href;
   const LS_KEY = "chess-connections:username";
+  const LS_THEME_KEY = "chess-connections:theme";
 
   const state = {
     chains: null,
@@ -79,6 +80,7 @@
   // ---------- render a chain (shared by showcase + live search) ----------
   function selectTarget(target) {
     state.activeTarget = target;
+    setActiveChip(target);
     const chain = state.chains?.chains.find((c) => c.target === target);
     if (chain) {
       renderChain({
@@ -106,19 +108,19 @@
 
     const defs = el("defs");
     const grad = el("linearGradient", { id: "edge-grad", x1: "0", y1: "0", x2: "1", y2: "0" });
-    grad.appendChild(el("stop", { offset: "0%", "stop-color": "#4be3c4" }));
-    grad.appendChild(el("stop", { offset: "50%", "stop-color": "#ffd479" }));
-    grad.appendChild(el("stop", { offset: "100%", "stop-color": "#c084fc" }));
+    grad.appendChild(el("stop", { offset: "0%", "stop-color": "#496a46" }));
+    grad.appendChild(el("stop", { offset: "50%", "stop-color": "#b4833a" }));
+    grad.appendChild(el("stop", { offset: "100%", "stop-color": "#415d75" }));
     defs.appendChild(grad);
     const clip = el("clipPath", { id: "clip" });
-    clip.appendChild(el("circle", { r: 30, cx: 0, cy: 0 }));
+    clip.appendChild(el("circle", { r: 32, cx: 0, cy: 0 }));
     defs.appendChild(clip);
     svg.appendChild(defs);
 
     if (!chain.found) {
       const t = el("text", {
-        x: 500, y: 160, "text-anchor": "middle",
-        fill: "#9aa0b4", "font-size": "18", "font-family": "Inter, sans-serif",
+        x: 520, y: 180, "text-anchor": "middle",
+        fill: "#63685f", "font-size": "18", "font-family": "Inter, sans-serif",
       });
       t.textContent = `couldn't find a connection to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} steps.`;
       svg.appendChild(t);
@@ -129,10 +131,10 @@
 
     const nodes = chain.path;
     const n = nodes.length;
-    const PAD = 90, W = 1000;
+    const PAD = 96, W = 1040;
     const usable = W - PAD * 2;
     const stepX = n > 1 ? usable / (n - 1) : 0;
-    const y = 150;
+    const y = 170;
     const positions = nodes.map((_, i) => ({ x: PAD + stepX * i, y }));
 
     const edgesGroup = el("g");
@@ -154,14 +156,15 @@
         class: "node" + (isStart ? " is-start" : "") + (isTarget ? " is-target" : ""),
         transform: `translate(${pos.x}, ${pos.y})`,
       });
+      g.appendChild(el("ellipse", { class: "node__shadow", cx: 0, cy: 42, rx: 34, ry: 8 }));
       g.appendChild(el("circle", { class: "node__pulse", r: 34 }));
-      g.appendChild(el("circle", { class: "node__ring", r: 30 }));
+      g.appendChild(el("circle", { class: "node__ring", r: 32 }));
 
       const av = avatarOf(u);
       if (av) {
         const img = el("image", {
           class: "node__img", href: av,
-          x: -30, y: -30, width: 60, height: 60,
+          x: -32, y: -32, width: 64, height: 64,
           "clip-path": "url(#clip)", preserveAspectRatio: "xMidYMid slice",
         });
         img.addEventListener("error", () => {
@@ -346,7 +349,7 @@
       proof.href = hop.url;
       proof.target = "_blank";
       proof.rel = "noopener";
-      proof.innerHTML = `see the game <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3z" fill="currentColor"/></svg>`;
+      proof.innerHTML = `Open game <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3z" fill="currentColor"/></svg>`;
 
       card.appendChild(avatars);
       card.appendChild(body);
@@ -495,6 +498,7 @@
         `✓ found it — ${esc(start)} connects to ${esc(target)} in ${result.path.length - 1} steps. ` +
         `looked at ${engine.stats.fetched} players, made ${engine.stats.apiCalls} requests` +
         (engine.stats.cached ? `, ${engine.stats.cached} from cache` : "") + ".");
+      setActiveChip(target);
 
       renderChain({
         target,
@@ -543,43 +547,17 @@
     }
   }
 
-  // ---------- starfield ----------
-  function starfield() {
-    const canvas = $("#stars");
-    const ctx = canvas.getContext("2d");
-    let stars = [], raf;
-    function resize() {
-      canvas.width = innerWidth * devicePixelRatio;
-      canvas.height = innerHeight * devicePixelRatio;
-      canvas.style.width = innerWidth + "px";
-      canvas.style.height = innerHeight + "px";
-      const count = Math.min(120, Math.floor(innerWidth / 12));
-      stars = Array.from({ length: count }, () => ({
-        x: Math.random() * canvas.width,
-        y: Math.random() * canvas.height,
-        r: Math.random() * 1.4 + 0.3,
-        a: Math.random(),
-        s: Math.random() * 0.02 + 0.005,
-        c: Math.random() > 0.85 ? "#ffd479" : Math.random() > 0.7 ? "#4be3c4" : "#ffffff",
-      }));
-    }
-    function tick() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      for (const st of stars) {
-        st.a += st.s;
-        const alpha = (Math.sin(st.a) + 1) / 2 * 0.7 + 0.1;
-        ctx.beginPath();
-        ctx.arc(st.x, st.y, st.r * devicePixelRatio, 0, Math.PI * 2);
-        ctx.fillStyle = st.c;
-        ctx.globalAlpha = alpha;
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-      raf = requestAnimationFrame(tick);
-    }
-    resize();
-    addEventListener("resize", () => { cancelAnimationFrame(raf); resize(); tick(); });
-    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) tick();
+  function applyTheme(theme) {
+    const next = theme === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem(LS_THEME_KEY, next);
+
+    const btn = $("#theme-toggle");
+    if (!btn) return;
+    const isDark = next === "dark";
+    btn.setAttribute("aria-pressed", String(isDark));
+    btn.setAttribute("aria-label", isDark ? "Switch to light mode" : "Switch to dark mode");
+    btn.title = isDark ? "Switch to light mode" : "Switch to dark mode";
   }
 
   // ---------- settings modal ----------
@@ -610,6 +588,10 @@
 
   $("#settings-open").addEventListener("click", openSettings);
   $("#settings-close").addEventListener("click", closeSettings);
+  $("#theme-toggle").addEventListener("click", () => {
+    const current = document.documentElement.dataset.theme || "dark";
+    applyTheme(current === "dark" ? "light" : "dark");
+  });
   $("#settings-modal").addEventListener("click", (e) => {
     if (e.target.id === "settings-modal") closeSettings(); // click backdrop
   });
@@ -670,6 +652,7 @@
   document.querySelectorAll(".chip").forEach((chip) => {
     chip.addEventListener("click", () => {
       $("#search-target").value = chip.dataset.target;
+      setActiveChip(chip.dataset.target);
       if ($("#search-start").value) {
         $("#search-form").requestSubmit();
       } else {
@@ -678,8 +661,19 @@
     });
   });
 
+  $("#search-target").addEventListener("input", (e) => {
+    setActiveChip(e.target.value.trim().toLowerCase());
+  });
+
+  function setActiveChip(target) {
+    const wanted = (target || "").toLowerCase();
+    document.querySelectorAll(".chip").forEach((chip) => {
+      chip.classList.toggle("is-active", chip.dataset.target === wanted);
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
-    starfield();
+    applyTheme(localStorage.getItem(LS_THEME_KEY) || document.documentElement.dataset.theme || "dark");
     // only restore the username if they saved one before
     // (don't pre-fill with any default)
     const saved = localStorage.getItem(LS_KEY);

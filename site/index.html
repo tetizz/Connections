@@ -3,169 +3,177 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chess Connections — who beat who beat who?</title>
-  <meta name="description" content="Pick any two Chess.com players and we'll show you the chain of real games that connects them." />
+  <title>Chess Connections | Trace real Chess.com win chains</title>
+  <meta name="description" content="Search two Chess.com players and trace the chain of live-game wins that connects them." />
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
+  <script>
+    document.documentElement.dataset.theme =
+      localStorage.getItem("chess-connections:theme") || "dark";
+  </script>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <!-- animated starfield -->
-  <canvas id="stars"></canvas>
-
-  <header class="hero">
-    <div class="hero__inner">
-      <div class="hero__top">
-        <div class="badge">♟ real games only · no variants · no daily</div>
+  <div class="site-shell">
+    <header class="masthead">
+      <a class="brand" href="./" aria-label="Chess Connections home">
+        <span class="brand__mark" aria-hidden="true">♞</span>
+        <span class="brand__text">Chess Connections</span>
+      </a>
+      <nav class="top-links" aria-label="Project links">
+        <a href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://www.chess.com/news/view/published-data-api" target="_blank" rel="noopener">Chess.com API</a>
+        <button class="theme-btn" id="theme-toggle" type="button" title="Switch to light mode" aria-label="Switch to light mode" aria-pressed="true">
+          <svg class="theme-btn__moon" viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
+            <path d="M20.3 14.9A7.7 7.7 0 0 1 9.1 3.7 8.6 8.6 0 1 0 20.3 14.9Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+          </svg>
+          <svg class="theme-btn__sun" viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
+            <path d="M12 7.2a4.8 4.8 0 1 0 0 9.6 4.8 4.8 0 0 0 0-9.6Z" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M12 2.5v2.1M12 19.4v2.1M4.6 4.6l1.5 1.5M17.9 17.9l1.5 1.5M2.5 12h2.1M19.4 12h2.1M4.6 19.4l1.5-1.5M17.9 6.1l1.5-1.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
         <button class="settings-btn" id="settings-open" type="button" title="Settings" aria-label="Settings">
-          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-            <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" fill="currentColor"/>
+          <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
+            <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.04.04a2.05 2.05 0 0 1-2.9 2.9l-.04-.04a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56v.12a2.05 2.05 0 0 1-4.1 0V21a1.7 1.7 0 0 0-1.03-1.56 1.7 1.7 0 0 0-1.88.34l-.04.04a2.05 2.05 0 1 1-2.9-2.9l.04-.04A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.03h-.12a2.05 2.05 0 0 1 0-4.1h.12A1.7 1.7 0 0 0 4.6 8.84a1.7 1.7 0 0 0-.34-1.88l-.04-.04a2.05 2.05 0 1 1 2.9-2.9l.04.04A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1.03-1.56v-.12a2.05 2.05 0 0 1 4.1 0v.12A1.7 1.7 0 0 0 15.16 4.6a1.7 1.7 0 0 0 1.88-.34l.04-.04a2.05 2.05 0 1 1 2.9 2.9l-.04.04a1.7 1.7 0 0 0-.34 1.88 1.7 1.7 0 0 0 1.56 1.03h.12a2.05 2.05 0 0 1 0 4.1h-.12A1.7 1.7 0 0 0 19.4 15Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
           </svg>
         </button>
-      </div>
-      <h1 class="hero__title">
-        Chess <span class="grad">Connections</span>
-      </h1>
-      <p class="hero__subtitle">
-        Ever wonder how you're connected to a grandmaster?
-        Put in two Chess.com usernames and we'll trace the real games
-        that link one player to the other.
-      </p>
+      </nav>
+    </header>
 
-      <!-- search -->
-      <form class="search" id="search-form" autocomplete="off">
-        <div class="search__field">
-          <label for="search-start">Your username</label>
-          <input id="search-start" type="text" placeholder="chess.com username"
-                 spellcheck="false" autocapitalize="none" />
+    <main>
+      <section class="command-center" aria-labelledby="page-title">
+        <div class="command-center__intro">
+          <h1 id="page-title">Find the win chain between any two players</h1>
+          <p>Every link is a real Chess.com live win: rapid, blitz, or bullet.</p>
         </div>
-        <div class="search__field">
-          <label for="search-target">Connect to</label>
-          <input id="search-target" type="text" placeholder="any player, e.g. hikaru"
-                 spellcheck="false" autocapitalize="none" />
+
+        <form class="search" id="search-form" autocomplete="off">
+          <div class="search__field">
+            <label for="search-start">Your username</label>
+            <input id="search-start" type="text" placeholder="trixize1234"
+                   spellcheck="false" autocapitalize="none" />
+          </div>
+          <div class="search__field">
+            <label for="search-target">Connect to</label>
+            <input id="search-target" type="text" placeholder="hikaru"
+                   spellcheck="false" autocapitalize="none" />
+          </div>
+          <div class="search__field search__field--narrow">
+            <label for="search-depth">Depth</label>
+            <select id="search-depth">
+              <option value="3">3 steps</option>
+              <option value="4" selected>4 steps</option>
+              <option value="5">5 steps</option>
+            </select>
+          </div>
+          <button class="search__btn" type="submit">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path d="M5 12h11.4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="m13 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            Trace chain
+          </button>
+        </form>
+
+        <div class="search__status" id="search-status" hidden></div>
+        <div class="search__log" id="search-log" hidden></div>
+        <div class="cache-info" id="cache-info" hidden></div>
+
+        <div class="quick-targets" aria-label="Popular target players">
+          <span class="quick-label">Quick targets</span>
+          <button class="chip" type="button" data-target="hikaru">Hikaru</button>
+          <button class="chip" type="button" data-target="magnuscarlsen">Magnus</button>
+          <button class="chip" type="button" data-target="fabianocaruana">Fabiano</button>
+          <button class="chip" type="button" data-target="danielnaroditsky">Naroditsky</button>
         </div>
-        <div class="search__field search__field--narrow">
-          <label for="search-depth">Search depth</label>
-          <select id="search-depth">
-            <option value="3">3 steps</option>
-            <option value="4" selected>4 steps</option>
-            <option value="5">5 steps (slow)</option>
-          </select>
+      </section>
+
+      <section class="graph-section" aria-labelledby="chain-heading">
+        <div class="graph-header">
+          <div>
+            <p class="eyebrow">Current chain</p>
+            <h2 id="chain-heading"><span id="target-name">…</span></h2>
+          </div>
+          <div class="graph-metric">
+            <span class="graph-length" id="chain-length">—</span>
+            <span class="graph-length-label">recorded wins</span>
+          </div>
+          <button class="replay-btn" id="replay" type="button" title="Replay animation">
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <path d="M5 12a7 7 0 1 0 2.05-4.95L5 9.1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M5 4.5v4.6h4.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            Replay
+          </button>
         </div>
-        <button class="search__btn" type="submit">
-          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-            <path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 5L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z" fill="currentColor"/>
-          </svg>
-          Find connection
-        </button>
-      </form>
+        <div class="graph-wrap">
+          <svg id="graph" viewBox="0 0 1040 360" preserveAspectRatio="xMidYMid meet" aria-label="Connection graph"></svg>
+        </div>
+        <p class="graph-hint" id="graph-hint"></p>
+      </section>
 
-      <div class="search__status" id="search-status" hidden></div>
-      <div class="search__log" id="search-log" hidden></div>
-      <div class="cache-info" id="cache-info" hidden></div>
+      <section class="cards-section" aria-labelledby="ledger-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Proof ledger</p>
+          <h2 id="ledger-heading">How the chain is built</h2>
+        </div>
+        <div class="cards" id="cards"></div>
+      </section>
 
-      <!-- quick target chips -->
-      <div class="quick-targets">
-        <span class="quick-label">popular targets:</span>
-        <button class="chip" data-target="hikaru">hikaru</button>
-        <button class="chip" data-target="magnuscarlsen">magnus carlsen</button>
-        <button class="chip" data-target="fabianocaruana">fabiano caruana</button>
-        <button class="chip" data-target="danielnaroditsky">daniel naroditsky</button>
-      </div>
-    </div>
-  </header>
-
-  <main>
-    <!-- the animated node graph -->
-    <section class="graph-section">
-      <div class="graph-header">
+      <section class="explain" aria-labelledby="explain-heading">
         <div>
-          <div class="graph-length" id="chain-length">—</div>
-          <div class="graph-length-label">games between you and <span id="target-name">…</span></div>
+          <p class="eyebrow">Source</p>
+          <h2 id="explain-heading">Public games, local search</h2>
         </div>
-        <button class="replay-btn" id="replay" type="button" title="Replay animation">
-          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-            <path d="M12 5V2L7 7l5 5V8c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" fill="currentColor"/>
-          </svg>
-          Replay
-        </button>
-      </div>
-      <div class="graph-wrap">
-        <svg id="graph" viewBox="0 0 1000 320" preserveAspectRatio="xMidYMid meet" aria-label="Connection graph"></svg>
-      </div>
-      <p class="graph-hint" id="graph-hint"></p>
-    </section>
-
-    <!-- hop detail cards -->
-    <section class="cards-section">
-      <h2 class="section-title">how you're connected</h2>
-      <div class="cards" id="cards"></div>
-    </section>
-
-    <!-- callout -->
-    <section class="cta">
-      <div class="cta__card">
-        <h3>how this works</h3>
         <p>
-          Every link is a real win from a real game on Chess.com —
-          rapid, blitz, or bullet. No daily games, no variants.
-          We read the moves off the public Chess.com data and trace
-          who beat who all the way to your target.
+          The app reads public Chess.com game archives, filters to standard live games,
+          and caches histories in your browser so repeat searches do less work.
         </p>
-        <a class="cta__btn" href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">
-          see the code →
-        </a>
-      </div>
-    </section>
-  </main>
+        <a class="text-link" href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">Read the code</a>
+      </section>
+    </main>
 
-  <footer class="footer">
-    <p>
-      Uses the public
-      <a href="https://www.chess.com/news/view/published-data-api" target="_blank" rel="noopener">Chess.com data feed</a>.
-      Runs in your browser — nothing is sent to a server.
-    </p>
-    <p>
-      <a href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">code on github →</a>
-    </p>
-  </footer>
+    <footer class="footer">
+      <p>Built from public Chess.com data. Nothing you search here is sent to a project server.</p>
+    </footer>
+  </div>
 
-  <!-- settings modal -->
   <div class="modal-overlay" id="settings-modal" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <div class="modal__header">
-        <h2 id="settings-title">settings</h2>
+        <h2 id="settings-title">Settings</h2>
         <button class="modal__close" id="settings-close" type="button" aria-label="Close">
           <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-            <path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" fill="currentColor"/>
+            <path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
           </svg>
         </button>
       </div>
       <div class="modal__body">
         <label class="setting">
-          <span class="setting__label">saved username</span>
+          <span class="setting__label">Saved username</span>
           <input id="setting-username" type="text" placeholder="chess.com username"
                  spellcheck="false" autocapitalize="none" />
-          <span class="setting__hint">we remember this so you don't have to type it every time</span>
+          <span class="setting__hint">Used to prefill the next search on this browser.</span>
         </label>
         <label class="setting">
-          <span class="setting__label">default search depth</span>
+          <span class="setting__label">Default search depth</span>
           <select id="setting-depth">
             <option value="3">3 steps</option>
             <option value="4">4 steps</option>
-            <option value="5">5 steps (slow)</option>
+            <option value="5">5 steps</option>
           </select>
-          <span class="setting__hint">how many links deep to look. deeper = slower</span>
+          <span class="setting__hint">Deeper searches can touch a lot more Chess.com archives.</span>
         </label>
         <div class="setting">
-          <span class="setting__label">cache</span>
+          <span class="setting__label">Cache</span>
           <div class="cache-controls">
-            <button class="setting__btn" id="setting-clear-cache" type="button">clear saved data</button>
+            <button class="setting__btn" id="setting-clear-cache" type="button">Clear saved data</button>
             <span class="setting__hint" id="setting-cache-size">…</span>
           </div>
-          <span class="setting__hint">your browser stores game data so repeat searches are faster</span>
+          <span class="setting__hint">Game histories stay in IndexedDB for seven days.</span>
         </div>
       </div>
     </div>

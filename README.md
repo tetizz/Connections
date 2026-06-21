@@ -1,73 +1,89 @@
-# ♞ Chess Connections
+# Chess Connections
 
-> Six degrees of chess separation. Trace the chain of **real recorded wins**
-> that links any player to the world's top grandmasters.
+Chess Connections answers a simple chess question:
 
-Live site: **https://tetizz.github.io/Connections/**
+> Who did I beat, who beat someone else, who beat someone else... until the chain reaches a grandmaster?
 
-This repo answers questions like:
+The site traces those links with real Chess.com live-game results. A link only counts when one player beat the next player in rapid, blitz, or bullet. Daily games and variants are skipped.
 
-> *"Who did I beat, who beat someone, who beat someone, ... who beat Hikaru?"*
+Live site: https://tetizz.github.io/Connections/
 
-Each link in the chain is a genuine win in a **live** Chess.com game
-(rapid / blitz / bullet). Daily (correspondence) games and variants
-(bughouse, chess960, etc.) are excluded — only real over-the-board-style wins
-count.
+## What the site does
 
----
+- Searches for a shortest known win chain between two Chess.com usernames.
+- Shows the chain as an animated graph.
+- Lists every hop with a link back to the original Chess.com game.
+- Saves fetched game histories in the browser for a week so repeated searches are faster.
+- Ships with precomputed example chains so the page has something useful to show immediately.
+
+## Dialogue changes
+
+The redesign rewrites the site copy around the way a chess player actually uses the tool:
+
+- "Trace chain" instead of vague search language.
+- "Recorded wins" for the chain length, because every edge needs a proof game.
+- "Proof ledger" for the hop list, because each row is evidence, not decoration.
+- Shorter status messages while the engine scans archives.
+- Settings copy that says exactly what is saved and why.
+
+No fake claims, no filler metrics, and no marketing page in front of the app.
 
 ## How it works
 
+The project is intentionally small:
+
+```text
+config.yml
+    |
+    v
+scripts/compute_chains.py
+    |
+    v
+data/*.json and site/data/*.json
+    |
+    v
+site/index.html, site/styles.css, site/app.js
 ```
-┌─────────────────┐     GitHub Actions      ┌──────────────┐     GitHub Pages
-│  Chess.com API  │ ─────────────────────▶  │  data/*.json │ ─────────────▶  🌐 animated site
-│  (public, no key)│   scripts/compute_chains │              │   site/ (static)
-└─────────────────┘                          └──────────────┘
-```
 
-1. **`scripts/chess_beaten_chain.py`** — the engine. Builds a directed graph
-   where `X → Y` means *X beat Y in a live standard game*, then runs BFS to
-   find the shortest path from a start player to a target.
-2. **`scripts/compute_chains.py`** — batch runner. Reads `config.yml`, runs
-   the search for every target, and writes `data/chains.json` +
-   `data/players.json`.
-3. **`.github/workflows/compute-chains.yml`** — runs weekly and on push,
-   commits fresh data back to `main`.
-4. **`.github/workflows/deploy-pages.yml`** — publishes `site/` to GitHub
-   Pages whenever data or site files change.
-5. **`site/`** — a no-build-step static site (vanilla HTML/CSS/JS) that
-   renders the chains as an animated node graph with a travelling chess piece.
+The Python scripts can precompute chains from `config.yml`. The static site reads the generated JSON for examples, then uses the browser-side engine for ad hoc searches.
 
-### Why precompute instead of live-search?
+Main files:
 
-Chess.com's pubapi does **not** send CORS headers, so a browser `fetch()` is
-blocked. Precomputing via GitHub Actions sidesteps that entirely — and keeps
-the site fast, free, and dependency-free.
-
----
+- `scripts/chess_beaten_chain.py` builds the directed graph. `A -> B` means A beat B in a standard live game.
+- `scripts/compute_chains.py` runs the configured searches and writes JSON.
+- `site/engine.js` runs the bidirectional search in the browser.
+- `site/cache.js` stores fetched game histories in IndexedDB.
+- `site/app.js` renders the graph, ledger, settings, and search states.
 
 ## Run it locally
 
 ```bash
-# find a single chain
-python scripts/chess_beaten_chain.py trixize1234 hikaru 4
-
-# regenerate all data/*.json from config.yml
-python scripts/compute_chains.py
-
-# preview the site (from the repo root)
 python -m http.server 8000
-# then open http://localhost:8000/site/
 ```
 
-> Note: the engine caches every player's game history under `chess_cache/`
-> (gitignored). First runs are slow; reruns are near-instant.
+Open:
 
----
+```text
+http://localhost:8000/site/
+```
 
-## Make it yours
+To regenerate the bundled data:
 
-Edit **`config.yml`**:
+```bash
+python scripts/compute_chains.py
+```
+
+To test a single chain from the command line:
+
+```bash
+python scripts/chess_beaten_chain.py trixize1234 hikaru 4
+```
+
+The scripts create a `chess_cache/` folder locally. It is ignored by git. First runs can be slow; cached runs are much faster.
+
+## Configure examples
+
+Edit `config.yml`:
 
 ```yaml
 start: your_username
@@ -79,27 +95,21 @@ targets:
     display: Magnus Carlsen
 ```
 
-Push to `main` — the Action recomputes and the site updates automatically.
-Or trigger a manual run from the
-[Actions tab](https://github.com/tetizz/Connections/actions)
-(`workflow_dispatch`).
+Then run:
 
----
+```bash
+python scripts/compute_chains.py
+```
 
-## Data source & limits
+Commit the updated JSON if you want the hosted examples to change.
 
-- All data comes from the public
-  [Chess.com Published Data API](https://www.chess.com/news/view/published-data-api)
-  (no API key, read-only).
-- The API is rate-limited (~300 req/min); the engine retries with backoff.
-- Chains longer than ~4 hops get slow due to graph fan-out. BFS guarantees
-  the chain shown is the **shortest** that exists within `max_depth`.
-- A chain may not exist for very strong targets — the site shows a graceful
-  "no chain within N hops" message in that case.
+## Data notes
 
----
+- Data comes from the public Chess.com Published Data API.
+- Searches can get expensive quickly because each player can add many more players to the graph.
+- Depth 3 or 4 is usually the practical range for a browser session.
+- If no chain is found, that means no chain was found inside the chosen depth, not that no chain exists.
 
 ## License
 
-MIT — see the engine and site files. Chess.com game data is owned by
-Chess.com and its players; this project only links to public game URLs.
+MIT. Chess.com game data belongs to Chess.com and its players; this project only links to public game pages.

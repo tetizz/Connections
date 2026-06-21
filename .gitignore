@@ -21,6 +21,11 @@ chain_log.txt
 chain_result.txt
 compute_log.txt
 server_log.txt
+live_shot.png
+headless_check.js
+headless_shot.js
+_chrome_profile/
+_chrome_profile2/
 
 # local computation cache (can be large; CI uses actions/cache)
 chess_cache/

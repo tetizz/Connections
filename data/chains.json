@@ -2,7 +2,7 @@
   "start": "trixize1234",
   "start_display": null,
   "max_depth": 4,
-  "computed_at": 1782030343,
+  "computed_at": 1782060149,
   "chains": [
     {
       "target": "hikaru",
@@ -159,13 +159,13 @@
     },
     {
       "target": "gmbenjaminfinegold",
-      "display": "GM Benjamin Bok",
+      "display": "GM Ben Finegold",
       "found": true,
       "length": 3,
       "path": [
         "trixize1234",
         "honisoitquimalypense",
-        "slippybishop",
+        "fl1ce",
         "gmbenjaminfinegold"
       ],
       "hops": [
@@ -176,13 +176,13 @@
         },
         {
           "from": "honisoitquimalypense",
-          "to": "slippybishop",
-          "url": "https://www.chess.com/game/live/3875815874"
+          "to": "fl1ce",
+          "url": "https://www.chess.com/game/live/4292530619"
         },
         {
-          "from": "slippybishop",
+          "from": "fl1ce",
           "to": "gmbenjaminfinegold",
-          "url": "https://www.chess.com/game/live/4222793084"
+          "url": "https://www.chess.com/game/live/144224297836"
         }
       ]
     },

@@ -1,0 +1,60 @@
+name: Compute Chains
+
+# Recomputes data/chains.json + data/players.json from the Chess.com pubapi
+# and commits the result back to main. The deploy-pages workflow then
+# publishes the updated site.
+
+on:
+  schedule:
+    # Every Sunday at 04:00 UTC
+    - cron: "0 4 * * 0"
+  push:
+    branches: [main]
+    paths:
+      - "config.yml"
+      - "scripts/**"
+      - ".github/workflows/compute-chains.yml"
+  workflow_dispatch: # manual "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compute-chains
+  cancel-in-progress: true
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache chess game data
+        uses: actions/cache@v4
+        with:
+          path: chess_cache
+          key: chess_cache-${{ github.run_id }}
+          restore-keys: |
+            chess_cache-
+
+      - name: Compute chains
+        run: python scripts/compute_chains.py
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/chains.json data/players.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: refresh chess connection chains [skip ci]"
+            git push
+          fi

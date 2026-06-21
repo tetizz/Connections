@@ -1,0 +1,45 @@
+# --- Chess Connections repo: keep this lean ---
+# Only the Connections project ships to github.com/tetizz/Connections.
+# Everything below is local scratch from earlier exploration and must
+# NOT be committed.
+
+# earlier exploration scripts (superseded by scripts/)
+beaten_chain.py
+best_win.py
+best_win_current.py
+best_win_parallel.py
+collect_wins.py
+conn2.py
+connections.py
+score_wins.py
+
+# scratch data from earlier exploration
+wins.json
+current_ratings.json
+connections_log.txt
+chain_log.txt
+chain_result.txt
+compute_log.txt
+server_log.txt
+
+# local computation cache (can be large; CI uses actions/cache)
+chess_cache/
+
+# empty placeholder created by cmd quirks
+nul
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# anything that isn't part of this project (other folders in the workspace)
+roblox-stuff/
+.agents/
+.zcode/

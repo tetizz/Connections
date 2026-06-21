@@ -1,0 +1,198 @@
+{
+  "start": "trixize1234",
+  "start_display": null,
+  "max_depth": 4,
+  "computed_at": 1782030343,
+  "chains": [
+    {
+      "target": "hikaru",
+      "display": "Hikaru Nakamura",
+      "found": true,
+      "length": 3,
+      "path": [
+        "trixize1234",
+        "madpotato",
+        "lucasmito",
+        "hikaru"
+      ],
+      "hops": [
+        {
+          "from": "trixize1234",
+          "to": "madpotato",
+          "url": "https://www.chess.com/game/live/165127805622"
+        },
+        {
+          "from": "madpotato",
+          "to": "lucasmito",
+          "url": "https://www.chess.com/game/live/1315436574"
+        },
+        {
+          "from": "lucasmito",
+          "to": "hikaru",
+          "url": "https://www.chess.com/game/live/109459898005"
+        }
+      ]
+    },
+    {
+      "target": "magnuscarlsen",
+      "display": "Magnus Carlsen",
+      "found": true,
+      "length": 3,
+      "path": [
+        "trixize1234",
+        "fredalsup",
+        "pianoskater",
+        "magnuscarlsen"
+      ],
+      "hops": [
+        {
+          "from": "trixize1234",
+          "to": "fredalsup",
+          "url": "https://www.chess.com/game/live/169295449982"
+        },
+        {
+          "from": "fredalsup",
+          "to": "pianoskater",
+          "url": "https://www.chess.com/game/live/63496054537"
+        },
+        {
+          "from": "pianoskater",
+          "to": "magnuscarlsen",
+          "url": "https://www.chess.com/game/live/115846799987"
+        }
+      ]
+    },
+    {
+      "target": "fabianocaruana",
+      "display": "Fabiano Caruana",
+      "found": true,
+      "length": 3,
+      "path": [
+        "trixize1234",
+        "madpotato",
+        "lucasmito",
+        "fabianocaruana"
+      ],
+      "hops": [
+        {
+          "from": "trixize1234",
+          "to": "madpotato",
+          "url": "https://www.chess.com/game/live/165127805622"
+        },
+        {
+          "from": "madpotato",
+          "to": "lucasmito",
+          "url": "https://www.chess.com/game/live/1315436574"
+        },
+        {
+          "from": "lucasmito",
+          "to": "fabianocaruana",
+          "url": "https://www.chess.com/game/live/123219233872"
+        }
+      ]
+    },
+    {
+      "target": "danielnaroditsky",
+      "display": "Daniel Naroditsky",
+      "found": true,
+      "length": 3,
+      "path": [
+        "trixize1234",
+        "madpotato",
+        "lucasmito",
+        "danielnaroditsky"
+      ],
+      "hops": [
+        {
+          "from": "trixize1234",
+          "to": "madpotato",
+          "url": "https://www.chess.com/game/live/165127805622"
+        },
+        {
+          "from": "madpotato",
+          "to": "lucasmito",
+          "url": "https://www.chess.com/game/live/1315436574"
+        },
+        {
+          "from": "lucasmito",
+          "to": "danielnaroditsky",
+          "url": "https://www.chess.com/game/live/81674688585"
+        }
+      ]
+    },
+    {
+      "target": "nihalsarin2004",
+      "display": "Nihal Sarin",
+      "found": true,
+      "length": 3,
+      "path": [
+        "trixize1234",
+        "kazimhyders",
+        "dancameron",
+        "nihalsarin2004"
+      ],
+      "hops": [
+        {
+          "from": "trixize1234",
+          "to": "kazimhyders",
+          "url": "https://www.chess.com/game/live/165116987924"
+        },
+        {
+          "from": "kazimhyders",
+          "to": "dancameron",
+          "url": "https://www.chess.com/game/live/167813327944"
+        },
+        {
+          "from": "dancameron",
+          "to": "nihalsarin2004",
+          "url": "https://www.chess.com/game/live/3291386173"
+        }
+      ]
+    },
+    {
+      "target": "alireza2003",
+      "display": "Alireza Firouzja",
+      "found": false,
+      "length": null,
+      "path": [],
+      "hops": []
+    },
+    {
+      "target": "gmbenjaminfinegold",
+      "display": "GM Benjamin Bok",
+      "found": true,
+      "length": 3,
+      "path": [
+        "trixize1234",
+        "honisoitquimalypense",
+        "slippybishop",
+        "gmbenjaminfinegold"
+      ],
+      "hops": [
+        {
+          "from": "trixize1234",
+          "to": "honisoitquimalypense",
+          "url": "https://www.chess.com/game/live/148412524176"
+        },
+        {
+          "from": "honisoitquimalypense",
+          "to": "slippybishop",
+          "url": "https://www.chess.com/game/live/3875815874"
+        },
+        {
+          "from": "slippybishop",
+          "to": "gmbenjaminfinegold",
+          "url": "https://www.chess.com/game/live/4222793084"
+        }
+      ]
+    },
+    {
+      "target": "lachlanq",
+      "display": "WGM Lachlan (tester)",
+      "found": false,
+      "length": null,
+      "path": [],
+      "hops": []
+    }
+  ]
+}

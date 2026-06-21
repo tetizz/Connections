@@ -1,0 +1,31 @@
+# Chess Connections configuration
+# Edit this file to change the source player or the target grandmasters.
+# The GitHub Action recomputes data/chains.json whenever this changes.
+
+# The player all chains start from.
+start: trixize1234
+
+# Maximum BFS depth (chain length). 4 is a good default - any deeper gets slow.
+max_depth: 4
+
+# Target players to find chains to. Titled players get a crown on the site.
+targets:
+  - username: hikaru
+    display: Hikaru Nakamura
+  - username: magnuscarlsen
+    display: Magnus Carlsen
+  - username: fabianocaruana
+    display: Fabiano Caruana
+  - username: danielnaroditsky
+    display: Daniel Naroditsky
+  - username: nihalsarin2004
+    display: Nihal Sarin
+  - username: alireza2003
+    display: Alireza Firouzja
+  - username: gmbenjaminfinegold
+    display: GM Ben Finegold
+  # lachlanq and alireza2003 have too few recorded losses for a chain to
+  # exist at depth 4 - kept as examples of the "no chain" graceful state.
+  # Remove or replace with other titled players to taste.
+  - username: lachlanq
+    display: WGM Lachlan (tester)

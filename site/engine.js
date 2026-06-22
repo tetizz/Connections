@@ -301,13 +301,14 @@ window.ChessChain = class ChessChain {
         return result;
       }
 
-      // replace the expanded frontier
+      // replace the expanded frontier (loop, not spread — spreading a huge
+      // array throws "Maximum call stack size exceeded")
       if (expandForward) {
         forwardFrontier.length = 0;
-        forwardFrontier.push(...nextFrontier);
+        for (let i = 0; i < nextFrontier.length; i++) forwardFrontier.push(nextFrontier[i]);
       } else {
         backwardFrontier.length = 0;
-        backwardFrontier.push(...nextFrontier);
+        for (let i = 0; i < nextFrontier.length; i++) backwardFrontier.push(nextFrontier[i]);
       }
     }
     this.log(`no connection found within ${maxDepth} steps. ` +
@@ -321,7 +322,9 @@ window.ChessChain = class ChessChain {
     // forward half: start -> ... -> mid
     const fwdHops = [];
     let cur = mid;
+    let guard = 0;
     while (forwardVisited.get(cur) && forwardVisited.get(cur).prev) {
+      if (guard++ > 10000) break; // safety against corrupted state
       const info = forwardVisited.get(cur);
       fwdHops.unshift({ from: info.prev, to: cur, url: info.hopUrl });
       cur = info.prev;
@@ -329,13 +332,15 @@ window.ChessChain = class ChessChain {
     // backward half: mid -> ... -> target
     const bwdHops = [];
     cur = mid;
+    guard = 0;
     while (backwardVisited.get(cur) && backwardVisited.get(cur).next) {
+      if (guard++ > 10000) break;
       const info = backwardVisited.get(cur);
       bwdHops.push({ from: cur, to: info.next, url: info.hopUrl });
       cur = info.next;
     }
-    const hops = [...fwdHops, ...bwdHops];
-    const path = hops.length ? [hops[0].from, ...hops.map(h => h.to)] : [mid];
+    const hops = fwdHops.concat(bwdHops);
+    const path = hops.length ? [hops[0].from].concat(hops.map(h => h.to)) : [mid];
     return { path, hops };
   }
 };

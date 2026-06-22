@@ -18,13 +18,13 @@ window.ChessChain = class ChessChain {
     // global concurrency gate for all HTTP requests — keeps us under
     // Chess.com's rate limit no matter how many tasks are queued.
     this._inflight = 0;
-    this._maxInflight = 3;
-    this._cache = cache;           // optional GameCache (IndexedDB)
-    this._lastReqTs = 0;           // throttle: min ms between request starts
-    this._minSpacing = 120;        // ~8 req/sec sustained, well under the limit
+    this._maxInflight = 20;         // max concurrency — hammer Chess.com
+    this._cache = cache;            // optional GameCache (IndexedDB)
+    this._lastReqTs = 0;            // throttle: min ms between request starts
+    this._minSpacing = 10;          // ~100 req/sec theoretical, throttled by 429s
     this._maxRetries = Number.isFinite(options.maxRetries)
       ? Math.max(1, options.maxRetries)
-      : 5;
+      : 8;
     this._fetchTimeout = Number.isFinite(options.fetchTimeout)
       ? Math.max(1000, options.fetchTimeout)
       : 0;
@@ -65,9 +65,9 @@ window.ChessChain = class ChessChain {
           signal: controller?.signal,
         });
         if (res.status === 429) {
-          // rate limited — back off then try again
-          const wait = 1000 * Math.pow(2, attempt);
-          this.log(`chess.com is busy, waiting ${Math.round(wait/1000)}s before retrying…`);
+          // rate limited — short backoff then hammer again
+          const wait = 300 * Math.pow(2, attempt); // 0.3s, 0.6s, 1.2s...
+          this.log(`chess.com throttled us, pausing ${(wait/1000).toFixed(1)}s…`);
           await new Promise(r => setTimeout(r, wait));
           continue;
         }

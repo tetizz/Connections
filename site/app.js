@@ -698,6 +698,13 @@
         (engine.stats.cached ? `, ${engine.stats.cached} from cache` : "") + ".");
       setActiveChip(target);
 
+      // auto-submit to the global leaderboard (fire-and-forget)
+      if (window.Leaderboard) {
+        window.Leaderboard.submit(
+          start, target, result.path.length - 1, result.path
+        ).then(() => window.Leaderboard && window.Leaderboard.load());
+      }
+
       renderChain({
         target,
         display: targetMeta.name || target,
@@ -888,5 +895,7 @@
       localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
     }
     loadShowcase();
+    // load the global leaderboard in the background
+    if (window.Leaderboard) window.Leaderboard.load();
   });
 })();

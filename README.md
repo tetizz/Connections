@@ -55,6 +55,31 @@ Main files:
 - `site/engine.js` runs the bidirectional search in the browser.
 - `site/cache.js` stores fetched game histories in IndexedDB.
 - `site/app.js` renders the graph, ledger, settings, and search states.
+- `site/leaderboard.js` auto-submits + displays the global leaderboard.
+- `worker/` is the Cloudflare Worker backend for the leaderboard (KV storage).
+
+## Leaderboard backend (one-time deploy)
+
+The shared leaderboard needs a tiny backend. It runs free on Cloudflare's
+edge. Deploy it once:
+
+```bash
+cd worker
+npm install
+npx wrangler login          # one-time, opens browser to authorize
+npm run deploy              # creates KV namespace + deploys the worker
+```
+
+This prints a Worker URL like
+`https://chess-connections-leaderboard.<your-subdomain>.workers.dev`.
+The site already points at that URL by default — if your subdomain
+differs, update `WORKER_URL` in `site/leaderboard.js` and push.
+
+The worker:
+- `POST /submit` — stores a chain, dedupes by (start,target) keeping the
+  shortest, rate-limited to 1 per IP per 10s.
+- `GET /leaderboard?limit=50` — returns ranked entries (shortest first).
+- `GET /health` — uptime check.
 
 ## Run it locally
 

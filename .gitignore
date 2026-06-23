@@ -22,8 +22,11 @@ chain_result.txt
 compute_log.txt
 server_log.txt
 live_shot.png
+baseline_full.png
+shot.js
 headless_check.js
 headless_shot.js
+_shot_profile/
 _chrome_profile/
 _chrome_profile2/
 

@@ -140,12 +140,12 @@ window.ChessChain = class ChessChain {
       : archives;
     this.log(`reading ${u}'s ${this._archiveLabel()} (${selectedArchives.length}/${archives.length} archives)…`);
     const games = [];
-    // fetch archives with throttling to respect rate limits
+    // fetch archives — rely on the global _maxInflight gate for throttling
     const tasks = selectedArchives.map((a) => async () => {
       try { return await this.fetchJSON(a); }
       catch { return { games: [] }; }
     });
-    const results = await this.runThrottled(tasks, 3);
+    const results = await this.runThrottled(tasks, this._maxInflight);
     for (const data of results) {
       for (const g of data.games || []) {
         if (g.rules !== "chess") continue;  // skip variants
@@ -288,7 +288,7 @@ window.ChessChain = class ChessChain {
           }
         }
       };
-      await Promise.all(Array.from({ length: 4 }, expandOne));
+      await Promise.all(Array.from({ length: this._maxInflight }, expandOne));
 
       // report progress roughly every ~50 nodes
       this.log(`checked ${frontier.length} more players — ${totalVisited()} total, ${this.stats.apiCalls} requests so far`);

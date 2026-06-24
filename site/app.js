@@ -34,7 +34,6 @@
     }
     return n;
   };
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   })[c]);
@@ -334,6 +333,9 @@
     });
     svg.appendChild(nodesGroup);
 
+    const spark = el("circle", { class: "edge-spark", cx: positions[0].x, cy: positions[0].y, r: 4 });
+    svg.appendChild(spark);
+
     const traveller = el("text", { class: "traveller", x: positions[0].x, y: positions[0].y });
     traveller.textContent = "♞";
     svg.appendChild(traveller);
@@ -341,57 +343,68 @@
     $("#graph-hint").textContent =
       `every arrow is a real win from a real game. ${n - 1} link${n - 1 === 1 ? "" : "s"} in total.`;
 
-    animateGraph(svg, positions, traveller);
+    animateGraph(svg, traveller, spark);
   }
 
   const pieceFor = (isStart, isTarget) => (isTarget ? "♚" : "♟");
 
   // ---------- animations ----------
-  async function animateGraph(svg, positions, traveller) {
+  async function animateGraph(svg, traveller, spark) {
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    svg.querySelectorAll(".edge-line").forEach((p) => {
+    const nodes = Array.from(svg.querySelectorAll(".node"));
+    const lines = Array.from(svg.querySelectorAll(".edge-line"));
+    const glows = Array.from(svg.querySelectorAll(".edge-glow"));
+
+    lines.forEach((p) => {
       const len = p.getTotalLength();
       p.style.strokeDasharray = len;
       p.style.strokeDashoffset = len;
       p.style.transition = "none";
     });
-    svg.querySelectorAll(".node").forEach((node) => {
+    glows.forEach((p) => {
+      const len = p.getTotalLength();
+      p.style.strokeDasharray = len;
+      p.style.strokeDashoffset = len;
+      p.style.opacity = 0;
+      p.style.transition = "none";
+    });
+    nodes.forEach((node) => {
       node.style.opacity = 0;
-      node.style.transform = node.getAttribute("transform") + " scale(0.4)";
+      node.style.transform = node.getAttribute("transform") + " scale(0.52)";
       node.style.transformOrigin = "center";
       node.style.transition = "none";
     });
-    svg.querySelectorAll(".edge-glow").forEach((p) => (p.style.opacity = 0));
-    traveller.style.opacity = 0;
+    [traveller, spark].forEach((marker) => {
+      if (!marker) return;
+      marker.style.opacity = 0;
+      marker.style.transition = "none";
+    });
 
     if (reduced) {
-      svg.querySelectorAll(".edge-line").forEach((p) => (p.style.strokeDashoffset = 0));
-      svg.querySelectorAll(".edge-glow").forEach((p) => (p.style.opacity = 0.18));
-      svg.querySelectorAll(".node").forEach((node) => {
+      lines.forEach((p) => (p.style.strokeDashoffset = 0));
+      glows.forEach((p) => {
+        p.style.strokeDashoffset = 0;
+        p.style.opacity = 0.1;
+      });
+      nodes.forEach((node) => {
         node.style.opacity = 1;
         node.style.transform = node.getAttribute("transform");
       });
       return;
     }
 
-    const nodes = svg.querySelectorAll(".node");
-    const lines = svg.querySelectorAll(".edge-line");
-    const glows = svg.querySelectorAll(".edge-glow");
-
     await revealNode(nodes[0]);
     await pulse(nodes[0]);
     for (let i = 0; i < lines.length; i++) {
-      glows[i].style.transition = "opacity .4s ease";
-      glows[i].style.opacity = 0.18;
-      lines[i].style.transition = "stroke-dashoffset .6s ease";
-      lines[i].style.strokeDashoffset = 0;
-      await sleep(600);
-      await slideTraveller(traveller, positions[i], positions[i + 1]);
+      await travelPath(lines[i], glows[i], traveller, spark);
       await revealNode(nodes[i + 1]);
       await pulse(nodes[i + 1]);
     }
-    traveller.style.transition = "opacity .3s";
-    traveller.style.opacity = 0;
+    [traveller, spark].forEach((marker) => {
+      if (!marker) return;
+      marker.style.transition = "opacity .3s ease";
+      marker.style.opacity = 0;
+    });
   }
 
   function revealNode(node, delay = 0) {
@@ -420,24 +433,47 @@
     });
   }
 
-  function slideTraveller(traveller, from, to) {
+  function travelPath(path, glow, traveller, spark) {
     return new Promise((resolve) => {
-      const dur = 650, start = performance.now();
-      const midX = (from.x + to.x) / 2;
-      const peakY = Math.min(from.y, to.y) - 28;
+      const len = path.getTotalLength();
+      const dur = 760;
+      const start = performance.now();
+      if (glow) {
+        glow.style.opacity = 0.11;
+        glow.style.strokeDasharray = len;
+        glow.style.strokeDashoffset = len;
+      }
       function frame(now) {
         const t = Math.min(1, (now - start) / dur);
-        const e = t < .5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-        const x = (1 - e) ** 2 * from.x + 2 * (1 - e) * e * midX + e ** 2 * to.x;
-        const y = (1 - e) ** 2 * from.y + 2 * (1 - e) * e * peakY + e ** 2 * to.y;
-        traveller.setAttribute("x", x);
-        traveller.setAttribute("y", y);
+        const e = easeInOutCubic(t);
+        const point = path.getPointAtLength(len * e);
+        path.style.strokeDashoffset = len * (1 - e);
+        if (glow) glow.style.strokeDashoffset = len * (1 - e);
+        traveller.setAttribute("x", point.x);
+        traveller.setAttribute("y", point.y);
         traveller.style.opacity = 1;
-        if (t < 1) requestAnimationFrame(frame);
-        else resolve();
+        if (spark) {
+          spark.setAttribute("cx", point.x);
+          spark.setAttribute("cy", point.y);
+          spark.style.opacity = t < 0.96 ? 1 : 0;
+        }
+        if (t < 1) {
+          requestAnimationFrame(frame);
+        } else {
+          path.style.strokeDashoffset = 0;
+          if (glow) {
+            glow.style.strokeDashoffset = 0;
+            glow.style.opacity = 0.08;
+          }
+          resolve();
+        }
       }
       requestAnimationFrame(frame);
     });
+  }
+
+  function easeInOutCubic(t) {
+    return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
   }
 
   // ---------- hop cards ----------
@@ -848,12 +884,9 @@
   // ---------- wire up ----------
   $("#replay").addEventListener("click", () => {
     const svg = $("#graph");
-    const positions = Array.from(svg.querySelectorAll(".node")).map((n) => {
-      const t = n.getAttribute("transform").match(/translate\(([\d.]+),\s*([\d.]+)\)/);
-      return { x: +t[1], y: +t[2] };
-    });
     const traveller = svg.querySelector(".traveller");
-    if (positions.length && traveller) animateGraph(svg, positions, traveller);
+    const spark = svg.querySelector(".edge-spark");
+    if (svg.querySelector(".node") && traveller) animateGraph(svg, traveller, spark);
   });
 
   $("#search-form").addEventListener("submit", (e) => {

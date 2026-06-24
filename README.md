@@ -12,7 +12,7 @@ Live site: https://tetizz.github.io/Connections/
 
 - Searches for a verified win chain between two Chess.com usernames.
 - Shows the chain as an animated graph.
-- Ranks searches by the most middle connections found. The start player and target are shown in the path but do not count toward the score.
+- Ranks the top connector players by how often they appear in the middle of submitted chains.
 - Lists every hop with a link back to the original Chess.com game.
 - Saves fetched game histories in the browser and shared Cloudflare KV cache for a week so repeated searches are faster.
 - Defaults to an instant bridge check so a random username gets a fast answer instead of a long crawl.
@@ -56,7 +56,7 @@ Main files:
 - `site/engine.js` runs the bidirectional search in the browser.
 - `site/cache.js` reads from IndexedDB first, then the shared Cloudflare Worker cache when configured.
 - `site/app.js` renders the graph, ledger, settings, and search states.
-- `site/leaderboard.js` auto-submits found chains and displays the global most-connections leaderboard. Its score is the number of middle players between the start and target.
+- `site/leaderboard.js` auto-submits found chains and displays the top 10 connector players with Chess.com profile photos.
 - `worker/` is the Cloudflare Worker backend for the leaderboard and shared game-history cache.
 
 ## Cloudflare backend
@@ -71,7 +71,7 @@ Endpoints:
 
 - `GET /games?key=username:recent:N` checks KV first, then fetches public Chess.com archives on a miss and stores sanitized game rows for seven days.
 - `POST /submit` stores an automatically submitted found chain, rejects duplicate exact paths, dedupes by `(start,target)` while keeping the chain with the most middle connections, and rate-limits writes by IP.
-- `GET /leaderboard?limit=50` returns ranked entries with the most connections first.
+- `GET /leaderboard?limit=50` returns connector-player rankings built from stored chains.
 - `GET /health` is an uptime check.
 
 Useful commands:

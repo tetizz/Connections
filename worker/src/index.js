@@ -3,7 +3,7 @@
  * -----------------------------------
  * - GET /games?key=username:recent:N caches sanitized Chess.com game rows.
  * - POST /submit stores found chains for the global leaderboard.
- * - GET /leaderboard ranks entries by most connections first.
+ * - GET /leaderboard ranks middle players by how often they connect chains.
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
@@ -70,13 +70,13 @@ async function handleGames(url, env) {
 
 async function handleLeaderboard(url, env) {
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 200);
-  const entries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
-  entries.sort((a, b) =>
-    b.length - a.length ||
-    b.steps - a.steps ||
-    b.ts - a.ts ||
-    `${a.start}|${a.target}`.localeCompare(`${b.start}|${b.target}`));
-  return json({ entries: entries.slice(0, limit), total: entries.length }, 200, "no-store");
+  const chains = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
+  const entries = connectorLeaderboard(chains);
+  return json({
+    entries: entries.slice(0, limit),
+    total: entries.length,
+    chainTotal: chains.length,
+  }, 200, "no-store");
 }
 
 async function handleSubmit(request, env) {
@@ -281,6 +281,36 @@ function isBetterStoredEntry(candidate, current) {
   if (candidate.length !== current.length) return candidate.length > current.length;
   if (candidate.steps !== current.steps) return candidate.steps > current.steps;
   return candidate.ts < current.ts;
+}
+
+function connectorLeaderboard(chains) {
+  const players = new Map();
+  for (const chain of chains) {
+    const middlePlayers = [...new Set(chain.path.slice(1, -1))];
+    for (const username of middlePlayers) {
+      const current = players.get(username) || {
+        username,
+        count: 0,
+        latestTs: 0,
+        examples: [],
+      };
+      current.count++;
+      current.latestTs = Math.max(current.latestTs, chain.ts);
+      if (current.examples.length < 3) {
+        current.examples.push({
+          start: chain.start,
+          target: chain.target,
+          steps: chain.steps,
+        });
+      }
+      players.set(username, current);
+    }
+  }
+
+  return [...players.values()].sort((a, b) =>
+    b.count - a.count ||
+    b.latestTs - a.latestTs ||
+    a.username.localeCompare(b.username));
 }
 
 function json(body, status = 200, cacheControl = null) {

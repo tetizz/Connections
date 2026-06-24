@@ -10,8 +10,10 @@ window.Leaderboard = (() => {
   const WORKER_URL = String(
     window.CONNECTIONS_CACHE_API || "https://connections-cache.tetizz.workers.dev"
   ).replace(/\/+$/, "");
-  const LB_CACHE_KEY = "chess-connections:leaderboard:v2";
+  const LB_CACHE_KEY = "chess-connections:leaderboard:v4";
+  const PROFILE_CACHE_KEY = "chess-connections:leaderboard-profiles:v1";
   const LB_CACHE_TTL = 30 * 1000;
+  const PROFILE_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
 
   /** Auto-submit a found chain. Fire-and-forget; never blocks the UI. */
   async function submit(start, target, length, path) {
@@ -33,16 +35,16 @@ window.Leaderboard = (() => {
     const el = document.getElementById("leaderboard-list");
     if (!el) return;
     const cached = readCached();
-    if (cached) render(el, cached);
+    if (cached) await render(el, cached);
     else el.innerHTML = '<div class="lb-loading">loading…</div>';
     try {
-      const res = await fetch(WORKER_URL + "/leaderboard?limit=25", {
+      const res = await fetch(WORKER_URL + "/leaderboard?limit=10", {
         headers: { "Accept": "application/json" },
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const { entries } = await res.json();
       writeCached(entries);
-      render(el, entries);
+      await render(el, entries);
     } catch (e) {
       el.innerHTML =
         '<div class="lb-empty">leaderboard isn\'t live yet — ' +
@@ -50,41 +52,42 @@ window.Leaderboard = (() => {
     }
   }
 
-  function render(el, entries) {
+  async function render(el, entries) {
     if (!entries || entries.length === 0) {
       el.innerHTML =
-        '<div class="lb-empty">no entries yet — be the first to find a connection!</div>';
+        '<div class="lb-empty">no connector scores yet — find a chain with a middle player.</div>';
       return;
     }
-    const medals = ["🥇", "🥈", "🥉"];
-    el.innerHTML = entries.map((e, i) => {
-      const rank = i < 3 ? medals[i] : `<span class="lb-rank-num">${i + 1}</span>`;
-      const pathStr = e.path && e.path.length
-        ? e.path.join(" → ")
-        : `${e.start} → ${e.target}`;
-      const connections = scoreOf(e);
-      const steps = Number.isFinite(e.steps)
-        ? e.steps
-        : Math.max(0, (e.path?.length || 1) - 1);
-      const ago = timeAgo(e.ts);
-      return `
-        <div class="lb-row${i < 3 ? " lb-row--top" : ""}">
-          <div class="lb-rank">${rank}</div>
-          <div class="lb-main">
-            <div class="lb-path">${esc(pathStr)}</div>
-            <div class="lb-meta">${connections} middle connection${connections === 1 ? "" : "s"} · ${steps} link${steps === 1 ? "" : "s"} · ${ago}</div>
-          </div>
-        </div>`;
-    }).join("");
-  }
-
-  function scoreOf(entry) {
-    if (Number.isFinite(entry.connections)) return entry.connections;
-    if (Array.isArray(entry.path) && entry.path.length >= 2) {
-      return Math.max(0, entry.path.length - 2);
+    const top = entries.filter((entry) => entry?.username).slice(0, 10);
+    if (!top.length) {
+      el.innerHTML =
+        '<div class="lb-empty">no connector scores yet — find a chain with a middle player.</div>';
+      return;
     }
-    const length = Number(entry.length);
-    return Number.isFinite(length) ? Math.max(0, length) : 0;
+    const profiles = await loadProfiles(top.map((e) => e.username));
+    el.innerHTML = top.map((e, i) => {
+      const profile = profiles.get(e.username) || {};
+      const rankClass = i === 0 ? " is-gold" : i === 1 ? " is-silver" : i === 2 ? " is-bronze" : "";
+      const profileUrl = profile.url || `https://www.chess.com/member/${encodeURIComponent(e.username)}`;
+      const title = profile.title ? `<span class="lb-title">${esc(profile.title)}</span>` : "";
+      const avatar = profile.avatar
+        ? `<img class="lb-avatar" src="${esc(profile.avatar)}" alt="${esc(e.username)} profile photo" referrerpolicy="no-referrer" loading="lazy">`
+        : `<span class="lb-avatar lb-avatar--fallback">${esc((e.username[0] || "?").toUpperCase())}</span>`;
+      const examples = Array.isArray(e.examples) && e.examples.length
+        ? e.examples.map((example) => `${example.start} → ${example.target}`).join(" · ")
+        : "submitted chains";
+      const ago = timeAgo(e.latestTs || e.ts);
+      const count = Number(e.count) || 0;
+      return `
+        <a class="lb-row${i < 3 ? " lb-row--top" : ""}" href="${esc(profileUrl)}" target="_blank" rel="noopener">
+          <div class="lb-rank${rankClass}"><span>${i + 1}</span></div>
+          ${avatar}
+          <div class="lb-main">
+            <div class="lb-path">${title}${esc(e.username)}</div>
+            <div class="lb-meta">${count} chain${count === 1 ? "" : "s"} · ${esc(examples)} · ${ago}</div>
+          </div>
+        </a>`;
+    }).join("");
   }
 
   function readCached() {
@@ -100,6 +103,55 @@ window.Leaderboard = (() => {
   function writeCached(entries) {
     try {
       localStorage.setItem(LB_CACHE_KEY, JSON.stringify({ ts: Date.now(), entries }));
+    } catch {
+      // best-effort only
+    }
+  }
+
+  async function loadProfiles(usernames) {
+    const cache = readProfileCache();
+    const profiles = new Map();
+    await Promise.all(usernames.map(async (username) => {
+      const key = username.toLowerCase();
+      const cached = cache[key];
+      if (cached && Date.now() - cached.ts < PROFILE_CACHE_TTL) {
+        profiles.set(username, cached.profile);
+        return;
+      }
+      try {
+        const res = await fetch(`https://api.chess.com/pub/player/${encodeURIComponent(username)}`, {
+          headers: { "Accept": "application/json" },
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        const profile = {
+          username: data.username || username,
+          name: data.name || "",
+          title: data.title || "",
+          avatar: data.avatar || "",
+          url: data.url || `https://www.chess.com/member/${username}`,
+        };
+        cache[key] = { ts: Date.now(), profile };
+        profiles.set(username, profile);
+      } catch {
+        profiles.set(username, { username, url: `https://www.chess.com/member/${username}` });
+      }
+    }));
+    writeProfileCache(cache);
+    return profiles;
+  }
+
+  function readProfileCache() {
+    try {
+      return JSON.parse(localStorage.getItem(PROFILE_CACHE_KEY) || "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  function writeProfileCache(cache) {
+    try {
+      localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify(cache));
     } catch {
       // best-effort only
     }

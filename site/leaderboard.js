@@ -79,7 +79,7 @@ window.Leaderboard = (() => {
       const ago = timeAgo(e.latestTs || e.ts);
       const count = Number(e.count) || 0;
       return `
-        <a class="lb-row${i < 3 ? " lb-row--top" : ""}" href="${esc(profileUrl)}" target="_blank" rel="noopener">
+        <a class="lb-row${i < 3 ? " lb-row--top" : ""}" style="--row-index:${i}" href="${esc(profileUrl)}" target="_blank" rel="noopener">
           <div class="lb-rank${rankClass}"><span>${i + 1}</span></div>
           ${avatar}
           <div class="lb-main">

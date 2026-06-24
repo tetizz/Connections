@@ -10,6 +10,8 @@ const CHESS_API = "https://api.chess.com/pub/player/";
 const TTL_SECONDS = 7 * 24 * 60 * 60;
 const MAX_LEADERBOARD_ENTRIES = 1000;
 const ARCHIVE_CONCURRENCY = 8;
+const SUBMIT_WINDOW_SECONDS = 60;
+const MAX_SUBMITS_PER_WINDOW = 30;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -118,9 +120,12 @@ async function handleSubmit(request, env) {
     }, 200, "no-store");
   }
 
-  const lastSubmit = parseInt(await env.GAMES_CACHE.get(rateLimitKey) || "0", 10);
-  if (Date.now() - lastSubmit < 10000) {
-    return json({ error: "too soon, wait a moment" }, 429);
+  const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
+  if (submitWindow.count >= MAX_SUBMITS_PER_WINDOW) {
+    return json({
+      error: "too many submissions, wait a moment",
+      retryAfter: Math.max(1, SUBMIT_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
+    }, 429);
   }
 
   const existingIndex = entries.findIndex((entry) => `${entry.start}|${entry.target}` === key);
@@ -150,7 +155,10 @@ async function handleSubmit(request, env) {
   if (entries.length > MAX_LEADERBOARD_ENTRIES) entries.length = MAX_LEADERBOARD_ENTRIES;
 
   await env.GAMES_CACHE.put("leaderboard:entries", JSON.stringify(entries));
-  await env.GAMES_CACHE.put(rateLimitKey, String(Date.now()), { expirationTtl: 60 });
+  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
+    startedAt: submitWindow.startedAt,
+    count: submitWindow.count + 1,
+  }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
 
   return json({ ok: true, entry }, 200, "no-store");
 }
@@ -281,6 +289,24 @@ function isBetterStoredEntry(candidate, current) {
   if (candidate.length !== current.length) return candidate.length > current.length;
   if (candidate.steps !== current.steps) return candidate.steps > current.steps;
   return candidate.ts < current.ts;
+}
+
+async function readSubmitWindow(kv, key) {
+  const now = Date.now();
+  const raw = await kv.get(key);
+  if (!raw) return { startedAt: now, count: 0 };
+  try {
+    const parsed = JSON.parse(raw);
+    if (Number.isFinite(parsed.startedAt) &&
+        Number.isFinite(parsed.count) &&
+        now - parsed.startedAt < SUBMIT_WINDOW_SECONDS * 1000) {
+      return parsed;
+    }
+  } catch {
+    // Old deployments stored a timestamp string. Treat that as expired so
+    // legitimate quick-target submissions are not blocked after deploy.
+  }
+  return { startedAt: now, count: 0 };
 }
 
 function connectorLeaderboard(chains) {

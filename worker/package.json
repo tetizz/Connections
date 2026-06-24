@@ -1,5 +1,5 @@
 {
-  "name": "chess-connections-leaderboard",
+  "name": "connections-cache",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -8,6 +8,6 @@
     "dev": "wrangler dev"
   },
   "devDependencies": {
-    "wrangler": "^3.0.0"
+    "wrangler": "^4.104.0"
   }
 }

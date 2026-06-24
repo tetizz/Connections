@@ -591,6 +591,7 @@ html[data-theme="dark"] .chip {
 }
 
 .graph-section,
+.leaderboard-section,
 .cards-section,
 .explain {
   margin-top: 22px;
@@ -601,6 +602,7 @@ html[data-theme="dark"] .chip {
 }
 
 html[data-theme="dark"] .graph-section,
+html[data-theme="dark"] .leaderboard-section,
 html[data-theme="dark"] .cards-section,
 html[data-theme="dark"] .explain {
   background: rgba(23, 28, 23, .90);
@@ -625,6 +627,138 @@ html[data-theme="dark"] .explain {
   color: var(--ink);
   font-size: clamp(24px, 3vw, 34px);
   line-height: 1.08;
+}
+
+.leaderboard-section {
+  padding: clamp(20px, 3vw, 28px);
+}
+
+.leaderboard-summary {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: right;
+}
+
+.leaderboard {
+  display: grid;
+  gap: 8px;
+}
+
+.leaderboard-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  color: var(--ink);
+  background: #fffaf0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  text-align: left;
+  cursor: pointer;
+  transition: transform .18s ease, border-color .18s ease, background .18s ease, box-shadow .18s ease;
+}
+
+html[data-theme="dark"] .leaderboard-row {
+  background: #151a15;
+}
+
+.leaderboard-row:hover,
+.leaderboard-row.is-active {
+  background: #fffdf8;
+  border-color: var(--brass);
+  box-shadow: 0 10px 24px rgba(57, 47, 32, .10);
+  transform: translateY(-1px);
+}
+
+html[data-theme="dark"] .leaderboard-row:hover,
+html[data-theme="dark"] .leaderboard-row.is-active {
+  background: #1b211b;
+}
+
+.leaderboard-rank {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  color: #fffdf8;
+  background: var(--panel-dark);
+  border-radius: 50%;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.leaderboard-player {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.leaderboard-player strong,
+.leaderboard-player small,
+.leaderboard-count small {
+  display: block;
+}
+
+.leaderboard-player strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.leaderboard-player small,
+.leaderboard-count small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.leaderboard-avatar {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  display: grid;
+  place-items: center;
+  color: #fffdf8;
+  background: var(--moss-2);
+  border: 2px solid #fffdf8;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px var(--line);
+  font-weight: 800;
+  object-fit: cover;
+}
+
+html[data-theme="dark"] .leaderboard-avatar {
+  border-color: #111511;
+}
+
+.leaderboard-count {
+  min-width: 88px;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+  text-align: right;
+}
+
+.leaderboard-count strong {
+  display: block;
+  color: var(--brass-2);
+  font-family: var(--mono);
+  font-size: 28px;
+  line-height: 1;
+}
+
+.leaderboard-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
 }
 
 .graph-metric {
@@ -1209,6 +1343,15 @@ html[data-theme="dark"] .setting__btn:hover {
     align-items: start;
   }
 
+  .section-heading {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .leaderboard-summary {
+    text-align: left;
+  }
+
   .graph-metric,
   .replay-btn {
     width: fit-content;
@@ -1257,6 +1400,28 @@ html[data-theme="dark"] .setting__btn:hover {
     gap: 11px;
   }
 
+  .leaderboard-row {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+
+  .leaderboard-count {
+    grid-column: 2;
+    min-width: 0;
+    padding-left: 0;
+    border-left: 0;
+    text-align: left;
+  }
+
+  .leaderboard-count strong,
+  .leaderboard-count small {
+    display: inline;
+  }
+
+  .leaderboard-count strong {
+    margin-right: 5px;
+    font-size: 20px;
+  }
+
   .card__proof {
     width: fit-content;
   }
@@ -1284,7 +1449,12 @@ html[data-theme="dark"] .setting__btn:hover {
 
 /* ---------- LEADERBOARD ---------- */
 .leaderboard-section { margin-top: 56px; }
-.lb-sub { font-size: 13px; color: var(--faint); font-weight: 400; }
+.lb-sub {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--faint);
+  font-weight: 400;
+}
 
 .lb-loading, .lb-empty {
   color: var(--faint);

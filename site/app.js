@@ -38,6 +38,8 @@
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   })[c]);
+  const connectionCount = (path = []) => Math.max(0, path.length - 2);
+  const stepText = (count) => `${count} step${count === 1 ? "" : "s"}`;
 
   const titleOf = (u) => state.players?.[u.toLowerCase()]?.title || null;
   const nameOf = (u) => {
@@ -101,6 +103,12 @@
     $("#chain-length").textContent = chain.found ? chain.length : "—";
     renderGraph(chain);
     renderCards(chain);
+  }
+
+  function submitLeaderboardChain(start, target, chain) {
+    if (!window.Leaderboard || !chain?.found || !Array.isArray(chain.path)) return;
+    window.Leaderboard.submit(start, target, connectionCount(chain.path), chain.path)
+      .then(() => window.Leaderboard && window.Leaderboard.load());
   }
 
   function precomputedChain(start, target) {
@@ -543,14 +551,16 @@
     const savedChain = precomputedChain(start, target);
     if (savedChain) {
       showStatus("done", `loaded the saved ${savedChain.display || target} chain instantly.`);
-      renderChain({
+      const renderedChain = {
         target: savedChain.target,
         display: savedChain.display || nameOf(savedChain.target),
         found: savedChain.found,
         length: savedChain.length,
         path: savedChain.path,
         hops: savedChain.hops,
-      });
+      };
+      renderChain(renderedChain);
+      submitLeaderboardChain(start, target, renderedChain);
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
       return;
     }
@@ -649,12 +659,15 @@
         const bridgeWork = bridgeEngine.stats.apiCalls
           ? `made ${bridgeEngine.stats.apiCalls} quick requests` +
             (bridgeEngine.stats.cached ? `, ${bridgeEngine.stats.cached} from cache` : "")
+          : bridgeEngine.stats.cached
+            ? `read ${bridgeEngine.stats.cached} player cache${bridgeEngine.stats.cached === 1 ? "" : "s"}`
           : "used the saved bridge index";
         showStatus("done",
-          `✓ found it fast — ${esc(start)} connects to ${esc(target)} in ${bridged.length} steps. ` +
+          `✓ found it fast — ${esc(start)} connects to ${esc(target)} in ${stepText(bridged.length)}. ` +
           `checked ${esc(mode.instantOnly ? mode.label : "the instant bridge first")} and ${bridgeWork}.`);
         setActiveChip(target);
         renderChain(bridged);
+        submitLeaderboardChain(start, target, bridged);
         document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
         return;
       }
@@ -693,26 +706,21 @@
       await hydratePlayers(result.path.slice(1, -1), engine);
 
       showStatus("done",
-        `✓ found it — ${esc(start)} connects to ${esc(target)} in ${result.path.length - 1} steps. ` +
+        `✓ found it — ${esc(start)} connects to ${esc(target)} in ${stepText(result.path.length - 1)}. ` +
         `looked at ${engine.stats.fetched} players, made ${engine.stats.apiCalls} requests` +
         (engine.stats.cached ? `, ${engine.stats.cached} from cache` : "") + ".");
       setActiveChip(target);
 
-      // auto-submit to the global leaderboard (fire-and-forget)
-      if (window.Leaderboard) {
-        window.Leaderboard.submit(
-          start, target, result.path.length - 1, result.path
-        ).then(() => window.Leaderboard && window.Leaderboard.load());
-      }
-
-      renderChain({
+      const renderedChain = {
         target,
         display: targetMeta.name || target,
         found: true,
         length: result.path.length - 1,
         path: result.path,
         hops: result.hops,
-      });
+      };
+      renderChain(renderedChain);
+      submitLeaderboardChain(start, target, renderedChain);
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
     } catch (e) {
       console.error(e);

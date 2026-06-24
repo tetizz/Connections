@@ -1,106 +1,295 @@
 /**
- * Chess Connections leaderboard Worker
- * ------------------------------------
- * Stores chain results in Cloudflare KV, dedupes by (start,target)
- * keeping the shortest chain, rate-limits by IP, serves a global board.
- *
- * Endpoints:
- *   POST /submit   { start, target, length, path }  -> stores it
- *   GET  /leaderboard?limit=50                       -> ranked entries
- *   GET  /health                                      -> { ok: true }
+ * Chess Connections Cloudflare Worker
+ * -----------------------------------
+ * - GET /games?key=username:recent:N caches sanitized Chess.com game rows.
+ * - POST /submit stores found chains for the global leaderboard.
+ * - GET /leaderboard ranks entries by most connections first.
  */
+
+const CHESS_API = "https://api.chess.com/pub/player/";
+const TTL_SECONDS = 7 * 24 * 60 * 60;
+const MAX_LEADERBOARD_ENTRIES = 1000;
+const ARCHIVE_CONCURRENCY = 8;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Content-Type": "application/json",
+  "Access-Control-Allow-Headers": "Accept, Content-Type",
 };
-
-const json = (body, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: CORS });
 
 export default {
   async fetch(request, env) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS });
+    }
+
     const url = new URL(request.url);
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: CORS });
-    }
-
-    // ---- GET /health ----
     if (url.pathname === "/health") {
-      return json({ ok: true, ts: Date.now() });
+      return json({ ok: true, service: "connections-cache", ts: Date.now() });
     }
 
-    // ---- GET /leaderboard ----
+    if (url.pathname === "/games" && request.method === "GET") {
+      return handleGames(url, env);
+    }
+
     if (url.pathname === "/leaderboard" && request.method === "GET") {
-      const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 200);
-      const list = await env.LEADERBOARD.get("entries", "json") || [];
-      // sort: shortest chain first, then most recent
-      list.sort((a, b) =>
-        a.length !== b.length ? a.length - b.length : b.ts - a.ts);
-      return json({ entries: list.slice(0, limit), total: list.length });
+      return handleLeaderboard(url, env);
     }
 
-    // ---- POST /submit ----
     if (url.pathname === "/submit" && request.method === "POST") {
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-
-      // rate limit: 1 submission per IP per 10 seconds
-      const lastSubmit = parseInt(
-        await env.LEADERBOARD.get(`ratelimit:${ip}`) || "0", 10);
-      if (Date.now() - lastSubmit < 10000) {
-        return json({ error: "too soon, wait a moment" }, 429);
-      }
-
-      let body;
-      try { body = await request.json(); }
-      catch { return json({ error: "bad json" }, 400); }
-
-      const start = String(body.start || "").toLowerCase().trim().slice(0, 40);
-      const target = String(body.target || "").toLowerCase().trim().slice(0, 40);
-      const length = parseInt(body.length, 10);
-      const path = Array.isArray(body.path) ? body.path.slice(0, 10) : [];
-      if (!start || !target || !Number.isFinite(length) || length < 1 || length > 9) {
-        return json({ error: "missing fields" }, 400);
-      }
-
-      // load existing entries, dedupe by (start,target) keeping shortest
-      const list = await env.LEADERBOARD.get("entries", "json") || [];
-      const key = `${start}|${target}`;
-      const existingIdx = list.findIndex(e =>
-        `${e.start}|${e.target}` === key);
-
-      const entry = {
-        start, target, length,
-        path: path.map(p => String(p).toLowerCase().slice(0, 40)),
-        ts: Date.now(),
-      };
-
-      if (existingIdx >= 0) {
-        // only overwrite if this chain is shorter (or equal, newer)
-        if (length <= list[existingIdx].length) {
-          list[existingIdx] = entry;
-        } else {
-          return json({ ok: true, deduped: true, message: "already have a shorter one" });
-        }
-      } else {
-        list.push(entry);
-      }
-
-      // cap total stored entries to prevent runaway growth
-      if (list.length > 1000) {
-        list.sort((a, b) => a.length - b.length);
-        list.length = 1000;
-      }
-
-      await env.LEADERBOARD.put("entries", JSON.stringify(list));
-      await env.LEADERBOARD.put(`ratelimit:${ip}`, String(Date.now()));
-
-      return json({ ok: true, entry });
+      return handleSubmit(request, env);
     }
 
     return json({ error: "not found" }, 404);
   },
 };
+
+async function handleGames(url, env) {
+  const key = url.searchParams.get("key") || "";
+  const parsed = parseGameCacheKey(key);
+  if (!parsed) return json({ error: "Invalid cache key" }, 400);
+
+  const kvKey = `games:${key.toLowerCase()}`;
+  const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
+  if (cached?.games && Date.now() - cached.ts < TTL_SECONDS * 1000) {
+    return json({ source: "cloudflare-kv", key, games: cached.games });
+  }
+
+  const games = await fetchGames(parsed);
+  await env.GAMES_CACHE.put(kvKey, JSON.stringify({ ts: Date.now(), games }), {
+    expirationTtl: TTL_SECONDS,
+    metadata: {
+      username: parsed.username,
+      range: `recent:${parsed.archiveLimit}`,
+    },
+  });
+
+  return json({ source: "chess.com", key, games });
+}
+
+async function handleLeaderboard(url, env) {
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 200);
+  const entries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
+  entries.sort((a, b) =>
+    b.length - a.length ||
+    b.steps - a.steps ||
+    b.ts - a.ts ||
+    `${a.start}|${a.target}`.localeCompare(`${b.start}|${b.target}`));
+  return json({ entries: entries.slice(0, limit), total: entries.length }, 200, "no-store");
+}
+
+async function handleSubmit(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const rateLimitKey = `leaderboard:ratelimit:${ip}`;
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "bad json" }, 400);
+  }
+
+  const start = cleanUsername(body.start);
+  const target = cleanUsername(body.target);
+  const submittedLength = parseInt(body.length, 10);
+  const path = Array.isArray(body.path)
+    ? body.path.slice(0, 12).map(cleanUsername).filter(Boolean)
+    : [];
+  const normalizedPath = normalizePath(start, target, path);
+  const steps = Math.max(0, normalizedPath.length - 1);
+  const length = connectionCount(normalizedPath, submittedLength);
+  const pathKey = chainKey(normalizedPath);
+
+  if (!start || !target || start === target || normalizedPath.length < 2 ||
+      !Number.isFinite(length) || length < 0 || length > 10) {
+    return json({ error: "missing fields" }, 400);
+  }
+
+  const entries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
+  const key = `${start}|${target}`;
+  const duplicatePath = entries.find((entry) => entry.pathKey === pathKey);
+  if (duplicatePath) {
+    return json({
+      ok: true,
+      deduped: true,
+      reason: "same-chain",
+      entry: duplicatePath,
+    }, 200, "no-store");
+  }
+
+  const lastSubmit = parseInt(await env.GAMES_CACHE.get(rateLimitKey) || "0", 10);
+  if (Date.now() - lastSubmit < 10000) {
+    return json({ error: "too soon, wait a moment" }, 429);
+  }
+
+  const existingIndex = entries.findIndex((entry) => `${entry.start}|${entry.target}` === key);
+  const entry = {
+    start,
+    target,
+    length,
+    connections: length,
+    steps,
+    path: normalizedPath,
+    pathKey,
+    ts: Date.now(),
+  };
+
+  if (existingIndex >= 0) {
+    if (length > entries[existingIndex].length ||
+        (length === entries[existingIndex].length && steps >= entries[existingIndex].steps)) {
+      entries[existingIndex] = entry;
+    } else {
+      return json({ ok: true, deduped: true, message: "already have a chain with more connections" }, 200, "no-store");
+    }
+  } else {
+    entries.push(entry);
+  }
+
+  entries.sort((a, b) => b.length - a.length || b.steps - a.steps || b.ts - a.ts);
+  if (entries.length > MAX_LEADERBOARD_ENTRIES) entries.length = MAX_LEADERBOARD_ENTRIES;
+
+  await env.GAMES_CACHE.put("leaderboard:entries", JSON.stringify(entries));
+  await env.GAMES_CACHE.put(rateLimitKey, String(Date.now()), { expirationTtl: 60 });
+
+  return json({ ok: true, entry }, 200, "no-store");
+}
+
+function parseGameCacheKey(key) {
+  const normalized = key.toLowerCase();
+  const match = normalized.match(/^([a-z0-9_-]{2,50}):recent:(\d{1,2})$/);
+  if (!match) return null;
+  const archiveLimit = Math.max(1, Math.min(12, Number(match[2])));
+  return { username: match[1], archiveLimit };
+}
+
+async function fetchGames({ username, archiveLimit }) {
+  const archiveData = await fetchJSON(`${CHESS_API}${username}/games/archives`);
+  const archives = Array.isArray(archiveData.archives) ? archiveData.archives : [];
+  const selectedArchives = archives.slice(-archiveLimit);
+  const results = await runThrottled(
+    selectedArchives.map((archiveUrl) => async () => {
+      try {
+        return await fetchJSON(archiveUrl);
+      } catch {
+        return { games: [] };
+      }
+    }),
+    ARCHIVE_CONCURRENCY,
+  );
+
+  const games = [];
+  for (const data of results) {
+    for (const game of data.games || []) {
+      if (game.rules !== "chess") continue;
+      games.push({
+        white: (game.white?.username || "").toLowerCase(),
+        black: (game.black?.username || "").toLowerCase(),
+        whiteResult: game.white?.result,
+        blackResult: game.black?.result,
+        url: game.url,
+        timeClass: game.time_class,
+      });
+    }
+  }
+  return games;
+}
+
+async function fetchJSON(url) {
+  const response = await fetch(url, {
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "chess-connections-cache/1.0",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} on ${url}`);
+  }
+  return response.json();
+}
+
+async function runThrottled(tasks, concurrency) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (next < tasks.length) {
+      const index = next++;
+      results[index] = await tasks[index]();
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function cleanUsername(value) {
+  return String(value || "").toLowerCase().trim().replace(/[^a-z0-9_-]/g, "").slice(0, 40);
+}
+
+function normalizePath(start, target, path) {
+  const clean = path.filter(Boolean);
+  if (!clean.length) return [start, target];
+  if (clean[0] !== start) clean.unshift(start);
+  if (clean[clean.length - 1] !== target) clean.push(target);
+  return clean.slice(0, 12);
+}
+
+function chainKey(path) {
+  return path.map(cleanUsername).filter(Boolean).join(">");
+}
+
+function connectionCount(path, fallback) {
+  if (Array.isArray(path) && path.length >= 2) return Math.max(0, path.length - 2);
+  if (Number.isFinite(fallback)) return Math.max(0, Math.min(10, fallback));
+  return 0;
+}
+
+function normalizeEntries(entries) {
+  if (!Array.isArray(entries)) return [];
+  const normalized = entries
+    .map((entry) => {
+      const start = cleanUsername(entry.start);
+      const target = cleanUsername(entry.target);
+      const path = normalizePath(start, target, Array.isArray(entry.path)
+        ? entry.path.slice(0, 12).map(cleanUsername).filter(Boolean)
+        : []);
+      const steps = Math.max(0, path.length - 1);
+      const length = connectionCount(path, parseInt(entry.length, 10));
+      if (!start || !target || start === target || path.length < 2) return null;
+      return {
+        start,
+        target,
+        length,
+        connections: length,
+        steps,
+        path,
+        pathKey: chainKey(path),
+        ts: Number.isFinite(entry.ts) ? entry.ts : Date.now(),
+      };
+    })
+    .filter(Boolean);
+  const unique = new Map();
+  for (const entry of normalized) {
+    const current = unique.get(entry.pathKey);
+    if (!current || isBetterStoredEntry(entry, current)) {
+      unique.set(entry.pathKey, entry);
+    }
+  }
+  return [...unique.values()];
+}
+
+function isBetterStoredEntry(candidate, current) {
+  if (candidate.length !== current.length) return candidate.length > current.length;
+  if (candidate.steps !== current.steps) return candidate.steps > current.steps;
+  return candidate.ts < current.ts;
+}
+
+function json(body, status = 200, cacheControl = null) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...CORS,
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": cacheControl || (status === 200 ? "public, max-age=60" : "no-store"),
+    },
+  });
+}

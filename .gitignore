@@ -32,6 +32,7 @@ _chrome_profile2/
 
 # local computation cache (can be large; CI uses actions/cache)
 chess_cache/
+.wrangler/
 
 # empty placeholder created by cmd quirks
 nul

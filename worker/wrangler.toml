@@ -1,9 +1,8 @@
-name = "chess-connections-leaderboard"
+name = "connections-cache"
 main = "src/index.js"
-compatibility_date = "2024-09-25"
+compatibility_date = "2026-06-24"
+workers_dev = true
 
-# KV namespace for storing submissions. Created on first deploy —
-# wrangler will print the binding to add here if it's missing.
 [[kv_namespaces]]
-binding = "LEADERBOARD"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+binding = "GAMES_CACHE"
+id = "47131485ddf648b9b6b3d9b74eacfb60"

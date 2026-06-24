@@ -146,15 +146,18 @@
 
       <section class="leaderboard-section" aria-labelledby="lb-heading">
         <div class="section-heading">
-          <p class="eyebrow">Hall of fame</p>
-          <h2 id="lb-heading">Shortest connections found</h2>
+          <div>
+            <p class="eyebrow">Leaderboard</p>
+            <h2 id="lb-heading">Most connections found</h2>
+            <p class="lb-sub">Start and target stay visible in the path; only middle players count.</p>
+          </div>
         </div>
         <div id="leaderboard-list"></div>
       </section>
     </main>
 
     <footer class="footer">
-      <p>Built from public Chess.com data. Nothing you search here is sent to a project server.</p>
+      <p>Built from public Chess.com data. Recent searches can use the shared Cloudflare cache.</p>
     </footer>
   </div>
 
@@ -196,6 +199,7 @@
     </div>
   </div>
 
+  <script src="config.js"></script>
   <script src="cache.js"></script>
   <script src="engine.js"></script>
   <script src="leaderboard.js"></script>

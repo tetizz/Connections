@@ -7,13 +7,11 @@
    ============================================================ */
 
 window.Leaderboard = (() => {
-  // Worker URL — set this after deploying (see README).
-  // Defaults to a sensible placeholder so the site degrades gracefully
-  // (shows "leaderboard coming soon" until configured).
-  const WORKER_URL = "https://chess-connections-leaderboard.tetizz.workers.dev";
-
-  const inDev = () =>
-    location.hostname === "localhost" || location.hostname === "127.0.0.1";
+  const WORKER_URL = String(
+    window.CONNECTIONS_CACHE_API || "https://connections-cache.tetizz.workers.dev"
+  ).replace(/\/+$/, "");
+  const LB_CACHE_KEY = "chess-connections:leaderboard:v2";
+  const LB_CACHE_TTL = 30 * 1000;
 
   /** Auto-submit a found chain. Fire-and-forget; never blocks the UI. */
   async function submit(start, target, length, path) {
@@ -21,6 +19,7 @@ window.Leaderboard = (() => {
       await fetch(WORKER_URL + "/submit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        keepalive: true,
         body: JSON.stringify({ start, target, length, path }),
       });
     } catch (e) {
@@ -33,11 +32,16 @@ window.Leaderboard = (() => {
   async function load() {
     const el = document.getElementById("leaderboard-list");
     if (!el) return;
-    el.innerHTML = '<div class="lb-loading">loading…</div>';
+    const cached = readCached();
+    if (cached) render(el, cached);
+    else el.innerHTML = '<div class="lb-loading">loading…</div>';
     try {
-      const res = await fetch(WORKER_URL + "/leaderboard?limit=25");
+      const res = await fetch(WORKER_URL + "/leaderboard?limit=25", {
+        headers: { "Accept": "application/json" },
+      });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const { entries } = await res.json();
+      writeCached(entries);
       render(el, entries);
     } catch (e) {
       el.innerHTML =
@@ -58,16 +62,47 @@ window.Leaderboard = (() => {
       const pathStr = e.path && e.path.length
         ? e.path.join(" → ")
         : `${e.start} → ${e.target}`;
+      const connections = scoreOf(e);
+      const steps = Number.isFinite(e.steps)
+        ? e.steps
+        : Math.max(0, (e.path?.length || 1) - 1);
       const ago = timeAgo(e.ts);
       return `
         <div class="lb-row${i < 3 ? " lb-row--top" : ""}">
           <div class="lb-rank">${rank}</div>
           <div class="lb-main">
             <div class="lb-path">${esc(pathStr)}</div>
-            <div class="lb-meta">${e.length} step${e.length === 1 ? "" : "s"} · ${ago}</div>
+            <div class="lb-meta">${connections} middle connection${connections === 1 ? "" : "s"} · ${steps} link${steps === 1 ? "" : "s"} · ${ago}</div>
           </div>
         </div>`;
     }).join("");
+  }
+
+  function scoreOf(entry) {
+    if (Number.isFinite(entry.connections)) return entry.connections;
+    if (Array.isArray(entry.path) && entry.path.length >= 2) {
+      return Math.max(0, entry.path.length - 2);
+    }
+    const length = Number(entry.length);
+    return Number.isFinite(length) ? Math.max(0, length) : 0;
+  }
+
+  function readCached() {
+    try {
+      const cached = JSON.parse(localStorage.getItem(LB_CACHE_KEY) || "null");
+      if (!cached || Date.now() - cached.ts > LB_CACHE_TTL) return null;
+      return cached.entries;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeCached(entries) {
+    try {
+      localStorage.setItem(LB_CACHE_KEY, JSON.stringify({ ts: Date.now(), entries }));
+    } catch {
+      // best-effort only
+    }
   }
 
   function timeAgo(ts) {

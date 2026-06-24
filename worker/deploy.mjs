@@ -1,5 +1,5 @@
 /**
- * deploy.mjs — one-command deploy for the leaderboard Worker.
+ * deploy.mjs — one-command deploy for the Connections backend Worker.
  *
  *   cd worker && npm install && npm run deploy
  *
@@ -8,7 +8,7 @@
  * Requires the user to have run `wrangler login` (or set CLOUDFLARE_API_TOKEN).
  */
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -16,22 +16,22 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const sh = (cmd) => execSync(cmd, { cwd: HERE, stdio: "pipe" }).toString().trim();
 const run = (cmd) => execSync(cmd, { cwd: HERE, stdio: "inherit" });
 
-console.log("♟  Chess Connections leaderboard — deploy\n");
+console.log("Chess Connections backend deploy\n");
 
 // 1. make sure wrangler is available + authenticated
 try {
   sh("npx wrangler --version");
 } catch {
-  console.error("✗ wrangler not found. Run `npm install` first.");
+  console.error("wrangler not found. Run `npm install` first.");
   process.exit(1);
 }
 
 try {
-  console.log("• checking Cloudflare auth…");
+  console.log("checking Cloudflare auth...");
   sh("npx wrangler whoami");
 } catch {
   console.error(
-    "\n✗ Not logged into Cloudflare.\n" +
+    "\nNot logged into Cloudflare.\n" +
     "  Run:  npx wrangler login\n" +
     "  (opens a browser to authorize, one-time)\n");
   process.exit(1);
@@ -45,9 +45,9 @@ let kvId = idMatch && idMatch[1] !== "REPLACE_WITH_KV_NAMESPACE_ID"
   ? idMatch[1] : null;
 
 if (!kvId) {
-  console.log("• creating KV namespace 'LEADERBOARD'…");
+  console.log("creating KV namespace 'GAMES_CACHE'...");
   try {
-    const out = sh("npx wrangler kv namespace create LEADERBOARD");
+    const out = sh("npx wrangler kv namespace create GAMES_CACHE");
     // output contains: id = "abc123..."
     const m = out.match(/id\s*=\s*"([a-f0-9]+)"/);
     if (!m) throw new Error("couldn't parse namespace id from: " + out);
@@ -57,28 +57,27 @@ if (!kvId) {
       `id = "${kvId}"`
     );
     writeFileSync(tomlPath, toml);
-    console.log(`  ✓ created, id: ${kvId}`);
+    console.log(`created, id: ${kvId}`);
   } catch (e) {
-    console.error("✗ failed to create KV namespace:", e.message);
+    console.error("failed to create KV namespace:", e.message);
     process.exit(1);
   }
 } else {
-  console.log(`• using existing KV namespace: ${kvId}`);
+  console.log(`using existing KV namespace: ${kvId}`);
 }
 
 // 3. deploy
-console.log("• deploying worker…\n");
+console.log("deploying worker...\n");
 try {
   run("npx wrangler deploy");
 } catch {
   process.exit(1);
 }
 
-// 4. print the URL to paste into leaderboard.js
-const workerName = "chess-connections-leaderboard";
-console.log("\n────────────────────────────────────────────────");
-console.log("✓ deployed!");
+// 4. print the URL to paste into site/config.js
+const workerName = "connections-cache";
+console.log("\n------------------------------------------------");
+console.log("deployed");
 console.log(`\n  Worker URL: https://${workerName}.<your-subdomain>.workers.dev`);
-console.log("\n  Add it to site/leaderboard.js (WORKER_URL) if different from");
-console.log("  the default, then push the site. Done.");
-console.log("────────────────────────────────────────────────\n");
+console.log("\n  If the URL changed, update site/config.js, then push the site.");
+console.log("------------------------------------------------\n");

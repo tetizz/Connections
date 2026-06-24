@@ -10,10 +10,11 @@ Live site: https://tetizz.github.io/Connections/
 
 ## What the site does
 
-- Searches for a shortest known win chain between two Chess.com usernames.
+- Searches for a verified win chain between two Chess.com usernames.
 - Shows the chain as an animated graph.
+- Ranks searches by the most middle connections found. The start player and target are shown in the path but do not count toward the score.
 - Lists every hop with a link back to the original Chess.com game.
-- Saves fetched game histories in the browser for a week so repeated searches are faster.
+- Saves fetched game histories in the browser and shared Cloudflare KV cache for a week so repeated searches are faster.
 - Defaults to an instant bridge check so a random username gets a fast answer instead of a long crawl.
 - Ships with precomputed example chains so the page has something useful to show immediately.
 
@@ -53,33 +54,36 @@ Main files:
 - `scripts/chess_beaten_chain.py` builds the directed graph. `A -> B` means A beat B in a standard live game.
 - `scripts/compute_chains.py` runs the configured searches and writes JSON.
 - `site/engine.js` runs the bidirectional search in the browser.
-- `site/cache.js` stores fetched game histories in IndexedDB.
+- `site/cache.js` reads from IndexedDB first, then the shared Cloudflare Worker cache when configured.
 - `site/app.js` renders the graph, ledger, settings, and search states.
-- `site/leaderboard.js` auto-submits + displays the global leaderboard.
-- `worker/` is the Cloudflare Worker backend for the leaderboard (KV storage).
+- `site/leaderboard.js` auto-submits found chains and displays the global most-connections leaderboard. Its score is the number of middle players between the start and target.
+- `worker/` is the Cloudflare Worker backend for the leaderboard and shared game-history cache.
 
-## Leaderboard backend (one-time deploy)
+## Cloudflare backend
 
-The shared leaderboard needs a tiny backend. It runs free on Cloudflare's
-edge. Deploy it once:
+The shared backend runs on Cloudflare Workers + KV:
+
+```text
+https://connections-cache.tetizz.workers.dev
+```
+
+Endpoints:
+
+- `GET /games?key=username:recent:N` checks KV first, then fetches public Chess.com archives on a miss and stores sanitized game rows for seven days.
+- `POST /submit` stores an automatically submitted found chain, rejects duplicate exact paths, dedupes by `(start,target)` while keeping the chain with the most middle connections, and rate-limits writes by IP.
+- `GET /leaderboard?limit=50` returns ranked entries with the most connections first.
+- `GET /health` is an uptime check.
+
+Useful commands:
 
 ```bash
 cd worker
 npm install
-npx wrangler login          # one-time, opens browser to authorize
-npm run deploy              # creates KV namespace + deploys the worker
+npx wrangler whoami
+npm run deploy
 ```
 
-This prints a Worker URL like
-`https://chess-connections-leaderboard.<your-subdomain>.workers.dev`.
-The site already points at that URL by default — if your subdomain
-differs, update `WORKER_URL` in `site/leaderboard.js` and push.
-
-The worker:
-- `POST /submit` — stores a chain, dedupes by (start,target) keeping the
-  shortest, rate-limited to 1 per IP per 10s.
-- `GET /leaderboard?limit=50` — returns ranked entries (shortest first).
-- `GET /health` — uptime check.
+After changing the Worker URL, update `site/config.js`.
 
 ## Run it locally
 
@@ -136,6 +140,7 @@ Commit the updated JSON if you want the hosted examples to change.
 - Depth 3 is the practical default for a browser session.
 - `Instant bridge` checks the starting player's latest two monthly archives for a direct win or a known connector into a saved master-player route. It returns fast and stops there.
 - `Recent fast` checks the latest six monthly archives for each player it touches.
+- `Last year` checks the latest twelve monthly archives and can use the shared Cloudflare cache.
 - `Full slow` checks all available archives and can take much longer, especially for famous players.
 - If no chain is found, that means no chain was found inside the chosen depth, not that no chain exists.
 

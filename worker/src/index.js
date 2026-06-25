@@ -8,6 +8,7 @@
 
 const CHESS_API = "https://api.chess.com/pub/player/";
 const TTL_SECONDS = 7 * 24 * 60 * 60;
+const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const KV_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const MAX_LEADERBOARD_ENTRIES = 1000;
 const ARCHIVE_CONCURRENCY = 4;
@@ -42,6 +43,10 @@ export default {
 
     if (url.pathname === "/leaderboard" && request.method === "GET") {
       return handleLeaderboard(url, env);
+    }
+
+    if (url.pathname === "/profile" && request.method === "GET") {
+      return handleProfile(url, env);
     }
 
     if (url.pathname === "/submit" && request.method === "POST") {
@@ -108,6 +113,45 @@ async function handleLeaderboard(url, env) {
     total: entries.length,
     chainTotal: chains.length,
   }, 200, "no-store");
+}
+
+async function handleProfile(url, env) {
+  const username = cleanUsername(url.searchParams.get("username"));
+  if (!username) return json({ error: "Invalid username" }, 400);
+
+  const kvKey = `profile:${username}`;
+  const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
+  const cachedProfile = cached?.profile && typeof cached.profile === "object"
+    ? cached.profile
+    : null;
+  const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
+
+  if (cachedProfile && Date.now() - cachedAt < PROFILE_TTL_SECONDS * 1000) {
+    return json({ source: "cloudflare-kv", profile: cachedProfile });
+  }
+
+  try {
+    const data = await fetchJSON(`${CHESS_API}${username}`);
+    const profile = profileShape(data, username);
+    await env.GAMES_CACHE.put(kvKey, JSON.stringify({ ts: Date.now(), profile }), {
+      expirationTtl: KV_RETENTION_SECONDS,
+      metadata: { username, type: "profile" },
+    });
+    return json({ source: "chess.com", profile });
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "profile_upstream_error",
+      username,
+      message: error?.message || String(error),
+    }));
+    if (cachedProfile) {
+      return json({ source: "cloudflare-kv-stale", profile: cachedProfile, stale: true }, 200, "public, max-age=60");
+    }
+    return json({
+      error: "Chess.com profile is unavailable right now.",
+      username,
+    }, 502, "no-store");
+  }
 }
 
 async function handleSubmit(request, env) {
@@ -194,6 +238,8 @@ async function handleSubmit(request, env) {
 
 function parseGameCacheKey(key) {
   const normalized = key.toLowerCase();
+  const allMatch = normalized.match(/^([a-z0-9_-]{2,50}):all$/);
+  if (allMatch) return { username: allMatch[1], archiveLimit: Infinity };
   const match = normalized.match(/^([a-z0-9_-]{2,50}):recent:(\d{1,2})$/);
   if (!match) return null;
   const archiveLimit = Math.max(1, Math.min(12, Number(match[2])));
@@ -203,7 +249,9 @@ function parseGameCacheKey(key) {
 async function fetchGames({ username, archiveLimit }) {
   const archiveData = await fetchJSON(`${CHESS_API}${username}/games/archives`);
   const archives = Array.isArray(archiveData.archives) ? archiveData.archives : [];
-  const selectedArchives = archives.slice(-archiveLimit);
+  const selectedArchives = Number.isFinite(archiveLimit)
+    ? archives.slice(-archiveLimit)
+    : archives;
   const results = await runThrottled(
     selectedArchives.map((archiveUrl) => async () => {
       try {
@@ -231,6 +279,24 @@ async function fetchGames({ username, archiveLimit }) {
     }
   }
   return games;
+}
+
+function profileShape(data, fallbackUsername) {
+  const username = cleanUsername(data?.username || fallbackUsername);
+  const countryUrl = typeof data?.country === "string" ? data.country : "";
+  const country = countryUrl ? countryUrl.split("/").pop() : "";
+  return {
+    username,
+    name: String(data?.name || ""),
+    title: String(data?.title || ""),
+    avatar: String(data?.avatar || ""),
+    url: String(data?.url || `https://www.chess.com/member/${username}`),
+    country,
+    followers: Number.isFinite(data?.followers) ? data.followers : null,
+    joined: Number.isFinite(data?.joined) ? data.joined : null,
+    lastOnline: Number.isFinite(data?.last_online) ? data.last_online : null,
+    status: String(data?.status || ""),
+  };
 }
 
 async function fetchJSON(url) {
@@ -389,7 +455,7 @@ async function putGamesCache(kv, kvKey, parsed, games) {
       expirationTtl: KV_RETENTION_SECONDS,
       metadata: {
         username: parsed.username,
-        range: `recent:${parsed.archiveLimit}`,
+        range: Number.isFinite(parsed.archiveLimit) ? `recent:${parsed.archiveLimit}` : "all",
       },
     });
   } catch (error) {

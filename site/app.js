@@ -17,6 +17,7 @@
   const LS_RANGE_KEY = "chess-connections:range";
   const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
   const INTRO_COMPLETE_KEY = "chess-connections:intro-complete:v1";
+  const SHARE_PARAM = "share";
   const DEFAULT_TARGET = "magnuscarlsen";
   const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
   let introCompletedThisSession = false;
@@ -45,6 +46,8 @@
     chains: null,
     players: null,
     activeTarget: null,
+    currentChain: null,
+    profilePromises: new Map(),
   };
 
   // ---------- small utils ----------
@@ -168,7 +171,7 @@
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
     return `
       <button class="chip quick-player${username === active ? " is-active" : ""}" type="button"
-              data-target="${esc(username)}" data-display="${esc(display)}" style="--player-index:${index}"${index >= 5 ? " hidden" : ""}>
+              data-target="${esc(username)}" data-display="${esc(display)}" data-profile-user="${esc(username)}" style="--player-index:${index}"${index >= 5 ? " hidden" : ""}>
         <span class="quick-player__avatar">${avatar}</span>
         <span class="quick-player__body">
           <span class="quick-player__name">${rank}<strong>${esc(display)}</strong></span>
@@ -266,10 +269,138 @@
   }
 
   function renderChain(chain) {
+    state.currentChain = chain;
     $("#target-name").textContent = chain.display || chain.target;
     $("#chain-length").textContent = chain.found ? chain.length : "—";
     renderGraph(chain);
     renderCards(chain);
+    updateShareButton(chain);
+  }
+
+  function updateShareButton(chain) {
+    const btn = $("#copy-share");
+    if (!btn) return;
+    if (!chain?.found || !Array.isArray(chain.path) || !chain.path.length) {
+      btn.hidden = true;
+      delete btn.dataset.shareUrl;
+      return;
+    }
+    btn.hidden = false;
+    btn.dataset.shareUrl = buildShareUrl(chain);
+    btn.classList.remove("is-copied");
+    btn.lastChild.textContent = " Copy link";
+  }
+
+  function buildShareUrl(chain) {
+    const url = new URL(location.href);
+    url.searchParams.set(SHARE_PARAM, encodeSharePayload(chain));
+    url.searchParams.set("v", "shared");
+    return url.toString();
+  }
+
+  function encodeSharePayload(chain) {
+    const players = {};
+    for (const username of chain.path || []) {
+      const key = String(username || "").toLowerCase();
+      if (!key || !state.players?.[key]) continue;
+      players[key] = state.players[key];
+    }
+    const payload = {
+      v: 1,
+      target: chain.target,
+      display: chain.display || nameOf(chain.target),
+      length: chain.length,
+      path: chain.path,
+      hops: chain.hops,
+      players,
+      ts: Date.now(),
+    };
+    return base64UrlEncode(JSON.stringify(payload));
+  }
+
+  function decodeSharePayload(value) {
+    try {
+      const parsed = JSON.parse(base64UrlDecode(value || ""));
+      if (parsed?.v !== 1 || !Array.isArray(parsed.path) || !Array.isArray(parsed.hops)) return null;
+      if (parsed.path.length < 2 || parsed.hops.length !== parsed.path.length - 1) return null;
+      const path = parsed.path.map((u) => String(u || "").trim().toLowerCase()).filter(Boolean).slice(0, 12);
+      const hops = parsed.hops.slice(0, 11).map((hop, index) => ({
+        from: String(hop?.from || path[index] || "").trim().toLowerCase(),
+        to: String(hop?.to || path[index + 1] || "").trim().toLowerCase(),
+        url: String(hop?.url || ""),
+      })).filter((hop) => hop.from && hop.to);
+      if (path.length < 2 || hops.length !== path.length - 1) return null;
+      return {
+        target: String(parsed.target || path[path.length - 1]).trim().toLowerCase(),
+        display: String(parsed.display || parsed.target || path[path.length - 1]),
+        found: true,
+        length: Number.isFinite(parsed.length) ? parsed.length : hops.length,
+        path,
+        hops,
+        players: parsed.players && typeof parsed.players === "object" ? parsed.players : {},
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function loadSharedChainFromUrl() {
+    const params = new URL(location.href).searchParams;
+    const shared = decodeSharePayload(params.get(SHARE_PARAM));
+    if (!shared) return false;
+    state.players = state.players || {};
+    for (const [username, profile] of Object.entries(shared.players || {})) {
+      const key = username.toLowerCase();
+      state.players[key] = {
+        ...(state.players[key] || {}),
+        ...metaShape({ username: key, ...profile }),
+      };
+    }
+    $("#search-start").value = shared.path[0] || "";
+    $("#search-target").value = shared.target;
+    renderChain(shared);
+    showStatus("done", `loaded a shared chain to ${shared.display || shared.target}.`);
+    return true;
+  }
+
+  function base64UrlEncode(value) {
+    const bytes = new TextEncoder().encode(value);
+    let binary = "";
+    bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function base64UrlDecode(value) {
+    const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  }
+
+  async function copyShareLink() {
+    const btn = $("#copy-share");
+    const url = btn?.dataset.shareUrl;
+    if (!btn || !url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    btn.classList.add("is-copied");
+    btn.lastChild.textContent = " Copied";
+    setTimeout(() => {
+      btn.classList.remove("is-copied");
+      btn.lastChild.textContent = " Copy link";
+    }, 1600);
   }
 
   function submitLeaderboardChain(start, target, chain) {
@@ -396,8 +527,11 @@
     state.players = state.players || {};
     await Promise.all([...new Set(path)].map(async (u) => {
       if (state.players[u]) return;
-      const m = await engine.fetchJSON(engine.API + u).catch(() => null);
-      if (m) state.players[u] = metaShape(m);
+      const m = await fetchProfile(u).catch(() => null);
+      if (!m && engine) {
+        const direct = await engine.fetchJSON(engine.API + u).catch(() => null);
+        if (direct) state.players[u] = metaShape(direct);
+      }
     }));
   }
 
@@ -455,6 +589,10 @@
       const g = el("g", {
         class: "node" + (isStart ? " is-start" : "") + (isTarget ? " is-target" : ""),
         transform: `translate(${pos.x}, ${pos.y})`,
+        "data-profile-user": u,
+        tabindex: "0",
+        role: "button",
+        "aria-label": `${nameOf(u)} profile`,
       });
       g.appendChild(el("ellipse", { class: "node__shadow", cx: 0, cy: 42, rx: 34, ry: 8 }));
       g.appendChild(el("circle", { class: "node__pulse", r: 34 }));
@@ -714,6 +852,7 @@
       img.className = "card__avatar" + (title ? " is-titled" : "");
       img.src = av;
       img.alt = nameOf(username);
+      img.dataset.profileUser = username.toLowerCase();
       img.referrerPolicy = "no-referrer";
       img.addEventListener("error", () => {
         const fb = document.createElement("div");
@@ -726,7 +865,127 @@
     const fb = document.createElement("div");
     fb.className = "card__avatar-fallback";
     fb.textContent = (nameOf(username)[0] || "?").toUpperCase();
+    fb.dataset.profileUser = username.toLowerCase();
+    fb.tabIndex = 0;
     return fb;
+  }
+
+  async function fetchProfile(username) {
+    const key = String(username || "").trim().toLowerCase();
+    if (!key) return null;
+    const existing = state.players?.[key];
+    if (existing?.profileComplete || existing?.country || existing?.followers || existing?.joined) return existing;
+    if (state.profilePromises.has(key)) return state.profilePromises.get(key);
+
+    const promise = (async () => {
+      const remoteBase = String(window.CONNECTIONS_CACHE_API || "").replace(/\/+$/, "");
+      let profile = null;
+      if (/^https?:\/\//.test(remoteBase)) {
+        try {
+          const res = await fetch(`${remoteBase}/profile?username=${encodeURIComponent(key)}`, {
+            headers: { "Accept": "application/json" },
+          });
+          if (res.ok) {
+            const data = await res.json();
+            profile = data.profile || null;
+          }
+        } catch {
+          // fall through to Chess.com direct lookup
+        }
+      }
+      if (!profile) {
+        try {
+          const res = await fetch(`https://api.chess.com/pub/player/${encodeURIComponent(key)}`, {
+            headers: { "Accept": "application/json" },
+          });
+          if (res.ok) profile = await res.json();
+        } catch {
+          profile = null;
+        }
+      }
+      const shaped = metaShape({ username: key, ...(profile || {}) });
+      state.players = state.players || {};
+      state.players[key] = {
+        ...(state.players[key] || {}),
+        ...shaped,
+        profileComplete: true,
+      };
+      return state.players[key];
+    })();
+
+    state.profilePromises.set(key, promise);
+    return promise;
+  }
+
+  function renderProfilePopover(profile, username, anchor) {
+    const pop = $("#profile-popover");
+    if (!pop || !anchor) return;
+    const display = profile?.name || profile?.username || username;
+    const handle = profile?.username || username;
+    const title = profile?.title ? `<span class="profile-popover__title">${esc(profile.title)}</span> ` : "";
+    const avatar = profile?.avatar
+      ? `<img src="${esc(profile.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer">`
+      : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
+    const joined = profile?.joined ? `<span>Joined ${esc(formatProfileDate(profile.joined))}</span>` : "";
+    const country = profile?.country ? `<span>${esc(profile.country.toUpperCase())}</span>` : "";
+    const followers = Number.isFinite(profile?.followers)
+      ? `<span>${Number(profile.followers).toLocaleString()} followers</span>`
+      : "";
+    const status = profile?.status ? `<span>${esc(profile.status)}</span>` : "";
+    const url = profile?.url || `https://www.chess.com/member/${encodeURIComponent(handle)}`;
+
+    pop.innerHTML = `
+      <div class="profile-popover__top">
+        <span class="profile-popover__avatar">${avatar}</span>
+        <span class="profile-popover__main">
+          <strong>${title}${esc(display)}</strong>
+          <small>@${esc(handle)}</small>
+        </span>
+      </div>
+      <div class="profile-popover__meta">${country}${followers}${joined}${status}</div>
+      <a href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>
+    `;
+    pop.hidden = false;
+    positionProfilePopover(pop, anchor);
+  }
+
+  function positionProfilePopover(pop, anchor) {
+    const rect = anchor.getBoundingClientRect();
+    const popRect = pop.getBoundingClientRect();
+    const gap = 12;
+    const maxLeft = window.innerWidth - popRect.width - gap;
+    const left = Math.max(gap, Math.min(maxLeft, rect.left + rect.width / 2 - popRect.width / 2));
+    let top = rect.bottom + gap;
+    if (top + popRect.height > window.innerHeight - gap) {
+      top = Math.max(gap, rect.top - popRect.height - gap);
+    }
+    pop.style.left = `${left}px`;
+    pop.style.top = `${top}px`;
+  }
+
+  async function showProfilePopover(username, anchor) {
+    const key = String(username || "").trim().toLowerCase();
+    if (!key) return;
+    const pop = $("#profile-popover");
+    if (pop) {
+      pop.hidden = false;
+      pop.innerHTML = `<div class="profile-popover__loading">Loading ${esc(key)}…</div>`;
+      positionProfilePopover(pop, anchor);
+    }
+    const profile = await fetchProfile(key);
+    if (!profile) return;
+    renderProfilePopover(profile, key, anchor);
+  }
+
+  function hideProfilePopover() {
+    const pop = $("#profile-popover");
+    if (pop) pop.hidden = true;
+  }
+
+  function formatProfileDate(seconds) {
+    const date = new Date(seconds * 1000);
+    if (!Number.isFinite(date.getTime())) return "";
+    return date.toLocaleDateString(undefined, { month: "short", year: "numeric" });
   }
 
   // ---------- live search ----------
@@ -862,9 +1121,9 @@
         await hydratePlayers(bridged.path, bridgeEngine);
         const bridgeWork = bridgeEngine.stats.apiCalls
           ? `made ${bridgeEngine.stats.apiCalls} quick requests` +
-            (bridgeEngine.stats.cached ? `, ${bridgeEngine.stats.cached} from cache` : "")
+            (bridgeEngine.stats.cached ? `, ${bridgeEngine.stats.cached} from shared cache` : "")
           : bridgeEngine.stats.cached
-            ? `read ${bridgeEngine.stats.cached} player cache${bridgeEngine.stats.cached === 1 ? "" : "s"}`
+            ? `read ${bridgeEngine.stats.cached} shared cache hit${bridgeEngine.stats.cached === 1 ? "" : "s"}`
           : "used the saved bridge index";
         showStatus("done",
           `✓ found it fast — ${esc(start)} connects to ${esc(target)} in ${stepText(bridged.length)}. ` +
@@ -912,7 +1171,7 @@
       showStatus("done",
         `✓ found it — ${esc(start)} connects to ${esc(target)} in ${stepText(result.path.length - 1)}. ` +
         `looked at ${engine.stats.fetched} players, made ${engine.stats.apiCalls} requests` +
-        (engine.stats.cached ? `, ${engine.stats.cached} from cache` : "") + ".");
+        (engine.stats.cached ? `, ${engine.stats.cached} from shared cache` : "") + ".");
       setActiveChip(target);
 
       const renderedChain = {
@@ -935,9 +1194,9 @@
       if (est) {
         const info = $("#cache-info");
         info.hidden = false;
-        info.textContent =
-          `saved ${(est.usage / 1048576).toFixed(1)} MB of game data locally ` +
-          `(of ${(est.quota / 1048576).toFixed(0)} MB available)`;
+        info.textContent = est.remote
+          ? "using the shared Cloudflare cache; no game history is stored in this browser"
+          : "shared Cloudflare cache is unavailable; this browser did not store game history";
       }
     }
   }
@@ -949,7 +1208,19 @@
       title: p.title,
       name: p.name,
       url: p.url,
+      country: countryCode(p.country),
+      followers: p.followers,
+      joined: p.joined,
+      lastOnline: p.lastOnline || p.last_online,
+      status: p.status,
+      profileComplete: Boolean(p.profileComplete),
     };
+  }
+
+  function countryCode(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    return raw.includes("/") ? raw.split("/").pop() : raw;
   }
 
   function showStatus(kind, msg) {
@@ -1029,11 +1300,7 @@
     const el = $("#setting-cache-size");
     const cache = new window.GameCache();
     const est = await cache.estimate();
-    if (est && est.usage) {
-      el.textContent = `${(est.usage / 1048576).toFixed(1)} MB stored`;
-    } else {
-      el.textContent = "nothing stored yet";
-    }
+    el.textContent = est?.remote ? "Cloudflare shared cache active" : "shared cache unavailable";
   }
 
   $("#settings-open").addEventListener("click", openSettings);
@@ -1074,7 +1341,12 @@
     try {
       const cache = new window.GameCache();
       await cache.clear();
-      btn.textContent = "cleared ✓";
+      localStorage.removeItem(LS_KEY);
+      localStorage.removeItem(LS_RANGE_KEY);
+      localStorage.removeItem(LS_DEPTH_KEY);
+      $("#search-start").value = "";
+      $("#setting-username").value = "";
+      btn.textContent = "local prefs cleared";
       refreshCacheSize();
       setTimeout(() => { btn.disabled = false; btn.textContent = "clear saved data"; }, 1500);
     } catch (err) {
@@ -1090,6 +1362,7 @@
     const spark = svg.querySelector(".edge-spark");
     if (svg.querySelector(".node") && traveller) animateGraph(svg, traveller, spark);
   });
+  $("#copy-share")?.addEventListener("click", copyShareLink);
 
   $("#search-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -1128,6 +1401,39 @@
     setActiveChip(e.target.value.trim().toLowerCase());
   });
 
+  document.addEventListener("pointerover", (event) => {
+    const target = event.target.closest("[data-profile-user]");
+    if (!target) return;
+    showProfilePopover(target.dataset.profileUser, target);
+  });
+
+  document.addEventListener("focusin", (event) => {
+    const target = event.target.closest("[data-profile-user]");
+    if (!target) return;
+    showProfilePopover(target.dataset.profileUser, target);
+  });
+
+  document.addEventListener("pointerout", (event) => {
+    const target = event.target.closest("[data-profile-user]");
+    if (!target) return;
+    if (event.relatedTarget?.closest?.("[data-profile-user], #profile-popover")) return;
+    hideProfilePopover();
+  });
+
+  document.addEventListener("focusout", (event) => {
+    if (event.relatedTarget?.closest?.("[data-profile-user], #profile-popover")) return;
+    hideProfilePopover();
+  });
+
+  document.addEventListener("click", (event) => {
+    const target = event.target.closest("[data-profile-user]");
+    if (target && !target.closest(".quick-player")) {
+      showProfilePopover(target.dataset.profileUser, target);
+      return;
+    }
+    if (!target && !event.target.closest("#profile-popover")) hideProfilePopover();
+  });
+
   function setActiveChip(target) {
     const wanted = (target || "").toLowerCase();
     document.querySelectorAll(".chip").forEach((chip) => {
@@ -1154,7 +1460,10 @@
     }
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
     if (!introComplete()) openIntroGate();
-    loadShowcase().then(loadLeaderboardTargets);
+    loadShowcase().then(() => {
+      loadSharedChainFromUrl();
+      loadLeaderboardTargets();
+    });
     // load the global leaderboard in the background
     if (window.Leaderboard) window.Leaderboard.load();
   });

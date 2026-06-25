@@ -19,7 +19,7 @@ window.ChessChain = class ChessChain {
     // Chess.com's rate limit no matter how many tasks are queued.
     this._inflight = 0;
     this._maxInflight = 20;         // max concurrency — hammer Chess.com
-    this._cache = cache;            // optional GameCache (IndexedDB)
+    this._cache = cache;            // optional shared Cloudflare GameCache
     this._lastReqTs = 0;            // throttle: min ms between request starts
     this._minSpacing = 10;          // ~100 req/sec theoretical, throttled by 429s
     this._maxRetries = Number.isFinite(options.maxRetries)
@@ -116,7 +116,7 @@ window.ChessChain = class ChessChain {
       : "full history";
   }
 
-  /** Standard-chess games for a user (cached in memory + IndexedDB). */
+  /** Standard-chess games for a user (memory + shared Cloudflare cache). */
   async getGames(username) {
     const u = username.toLowerCase();
     const cacheKey = this._cacheKey(u);
@@ -124,13 +124,13 @@ window.ChessChain = class ChessChain {
       this.stats.cached++;
       return this._gamesCache.get(cacheKey);
     }
-    // try persistent (IndexedDB) cache first
+    // try the shared Cloudflare cache first
     if (this._cache) {
       const hit = await this._cache.get(cacheKey);
       if (hit) {
         this.stats.cached++;
         this._gamesCache.set(cacheKey, hit);
-        this.log(`(already had ${u}'s ${this._archiveLabel()} saved)`);
+        this.log(`shared cache had ${u}'s ${this._archiveLabel()}`);
         return hit;
       }
     }

@@ -13,7 +13,7 @@
     document.documentElement.dataset.theme =
       localStorage.getItem("chess-connections:theme") || "dark";
   </script>
-  <link rel="stylesheet" href="styles.css?v=target-board-icons-20260625" />
+  <link rel="stylesheet" href="styles.css?v=share-popovers-cache-20260625" />
 </head>
 <body>
   <div class="site-shell">
@@ -120,6 +120,13 @@
             </svg>
             Replay
           </button>
+          <button class="share-btn" id="copy-share" type="button" title="Copy result link" hidden>
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <path d="M8.6 12.8 7.2 14.2a3.4 3.4 0 1 0 4.8 4.8l2.3-2.3a3.4 3.4 0 0 0 0-4.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              <path d="m15.4 11.2 1.4-1.4A3.4 3.4 0 1 0 12 5l-2.3 2.3a3.4 3.4 0 0 0 0 4.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+            Copy link
+          </button>
         </div>
         <div class="graph-wrap">
           <svg id="graph" viewBox="0 0 1040 360" preserveAspectRatio="xMidYMid meet" aria-label="Connection graph"></svg>
@@ -141,8 +148,8 @@
           <h2 id="explain-heading">Public games, local search</h2>
         </div>
         <p>
-          The app reads public Chess.com game archives, filters to standard live games,
-          and caches histories in your browser so repeat searches do less work.
+          The app reads public Chess.com game archives through the shared Cloudflare cache,
+          filters to standard live games, and keeps large game histories out of your browser.
         </p>
         <a class="text-link" href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">Read the code</a>
       </section>
@@ -211,16 +218,18 @@
             <button class="setting__btn" id="setting-clear-cache" type="button">Clear saved data</button>
             <span class="setting__hint" id="setting-cache-size">…</span>
           </div>
-          <span class="setting__hint">Game histories stay in IndexedDB for seven days.</span>
+          <span class="setting__hint">Game histories and profiles come from the shared Cloudflare cache.</span>
         </div>
       </div>
     </div>
   </div>
 
-  <script src="config.js?v=target-board-icons-20260625"></script>
-  <script src="cache.js?v=target-board-icons-20260625"></script>
-  <script src="engine.js?v=target-board-icons-20260625"></script>
-  <script src="leaderboard.js?v=target-board-icons-20260625"></script>
-  <script src="app.js?v=target-board-icons-20260625"></script>
+  <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
+
+  <script src="config.js?v=share-popovers-cache-20260625"></script>
+  <script src="cache.js?v=share-popovers-cache-20260625"></script>
+  <script src="engine.js?v=share-popovers-cache-20260625"></script>
+  <script src="leaderboard.js?v=share-popovers-cache-20260625"></script>
+  <script src="app.js?v=share-popovers-cache-20260625"></script>
 </body>
 </html>

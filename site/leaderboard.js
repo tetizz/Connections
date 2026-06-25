@@ -10,10 +10,6 @@ window.Leaderboard = (() => {
   const WORKER_URL = String(
     window.CONNECTIONS_CACHE_API || "https://connections-cache.tetizz.workers.dev"
   ).replace(/\/+$/, "");
-  const LB_CACHE_KEY = "chess-connections:leaderboard:v4";
-  const PROFILE_CACHE_KEY = "chess-connections:leaderboard-profiles:v1";
-  const LB_CACHE_TTL = 30 * 1000;
-  const PROFILE_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
 
   /** Auto-submit a found chain. Fire-and-forget; never blocks the UI. */
   async function submit(start, target, length, path) {
@@ -34,16 +30,13 @@ window.Leaderboard = (() => {
   async function load() {
     const el = document.getElementById("leaderboard-list");
     if (!el) return;
-    const cached = readCached();
-    if (cached) await render(el, cached);
-    else el.innerHTML = '<div class="lb-loading">loading…</div>';
+    el.innerHTML = '<div class="lb-loading">loading…</div>';
     try {
       const res = await fetch(WORKER_URL + "/leaderboard?limit=10", {
         headers: { "Accept": "application/json" },
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const { entries } = await res.json();
-      writeCached(entries);
       await render(el, entries);
     } catch (e) {
       el.innerHTML =
@@ -90,71 +83,22 @@ window.Leaderboard = (() => {
     }).join("");
   }
 
-  function readCached() {
-    try {
-      const cached = JSON.parse(localStorage.getItem(LB_CACHE_KEY) || "null");
-      if (!cached || Date.now() - cached.ts > LB_CACHE_TTL) return null;
-      return cached.entries;
-    } catch {
-      return null;
-    }
-  }
-
-  function writeCached(entries) {
-    try {
-      localStorage.setItem(LB_CACHE_KEY, JSON.stringify({ ts: Date.now(), entries }));
-    } catch {
-      // best-effort only
-    }
-  }
-
   async function loadProfiles(usernames) {
-    const cache = readProfileCache();
     const profiles = new Map();
     await Promise.all(usernames.map(async (username) => {
       const key = username.toLowerCase();
-      const cached = cache[key];
-      if (cached && Date.now() - cached.ts < PROFILE_CACHE_TTL) {
-        profiles.set(username, cached.profile);
-        return;
-      }
       try {
-        const res = await fetch(`https://api.chess.com/pub/player/${encodeURIComponent(username)}`, {
+        const res = await fetch(`${WORKER_URL}/profile?username=${encodeURIComponent(username)}`, {
           headers: { "Accept": "application/json" },
         });
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
-        const profile = {
-          username: data.username || username,
-          name: data.name || "",
-          title: data.title || "",
-          avatar: data.avatar || "",
-          url: data.url || `https://www.chess.com/member/${username}`,
-        };
-        cache[key] = { ts: Date.now(), profile };
-        profiles.set(username, profile);
+        profiles.set(username, data.profile || { username, url: `https://www.chess.com/member/${username}` });
       } catch {
         profiles.set(username, { username, url: `https://www.chess.com/member/${username}` });
       }
     }));
-    writeProfileCache(cache);
     return profiles;
-  }
-
-  function readProfileCache() {
-    try {
-      return JSON.parse(localStorage.getItem(PROFILE_CACHE_KEY) || "{}");
-    } catch {
-      return {};
-    }
-  }
-
-  function writeProfileCache(cache) {
-    try {
-      localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify(cache));
-    } catch {
-      // best-effort only
-    }
   }
 
   function timeAgo(ts) {

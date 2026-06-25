@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" role="img" aria-label="Bullet">
+  <rect width="24" height="24" rx="7" fill="#bd7240"/>
+  <path d="M4.8 8h8.1M4.8 12h10.8M4.8 16h8.1" fill="none" stroke="#201008" stroke-width="2" stroke-linecap="round"/>
+  <path d="M14 5.4 20.2 12 14 18.6Z" fill="#201008"/>
+</svg>

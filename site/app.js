@@ -164,7 +164,7 @@
     const rank = Number.isFinite(player.rank) ? `<span class="quick-player__rank">#${player.rank}</span>` : "";
     const score = Number.isFinite(player.score) ? `<span>${Number(player.score).toLocaleString()}</span>` : "";
     const avatar = player.avatar
-      ? `<img src="${esc(player.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer" loading="lazy">`
+      ? `<img class="quick-player__photo" src="${esc(player.avatar)}" alt="${esc(display)} profile photo" width="34" height="34" referrerpolicy="no-referrer" loading="lazy" decoding="async">`
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
     return `
       <button class="chip quick-player${username === active ? " is-active" : ""}" type="button"
@@ -180,11 +180,12 @@
 
   function quickIcon(kind) {
     const icons = {
-      rapid: '<svg viewBox="0 0 24 24"><path d="M12 7v5l3.4 2"/><path d="M7.6 3.8 5.4 6M16.4 3.8 18.6 6"/><path d="M12 21a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z"/></svg>',
-      blitz: '<svg viewBox="0 0 24 24"><path d="M13 2 5.8 13h5.5L10 22l8.2-12h-5.6L13 2Z"/></svg>',
-      bullet: '<svg viewBox="0 0 24 24"><path d="M5 12h7"/><path d="M4 7h10"/><path d="M4 17h10"/><path d="M14 5l6 7-6 7Z"/></svg>',
+      rapid: "assets/icon-rapid.svg",
+      blitz: "assets/icon-blitz.svg",
+      bullet: "assets/icon-bullet.svg",
     };
-    return icons[kind] || icons.rapid;
+    const src = icons[kind] || icons.rapid;
+    return `<img class="quick-group__image-icon" src="${src}" width="16" height="16" alt="" aria-hidden="true" loading="lazy" decoding="async">`;
   }
 
   async function loadLeaderboardTargets() {

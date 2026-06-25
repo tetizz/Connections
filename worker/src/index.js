@@ -8,10 +8,15 @@
 
 const CHESS_API = "https://api.chess.com/pub/player/";
 const TTL_SECONDS = 7 * 24 * 60 * 60;
+const KV_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const MAX_LEADERBOARD_ENTRIES = 1000;
-const ARCHIVE_CONCURRENCY = 8;
+const ARCHIVE_CONCURRENCY = 4;
 const SUBMIT_WINDOW_SECONDS = 60;
 const MAX_SUBMITS_PER_WINDOW = 30;
+const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
+const RATE_LIMIT_COOLDOWN_SECONDS = 90;
+const FETCH_RETRIES = 2;
+const FETCH_BACKOFF_MS = 450;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -54,20 +59,44 @@ async function handleGames(url, env) {
 
   const kvKey = `games:${key.toLowerCase()}`;
   const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
-  if (cached?.games && Date.now() - cached.ts < TTL_SECONDS * 1000) {
+  const cachedGames = Array.isArray(cached?.games) ? cached.games : null;
+  const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
+  const cacheAge = Date.now() - cachedAt;
+
+  if (cachedGames && cacheAge < TTL_SECONDS * 1000) {
     return json({ source: "cloudflare-kv", key, games: cached.games });
   }
 
-  const games = await fetchGames(parsed);
-  await env.GAMES_CACHE.put(kvKey, JSON.stringify({ ts: Date.now(), games }), {
-    expirationTtl: TTL_SECONDS,
-    metadata: {
-      username: parsed.username,
-      range: `recent:${parsed.archiveLimit}`,
-    },
-  });
+  const activeLimit = await readRateLimit(env.GAMES_CACHE);
+  if (activeLimit && cachedGames) {
+    return staleGames(key, cachedGames, activeLimit.retryAfter);
+  }
+  if (activeLimit) {
+    return rateLimited(key, activeLimit.retryAfter);
+  }
 
-  return json({ source: "chess.com", key, games });
+  try {
+    const games = await fetchGames(parsed);
+    await putGamesCache(env.GAMES_CACHE, kvKey, parsed, games);
+    return json({ source: "chess.com", key, games });
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      const retryAfter = await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
+      if (cachedGames) return staleGames(key, cachedGames, retryAfter);
+      return rateLimited(key, retryAfter);
+    }
+
+    console.warn(JSON.stringify({
+      event: "games_upstream_error",
+      key,
+      message: error?.message || String(error),
+    }));
+    if (cachedGames) return staleGames(key, cachedGames, 60, "upstream-error");
+    return json({
+      error: "Chess.com is unavailable right now. Try again shortly.",
+      key,
+    }, 502, "no-store");
+  }
 }
 
 async function handleLeaderboard(url, env) {
@@ -179,7 +208,8 @@ async function fetchGames({ username, archiveLimit }) {
     selectedArchives.map((archiveUrl) => async () => {
       try {
         return await fetchJSON(archiveUrl);
-      } catch {
+      } catch (error) {
+        if (isRateLimitError(error)) throw error;
         return { games: [] };
       }
     }),
@@ -204,16 +234,30 @@ async function fetchGames({ username, archiveLimit }) {
 }
 
 async function fetchJSON(url) {
-  const response = await fetch(url, {
-    headers: {
-      "Accept": "application/json",
-      "User-Agent": "chess-connections-cache/1.0",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} on ${url}`);
+  for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
+    const response = await fetch(url, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "chess-connections-cache/1.0",
+      },
+    });
+    if (response.ok) {
+      return response.json();
+    }
+
+    const retryAfter = parseRetryAfter(response.headers);
+    const canRetry =
+      attempt < FETCH_RETRIES &&
+      (response.status >= 500 || (response.status === 429 && retryAfter <= 2));
+
+    if (!canRetry) {
+      throw new UpstreamHTTPError(response.status, url, retryAfter);
+    }
+
+    await delay(retryAfter ? retryAfter * 1000 : FETCH_BACKOFF_MS * (attempt + 1));
   }
-  return response.json();
+
+  throw new Error(`Failed to fetch ${url}`);
 }
 
 async function runThrottled(tasks, concurrency) {
@@ -339,11 +383,111 @@ function connectorLeaderboard(chains) {
     a.username.localeCompare(b.username));
 }
 
-function json(body, status = 200, cacheControl = null) {
+async function putGamesCache(kv, kvKey, parsed, games) {
+  try {
+    await kv.put(kvKey, JSON.stringify({ ts: Date.now(), games }), {
+      expirationTtl: KV_RETENTION_SECONDS,
+      metadata: {
+        username: parsed.username,
+        range: `recent:${parsed.archiveLimit}`,
+      },
+    });
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "games_cache_write_failed",
+      key: kvKey,
+      message: error?.message || String(error),
+    }));
+  }
+}
+
+function staleGames(key, games, retryAfter, reason = "rate-limited") {
+  return json({
+    source: "cloudflare-kv-stale",
+    key,
+    games,
+    stale: true,
+    reason,
+    retryAfter,
+  }, 200, "public, max-age=30, stale-while-revalidate=300");
+}
+
+function rateLimited(key, retryAfter) {
+  return json({
+    error: "Chess.com rate limited the shared cache. Try again shortly.",
+    key,
+    retryAfter,
+  }, 429, "no-store", {
+    "Retry-After": String(retryAfter),
+  });
+}
+
+async function readRateLimit(kv) {
+  try {
+    const record = await kv.get(CHESS_RATE_LIMIT_KEY, { type: "json", cacheTtl: 5 });
+    if (!record || !Number.isFinite(record.until)) return null;
+    const retryAfter = Math.ceil((record.until - Date.now()) / 1000);
+    return retryAfter > 0 ? { retryAfter } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function rememberRateLimit(kv, retryAfter) {
+  const seconds = clampRetryAfter(retryAfter);
+  const record = { until: Date.now() + seconds * 1000 };
+  try {
+    await kv.put(CHESS_RATE_LIMIT_KEY, JSON.stringify(record), {
+      expirationTtl: seconds,
+    });
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "rate_limit_cache_write_failed",
+      message: error?.message || String(error),
+    }));
+  }
+  return seconds;
+}
+
+function parseRetryAfter(headers) {
+  const value = headers.get("Retry-After");
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, Math.ceil(seconds));
+  const date = Date.parse(value);
+  if (!Number.isFinite(date)) return 0;
+  return Math.max(0, Math.ceil((date - Date.now()) / 1000));
+}
+
+function clampRetryAfter(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return RATE_LIMIT_COOLDOWN_SECONDS;
+  return Math.max(15, Math.min(300, Math.ceil(seconds)));
+}
+
+function isRateLimitError(error) {
+  return error instanceof UpstreamHTTPError && error.status === 429;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class UpstreamHTTPError extends Error {
+  constructor(status, url, retryAfter = 0) {
+    super(`HTTP ${status} on ${url}`);
+    this.name = "UpstreamHTTPError";
+    this.status = status;
+    this.url = url;
+    this.retryAfter = retryAfter;
+  }
+}
+
+function json(body, status = 200, cacheControl = null, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       ...CORS,
+      ...extraHeaders,
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": cacheControl || (status === 200 ? "public, max-age=60" : "no-store"),
     },

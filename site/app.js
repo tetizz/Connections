@@ -20,6 +20,8 @@
   const SHARE_PARAM = "share";
   const DEFAULT_TARGET = "magnuscarlsen";
   const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
+  const SUGGEST_MIN_CHARS = 2;
+  const SUGGEST_LIMIT = 6;
   let introCompletedThisSession = false;
   const QUICK_TARGET_GROUPS = [
     {
@@ -48,6 +50,14 @@
     activeTarget: null,
     currentChain: null,
     profilePromises: new Map(),
+    suggest: {
+      items: [],
+      activeIndex: -1,
+      focused: false,
+      timer: null,
+      controller: null,
+      seq: 0,
+    },
   };
 
   // ---------- small utils ----------
@@ -73,6 +83,8 @@
     return p?.name || p?.username || u;
   };
   const avatarOf = (u) => state.players?.[u.toLowerCase()]?.avatar || null;
+  const cleanUsernameInput = (value) =>
+    String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
 
   // ---------- data load ----------
   async function loadShowcase() {
@@ -249,6 +261,191 @@
       };
     }
     return normalized;
+  }
+
+  // ---------- username autocomplete ----------
+  function scheduleUsernameSuggest(value) {
+    clearTimeout(state.suggest.timer);
+    const query = cleanUsernameInput(value);
+    if (query.length < SUGGEST_MIN_CHARS) {
+      hideUsernameSuggest();
+      return;
+    }
+    renderUsernameSuggest(query, localUsernameSuggestions(query), { loading: true });
+    state.suggest.timer = setTimeout(() => loadUsernameSuggestions(query), 180);
+  }
+
+  async function loadUsernameSuggestions(query) {
+    const input = $("#search-start");
+    if (!input || cleanUsernameInput(input.value) !== query) return;
+    state.suggest.controller?.abort();
+    const seq = ++state.suggest.seq;
+    const controller = new AbortController();
+    state.suggest.controller = controller;
+    const remote = await fetchUsernameSuggestions(query, controller.signal).catch(() => []);
+    if (seq !== state.suggest.seq || cleanUsernameInput(input.value) !== query) return;
+    renderUsernameSuggest(query, mergeUsernameSuggestions(remote, localUsernameSuggestions(query)));
+  }
+
+  async function fetchUsernameSuggestions(query, signal) {
+    const remoteBase = String(window.CONNECTIONS_CACHE_API || "").replace(/\/+$/, "");
+    if (!/^https?:\/\//.test(remoteBase)) return [];
+    const res = await fetch(`${remoteBase}/suggest?query=${encodeURIComponent(query)}&limit=${SUGGEST_LIMIT}`, {
+      headers: { "Accept": "application/json" },
+      signal,
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.suggestions) ? data.suggestions.map(normalizeSuggestion).filter(Boolean) : [];
+  }
+
+  function localUsernameSuggestions(query) {
+    const q = query.toLowerCase();
+    const all = Object.values(state.players || {})
+      .map((player) => normalizeSuggestion({ ...player, source: "loaded player" }))
+      .filter(Boolean)
+      .filter((player) => player.username.includes(q) || String(player.name || "").toLowerCase().includes(q));
+    return all
+      .sort((a, b) => suggestionScore(b, q) - suggestionScore(a, q) || a.username.localeCompare(b.username))
+      .slice(0, SUGGEST_LIMIT);
+  }
+
+  function mergeUsernameSuggestions(...groups) {
+    const merged = new Map();
+    for (const group of groups) {
+      for (const item of group || []) {
+        if (!item?.username) continue;
+        const current = merged.get(item.username);
+        merged.set(item.username, {
+          ...(current || {}),
+          ...item,
+          avatar: item.avatar || current?.avatar || "",
+          title: item.title || current?.title || "",
+          name: item.name || current?.name || "",
+          country: item.country || current?.country || "",
+          source: item.source || current?.source || "",
+        });
+      }
+    }
+    return [...merged.values()].slice(0, SUGGEST_LIMIT);
+  }
+
+  function normalizeSuggestion(item) {
+    const username = cleanUsernameInput(item?.username);
+    if (!username) return null;
+    return {
+      username,
+      name: String(item?.name || item?.display || ""),
+      title: String(item?.title || ""),
+      avatar: String(item?.avatar || ""),
+      country: countryCode(item?.country || ""),
+      url: String(item?.url || `https://www.chess.com/member/${username}`),
+      followers: Number.isFinite(item?.followers) ? item.followers : null,
+      status: String(item?.status || ""),
+      source: String(item?.source || ""),
+      score: Number.isFinite(item?.score) ? item.score : null,
+      rank: Number.isFinite(item?.rank) ? item.rank : null,
+    };
+  }
+
+  function suggestionScore(item, query) {
+    let score = 0;
+    if (item.username === query) score += 1000;
+    if (item.username.startsWith(query)) score += 500;
+    if (String(item.name || "").toLowerCase().startsWith(query)) score += 250;
+    if (item.avatar) score += 60;
+    if (item.title) score += 30;
+    if (Number.isFinite(item.rank)) score += Math.max(0, 30 - item.rank);
+    if (Number.isFinite(item.followers)) score += Math.min(40, Math.log10(item.followers + 1) * 8);
+    return score;
+  }
+
+  function renderUsernameSuggest(query, items, options = {}) {
+    const box = $("#username-suggest");
+    const input = $("#search-start");
+    if (!box || !input || !state.suggest.focused || query.length < SUGGEST_MIN_CHARS) return;
+    state.suggest.items = items.slice(0, SUGGEST_LIMIT);
+    state.suggest.activeIndex = state.suggest.items.length ? 0 : -1;
+    input.setAttribute("aria-expanded", "true");
+    box.hidden = false;
+    box.innerHTML = `
+      <div class="username-suggest__panel">
+        ${options.loading ? `<div class="username-suggest__status">Searching shared cache...</div>` : ""}
+        ${state.suggest.items.length ? state.suggest.items.map((item, index) => usernameSuggestionRow(item, index)).join("") : usernameSuggestEmpty(query)}
+        <button class="username-suggest__all" type="button" data-exact="${esc(query)}">Use exact username "${esc(query)}"</button>
+      </div>
+    `;
+  }
+
+  function usernameSuggestionRow(item, index) {
+    const display = item.name || item.username;
+    const avatar = item.avatar
+      ? `<img src="${esc(item.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer" loading="lazy" decoding="async">`
+      : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
+    const title = item.title ? `<span class="username-suggest__title">${esc(item.title)}</span>` : "";
+    const flag = countryFlag(item.country);
+    const country = flag ? `<span class="username-suggest__flag" title="${esc(item.country.toUpperCase())}">${flag}</span>` : "";
+    const source = item.source ? `<span>${esc(item.source)}</span>` : "";
+    return `
+      <button class="username-suggest__row${index === state.suggest.activeIndex ? " is-active" : ""}" type="button"
+              role="option" aria-selected="${index === state.suggest.activeIndex ? "true" : "false"}"
+              data-index="${index}" data-username="${esc(item.username)}">
+        <span class="username-suggest__avatar">${avatar}</span>
+        <span class="username-suggest__body">
+          <span class="username-suggest__name">${title}<strong>${esc(display)}</strong>${country}</span>
+          <span class="username-suggest__handle">@${esc(item.username)}${source}</span>
+        </span>
+      </button>
+    `;
+  }
+
+  function usernameSuggestEmpty(query) {
+    return `
+      <div class="username-suggest__empty">
+        <strong>No cached match yet.</strong>
+        <span>Press Enter to check ${esc(query)} directly.</span>
+      </div>
+    `;
+  }
+
+  function moveUsernameSuggest(delta) {
+    if (!state.suggest.items.length) return;
+    state.suggest.activeIndex = (state.suggest.activeIndex + delta + state.suggest.items.length) % state.suggest.items.length;
+    $("#username-suggest")?.querySelectorAll(".username-suggest__row").forEach((row, index) => {
+      const active = index === state.suggest.activeIndex;
+      row.classList.toggle("is-active", active);
+      row.setAttribute("aria-selected", active ? "true" : "false");
+      if (active) row.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  function selectUsernameSuggestion(username) {
+    const value = cleanUsernameInput(username);
+    if (!value) return;
+    $("#search-start").value = value;
+    $("#setting-username").value = value;
+    hideUsernameSuggest();
+    $("#search-target")?.focus();
+  }
+
+  function hideUsernameSuggest() {
+    const box = $("#username-suggest");
+    const input = $("#search-start");
+    clearTimeout(state.suggest.timer);
+    state.suggest.controller?.abort();
+    state.suggest.items = [];
+    state.suggest.activeIndex = -1;
+    if (box) {
+      box.hidden = true;
+      box.innerHTML = "";
+    }
+    input?.setAttribute("aria-expanded", "false");
+  }
+
+  function countryFlag(country) {
+    const code = countryCode(country).toUpperCase();
+    if (!/^[A-Z]{2}$/.test(code)) return "";
+    return [...code].map((char) => String.fromCodePoint(0x1f1e6 + char.charCodeAt(0) - 65)).join("");
   }
 
   // ---------- render a chain (shared by showcase + live search) ----------
@@ -1366,8 +1563,46 @@
 
   $("#search-form").addEventListener("submit", (e) => {
     e.preventDefault();
+    hideUsernameSuggest();
     const depth = parseInt($("#search-depth").value, 10) || 3;
     runSearch($("#search-start").value, $("#search-target").value, depth, $("#search-range").value);
+  });
+
+  $("#search-start").addEventListener("focus", (e) => {
+    state.suggest.focused = true;
+    scheduleUsernameSuggest(e.target.value);
+  });
+
+  $("#search-start").addEventListener("input", (e) => {
+    state.suggest.focused = true;
+    scheduleUsernameSuggest(e.target.value);
+  });
+
+  $("#search-start").addEventListener("keydown", (e) => {
+    if ($("#username-suggest")?.hidden) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      moveUsernameSuggest(1);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      moveUsernameSuggest(-1);
+    } else if (e.key === "Enter" && state.suggest.activeIndex >= 0) {
+      e.preventDefault();
+      selectUsernameSuggestion(state.suggest.items[state.suggest.activeIndex]?.username);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      hideUsernameSuggest();
+    }
+  });
+
+  $("#username-suggest")?.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+  });
+
+  $("#username-suggest")?.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-username], [data-exact]");
+    if (!row) return;
+    selectUsernameSuggestion(row.dataset.username || row.dataset.exact);
   });
 
   $(".quick-targets")?.addEventListener("click", (event) => {
@@ -1426,6 +1661,10 @@
   });
 
   document.addEventListener("click", (event) => {
+    if (!event.target.closest(".search__field--username")) {
+      state.suggest.focused = false;
+      hideUsernameSuggest();
+    }
     const target = event.target.closest("[data-profile-user]");
     if (target && !target.closest(".quick-player")) {
       showProfilePopover(target.dataset.profileUser, target);

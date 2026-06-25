@@ -4,6 +4,7 @@
  * - GET /games?key=username:recent:N caches sanitized Chess.com game rows.
  * - POST /submit stores found chains for the global leaderboard.
  * - GET /leaderboard ranks middle players by how often they connect chains.
+ * - GET /suggest?query=name returns cached username suggestions.
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
@@ -11,6 +12,7 @@ const TTL_SECONDS = 7 * 24 * 60 * 60;
 const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const KV_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const MAX_LEADERBOARD_ENTRIES = 1000;
+const MAX_SUGGESTIONS = 8;
 const ARCHIVE_CONCURRENCY = 4;
 const SUBMIT_WINDOW_SECONDS = 60;
 const MAX_SUBMITS_PER_WINDOW = 30;
@@ -47,6 +49,10 @@ export default {
 
     if (url.pathname === "/profile" && request.method === "GET") {
       return handleProfile(url, env);
+    }
+
+    if (url.pathname === "/suggest" && request.method === "GET") {
+      return handleSuggest(url, env);
     }
 
     if (url.pathname === "/submit" && request.method === "POST") {
@@ -152,6 +158,55 @@ async function handleProfile(url, env) {
       username,
     }, 502, "no-store");
   }
+}
+
+async function handleSuggest(url, env) {
+  const query = cleanPartialUsername(url.searchParams.get("query"));
+  const limit = Math.max(1, Math.min(MAX_SUGGESTIONS, parseInt(url.searchParams.get("limit") || "6", 10)));
+  if (query.length < 2) {
+    return json({ query, suggestions: [] }, 200, "public, max-age=30");
+  }
+
+  const seen = new Map();
+  const add = (profile, source = "cloudflare") => {
+    const suggestion = suggestionShape(profile, source);
+    if (!suggestion || !matchesSuggestion(suggestion, query)) return;
+    const existing = seen.get(suggestion.username);
+    if (!existing || suggestionScore(suggestion, query) > suggestionScore(existing, query)) {
+      seen.set(suggestion.username, suggestion);
+    }
+  };
+
+  const entries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
+  for (const entry of entries) {
+    for (const username of entry.path || []) {
+      if (seen.size >= limit * 3) break;
+      if (username.includes(query)) add({ username }, "recent chain");
+    }
+  }
+
+  await addProfilesFromKV(env, query, seen, limit * 3);
+  await addLeaderboardSuggestions(query, seen, limit * 3);
+
+  const missingProfiles = [...seen.values()]
+    .filter((item) => !item.avatar && !item.name && !item.profileComplete)
+    .slice(0, limit);
+  await runThrottled(missingProfiles.map((item) => async () => {
+    const profile = await readOrFetchProfile(env, item.username);
+    if (profile) add(profile, item.source || "cloudflare");
+  }), 2);
+
+  if (query.length >= 3 && !seen.has(query)) {
+    const exact = await readOrFetchProfile(env, query);
+    if (exact) add(exact, "exact match");
+  }
+
+  const suggestions = [...seen.values()]
+    .filter((item) => matchesSuggestion(item, query))
+    .sort((a, b) => suggestionScore(b, query) - suggestionScore(a, query) || a.username.localeCompare(b.username))
+    .slice(0, limit);
+
+  return json({ query, suggestions }, 200, "public, max-age=45");
 }
 
 async function handleSubmit(request, env) {
@@ -299,6 +354,109 @@ function profileShape(data, fallbackUsername) {
   };
 }
 
+function suggestionShape(data, source = "cloudflare") {
+  const username = cleanUsername(data?.username);
+  if (!username) return null;
+  return {
+    username,
+    name: String(data?.name || data?.display || ""),
+    title: String(data?.title || ""),
+    avatar: String(data?.avatar || ""),
+    url: String(data?.url || `https://www.chess.com/member/${username}`),
+    country: String(data?.country || ""),
+    followers: Number.isFinite(data?.followers) ? data.followers : null,
+    status: String(data?.status || ""),
+    source,
+    score: Number.isFinite(data?.score) ? data.score : null,
+    rank: Number.isFinite(data?.rank) ? data.rank : null,
+  };
+}
+
+async function readOrFetchProfile(env, username) {
+  const cached = await readCachedProfile(env, username);
+  if (cached) return cached;
+  try {
+    const data = await fetchJSON(`${CHESS_API}${username}`);
+    const profile = profileShape(data, username);
+    await env.GAMES_CACHE.put(`profile:${username}`, JSON.stringify({ ts: Date.now(), profile }), {
+      expirationTtl: KV_RETENTION_SECONDS,
+      metadata: { username, type: "profile" },
+    });
+    return profile;
+  } catch {
+    return null;
+  }
+}
+
+async function readCachedProfile(env, username) {
+  const cached = await env.GAMES_CACHE.get(`profile:${username}`, { type: "json", cacheTtl: 60 });
+  return cached?.profile && typeof cached.profile === "object" ? cached.profile : null;
+}
+
+async function addProfilesFromKV(env, query, seen, maxCandidates) {
+  let cursor;
+  let pages = 0;
+  do {
+    const listed = await env.GAMES_CACHE.list({ prefix: "profile:", limit: 1000, cursor });
+    for (const key of listed.keys || []) {
+      const username = cleanUsername(key.name.replace(/^profile:/, ""));
+      if (!username || !username.includes(query)) continue;
+      const profile = await readCachedProfile(env, username);
+      seen.set(username, suggestionShape(profile || { username }, "cloudflare cache"));
+      if (seen.size >= maxCandidates) return;
+    }
+    cursor = listed.cursor;
+    pages++;
+  } while (cursor && pages < 3 && seen.size < maxCandidates);
+}
+
+async function addLeaderboardSuggestions(query, seen, maxCandidates) {
+  if (seen.size >= maxCandidates) return;
+  try {
+    const data = await fetchJSON("https://api.chess.com/pub/leaderboards");
+    const groups = [
+      ["live_rapid", "Rapid leaderboard"],
+      ["live_blitz", "Blitz leaderboard"],
+      ["live_bullet", "Bullet leaderboard"],
+    ];
+    for (const [key, source] of groups) {
+      const rows = Array.isArray(data?.[key]) ? data[key] : [];
+      for (const row of rows.slice(0, 25)) {
+        const item = suggestionShape({
+          username: row.username,
+          name: row.name,
+          title: row.title,
+          avatar: row.avatar,
+          url: row.url,
+          score: row.score,
+          rank: row.rank,
+        }, source);
+        if (!item || !matchesSuggestion(item, query)) continue;
+        seen.set(item.username, item);
+        if (seen.size >= maxCandidates) return;
+      }
+    }
+  } catch {
+    // Suggestions are best-effort; cached/profile matches still work.
+  }
+}
+
+function matchesSuggestion(item, query) {
+  return item.username.includes(query) || String(item.name || "").toLowerCase().includes(query);
+}
+
+function suggestionScore(item, query) {
+  let score = 0;
+  if (item.username === query) score += 1000;
+  if (item.username.startsWith(query)) score += 500;
+  if (String(item.name || "").toLowerCase().startsWith(query)) score += 250;
+  if (item.avatar) score += 60;
+  if (item.title) score += 30;
+  if (Number.isFinite(item.rank)) score += Math.max(0, 30 - item.rank);
+  if (Number.isFinite(item.followers)) score += Math.min(40, Math.log10(item.followers + 1) * 8);
+  return score;
+}
+
 async function fetchJSON(url) {
   for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
     const response = await fetch(url, {
@@ -341,6 +499,10 @@ async function runThrottled(tasks, concurrency) {
 
 function cleanUsername(value) {
   return String(value || "").toLowerCase().trim().replace(/[^a-z0-9_-]/g, "").slice(0, 40);
+}
+
+function cleanPartialUsername(value) {
+  return String(value || "").toLowerCase().trim().replace(/[^a-z0-9_-]/g, "").slice(0, 50);
 }
 
 function normalizePath(start, target, path) {

@@ -16,6 +16,30 @@
   const LS_THEME_KEY = "chess-connections:theme";
   const LS_RANGE_KEY = "chess-connections:range";
   const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
+  const INTRO_COMPLETE_KEY = "chess-connections:intro-complete:v1";
+  const DEFAULT_TARGET = "magnuscarlsen";
+  const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
+  let introCompletedThisSession = false;
+  const QUICK_TARGET_GROUPS = [
+    {
+      id: "rapid",
+      label: "Rapid",
+      source: "live_rapid",
+      icon: "rapid",
+    },
+    {
+      id: "blitz",
+      label: "Blitz",
+      source: "live_blitz",
+      icon: "blitz",
+    },
+    {
+      id: "bullet",
+      label: "Bullet",
+      source: "live_bullet",
+      icon: "bullet",
+    },
+  ];
 
   const state = {
     chains: null,
@@ -65,7 +89,10 @@
     }
     renderShowcaseTabs();
     // show an example chain so the page isn't blank on first visit
-    const first = state.chains.chains.find((c) => c.found) || state.chains.chains[0];
+    const first =
+      state.chains.chains.find((c) => c.found && c.target === DEFAULT_TARGET) ||
+      state.chains.chains.find((c) => c.found) ||
+      state.chains.chains[0];
     if (first) selectTarget(first.target);
   }
 
@@ -75,9 +102,149 @@
     if (!state.chains?.chains?.length) return;
     // default the search target to the first found showcase target
     if (!$("#search-target").value) {
-      const first = state.chains.chains.find((c) => c.found);
+      const first =
+        state.chains.chains.find((c) => c.found && c.target === DEFAULT_TARGET) ||
+        state.chains.chains.find((c) => c.found);
       if (first) $("#search-target").value = first.target;
     }
+  }
+
+  // ---------- Chess.com leaderboard quick targets ----------
+  function renderQuickTargetsLoading() {
+    const wrap = $("#quick-target-groups");
+    if (!wrap) return;
+    wrap.innerHTML = `
+      <div class="quick-targets__empty" role="status">
+        <strong>Loading live rankings...</strong>
+        <span>Pulling the current Rapid, Blitz, and Bullet top 10 from Chess.com.</span>
+      </div>
+    `;
+  }
+
+  function renderLeaderboardUnavailable(error) {
+    const wrap = $("#quick-target-groups");
+    if (!wrap) return;
+    wrap.innerHTML = `
+      <div class="quick-targets__empty" role="status">
+        <strong>Live rankings unavailable.</strong>
+        <span>Retry in a moment. You can still type any Chess.com username into Connect to.</span>
+      </div>
+    `;
+    if (error) console.debug("leaderboard targets unavailable:", error.message || error);
+  }
+
+  function renderQuickTargets(groups) {
+    const wrap = $("#quick-target-groups");
+    if (!wrap) return;
+    const playableGroups = groups.filter((group) => group.players?.length);
+    if (!playableGroups.length) {
+      renderLeaderboardUnavailable();
+      return;
+    }
+    const active = ($("#search-target")?.value || DEFAULT_TARGET).trim().toLowerCase();
+    wrap.innerHTML = playableGroups.map((group, groupIndex) => `
+      <section class="quick-group" style="--group-index:${groupIndex}" aria-label="${esc(group.label)} targets">
+        <div class="quick-group__title">
+          <span class="quick-group__icon quick-group__icon--${esc(group.id)}" aria-hidden="true">${quickIcon(group.icon)}</span>
+          <span>${esc(group.label)}</span>
+          <small>top 10 live</small>
+        </div>
+        <div class="quick-group__players">
+          ${group.players.map((player, index) => quickTargetButton(player, index, active)).join("")}
+        </div>
+        ${group.players.length > 5 ? `<button class="quick-more" type="button" data-group="${esc(group.id)}">Show 5 more</button>` : ""}
+      </section>
+    `).join("");
+  }
+
+  function quickTargetButton(player, index, active) {
+    const username = player.username.toLowerCase();
+    const display = player.display || player.username;
+    const title = player.title ? `<span class="quick-player__title">${esc(player.title)}</span>` : "";
+    const rank = Number.isFinite(player.rank) ? `<span class="quick-player__rank">#${player.rank}</span>` : "";
+    const score = Number.isFinite(player.score) ? `<span>${Number(player.score).toLocaleString()}</span>` : "";
+    const avatar = player.avatar
+      ? `<img src="${esc(player.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer" loading="lazy">`
+      : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
+    return `
+      <button class="chip quick-player${username === active ? " is-active" : ""}" type="button"
+              data-target="${esc(username)}" data-display="${esc(display)}" style="--player-index:${index}"${index >= 5 ? " hidden" : ""}>
+        <span class="quick-player__avatar">${avatar}</span>
+        <span class="quick-player__body">
+          <span class="quick-player__name">${rank}<strong>${esc(display)}</strong></span>
+          <span class="quick-player__meta">${title}${score}</span>
+        </span>
+      </button>
+    `;
+  }
+
+  function quickIcon(kind) {
+    const icons = {
+      rapid: '<svg viewBox="0 0 24 24"><path d="M12 7v5l3.4 2"/><path d="M7.6 3.8 5.4 6M16.4 3.8 18.6 6"/><path d="M12 21a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z"/></svg>',
+      blitz: '<svg viewBox="0 0 24 24"><path d="M13 2 5.8 13h5.5L10 22l8.2-12h-5.6L13 2Z"/></svg>',
+      bullet: '<svg viewBox="0 0 24 24"><path d="M5 12h7"/><path d="M4 7h10"/><path d="M4 17h10"/><path d="M14 5l6 7-6 7Z"/></svg>',
+    };
+    return icons[kind] || icons.rapid;
+  }
+
+  async function loadLeaderboardTargets() {
+    renderQuickTargetsLoading();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6500);
+    try {
+      const res = await fetch(CHESS_LEADERBOARDS_URL, {
+        headers: { "Accept": "application/json" },
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`leaderboards ${res.status}`);
+      const data = await res.json();
+      renderQuickTargets(buildLeaderboardTargetGroups(data));
+    } catch (error) {
+      renderLeaderboardUnavailable(error);
+    } finally {
+      clearTimeout(timeout);
+      setActiveChip($("#search-target")?.value || DEFAULT_TARGET);
+    }
+  }
+
+  function buildLeaderboardTargetGroups(data) {
+    return QUICK_TARGET_GROUPS.map((group) => {
+      const rows = Array.isArray(data?.[group.source]) ? data[group.source] : [];
+      const players = rows
+        .slice(0, 10)
+        .map(normalizeQuickPlayer)
+        .filter(Boolean);
+      return {
+        ...group,
+        players,
+      };
+    });
+  }
+
+  function normalizeQuickPlayer(player) {
+    const username = String(player?.username || "").trim().toLowerCase();
+    if (!username) return null;
+    const normalized = {
+      username,
+      display: player.name || player.display || player.username,
+      title: player.title || "",
+      rank: Number.isFinite(player.rank) ? player.rank : null,
+      score: Number.isFinite(player.score) ? player.score : null,
+      tag: player.tag || "",
+      avatar: player.avatar || "",
+      url: player.url || `https://www.chess.com/member/${encodeURIComponent(player.username || username)}`,
+    };
+    if (state.players) {
+      state.players[username] = {
+        ...(state.players[username] || {}),
+        username,
+        avatar: normalized.avatar || state.players[username]?.avatar,
+        title: normalized.title || state.players[username]?.title,
+        name: normalized.display || state.players[username]?.name,
+        url: normalized.url || state.players[username]?.url,
+      };
+    }
+    return normalized;
   }
 
   // ---------- render a chain (shared by showcase + live search) ----------
@@ -809,6 +976,39 @@
     btn.title = isDark ? "Switch to light mode" : "Switch to dark mode";
   }
 
+  // ---------- first-run intro ----------
+  function introComplete() {
+    if (introCompletedThisSession) return true;
+    try {
+      return localStorage.getItem(INTRO_COMPLETE_KEY) === "1";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function openIntroGate() {
+    const gate = $("#intro-gate");
+    if (!gate) return;
+    gate.hidden = false;
+    requestAnimationFrame(() => $("#intro-start")?.focus());
+  }
+
+  function closeIntroGate() {
+    const gate = $("#intro-gate");
+    if (gate) gate.hidden = true;
+  }
+
+  function completeIntroGate() {
+    introCompletedThisSession = true;
+    try {
+      localStorage.setItem(INTRO_COMPLETE_KEY, "1");
+    } catch (_) {
+      // If storage is blocked, treat this tab as introduced and keep going.
+    }
+    closeIntroGate();
+    $("#search-start")?.focus();
+  }
+
   // ---------- settings modal ----------
   const LS_DEPTH_KEY = "chess-connections:depth";
 
@@ -841,6 +1041,7 @@
     const current = document.documentElement.dataset.theme || "dark";
     applyTheme(current === "dark" ? "light" : "dark");
   });
+  $("#intro-start")?.addEventListener("click", completeIntroGate);
   $("#settings-modal").addEventListener("click", (e) => {
     if (e.target.id === "settings-modal") closeSettings(); // click backdrop
   });
@@ -895,16 +1096,31 @@
     runSearch($("#search-start").value, $("#search-target").value, depth, $("#search-range").value);
   });
 
-  document.querySelectorAll(".chip").forEach((chip) => {
-    chip.addEventListener("click", () => {
-      $("#search-target").value = chip.dataset.target;
-      setActiveChip(chip.dataset.target);
-      if ($("#search-start").value) {
-        $("#search-form").requestSubmit();
-      } else {
-        $("#search-start").focus();
-      }
-    });
+  $(".quick-targets")?.addEventListener("click", (event) => {
+    const more = event.target.closest(".quick-more[data-group]");
+    if (more) {
+      const group = more.closest(".quick-group");
+      group?.querySelectorAll(".quick-player[hidden]").forEach((player) => {
+        player.hidden = false;
+      });
+      group?.classList.add("is-expanded");
+      more.hidden = true;
+      return;
+    }
+
+    const chip = event.target.closest(".chip[data-target]");
+    if (!chip) return;
+    $("#search-target").value = chip.dataset.target;
+    setActiveChip(chip.dataset.target);
+    if (!introComplete()) {
+      openIntroGate();
+      return;
+    }
+    if ($("#search-start").value) {
+      $("#search-form").requestSubmit();
+    } else {
+      $("#search-start").focus();
+    }
   });
 
   $("#search-target").addEventListener("input", (e) => {
@@ -935,7 +1151,9 @@
       localStorage.setItem(LS_RANGE_KEY, "instant");
       localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
     }
-    loadShowcase();
+    $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
+    if (!introComplete()) openIntroGate();
+    loadShowcase().then(loadLeaderboardTargets);
     // load the global leaderboard in the background
     if (window.Leaderboard) window.Leaderboard.load();
   });

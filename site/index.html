@@ -53,12 +53,12 @@
         <form class="search" id="search-form" autocomplete="off">
           <div class="search__field">
             <label for="search-start">Your username</label>
-            <input id="search-start" type="text" placeholder="trixize1234"
+            <input id="search-start" type="text" placeholder="input your username"
                    spellcheck="false" autocapitalize="none" />
           </div>
           <div class="search__field">
             <label for="search-target">Connect to</label>
-            <input id="search-target" type="text" placeholder="hikaru"
+            <input id="search-target" type="text" value="magnuscarlsen" placeholder="magnuscarlsen"
                    spellcheck="false" autocapitalize="none" />
           </div>
           <div class="search__field search__field--narrow">
@@ -91,12 +91,15 @@
         <div class="search__log" id="search-log" hidden></div>
         <div class="cache-info" id="cache-info" hidden></div>
 
-        <div class="quick-targets" aria-label="Popular target players">
-          <span class="quick-label">Quick targets</span>
-          <button class="chip" type="button" data-target="hikaru">Hikaru</button>
-          <button class="chip" type="button" data-target="magnuscarlsen">Magnus</button>
-          <button class="chip" type="button" data-target="fabianocaruana">Fabiano</button>
-          <button class="chip" type="button" data-target="danielnaroditsky">Naroditsky</button>
+        <div class="quick-targets" aria-labelledby="quick-target-heading">
+          <div class="quick-targets__head">
+            <div>
+              <span class="quick-label" id="quick-target-heading">Chess.com leaderboard targets</span>
+              <p>Click a player to trace yourself to them.</p>
+            </div>
+            <a class="quick-targets__source" href="https://www.chess.com/leaderboard" target="_blank" rel="noopener">Live rankings</a>
+          </div>
+          <div class="quick-target-groups" id="quick-target-groups" aria-live="polite"></div>
         </div>
       </section>
 
@@ -161,6 +164,21 @@
     </footer>
   </div>
 
+  <div class="intro-gate" id="intro-gate" hidden role="dialog" aria-modal="true" aria-labelledby="intro-title">
+    <div class="intro-card">
+      <span class="intro-card__mark" aria-hidden="true">♞</span>
+      <p class="eyebrow">New here</p>
+      <h2 id="intro-title">Trace yourself to a Chess.com leaderboard player</h2>
+      <p class="intro-card__copy">Input your username, pick a Rapid, Blitz, or Bullet target, trace the chain, then open the proof games behind every link.</p>
+      <ol class="intro-steps">
+        <li><span>1</span><strong>Input your username</strong><small>Use your exact Chess.com handle.</small></li>
+        <li><span>2</span><strong>Pick a target</strong><small>Targets come from live Chess.com leaderboards.</small></li>
+        <li><span>3</span><strong>Open proof games</strong><small>Each connection points to a real public game.</small></li>
+      </ol>
+      <button class="intro-start" id="intro-start" type="button">Start tracing</button>
+    </div>
+  </div>
+
   <div class="modal-overlay" id="settings-modal" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <div class="modal__header">
@@ -174,7 +192,7 @@
       <div class="modal__body">
         <label class="setting">
           <span class="setting__label">Saved username</span>
-          <input id="setting-username" type="text" placeholder="chess.com username"
+          <input id="setting-username" type="text" placeholder="input your username"
                  spellcheck="false" autocapitalize="none" />
           <span class="setting__hint">Used to prefill the next search on this browser.</span>
         </label>

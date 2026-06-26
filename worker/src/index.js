@@ -162,7 +162,8 @@ async function handleProfile(url, env) {
 
 async function handleSuggest(url, env) {
   const query = cleanPartialUsername(url.searchParams.get("query"));
-  const limit = Math.max(1, Math.min(MAX_SUGGESTIONS, parseInt(url.searchParams.get("limit") || "6", 10)));
+  const parsedLimit = parseInt(url.searchParams.get("limit") || "6", 10);
+  const limit = Math.max(1, Math.min(MAX_SUGGESTIONS, Number.isFinite(parsedLimit) ? parsedLimit : 6));
   if (query.length < 2) {
     return json({ query, suggestions: [] }, 200, "public, max-age=30");
   }

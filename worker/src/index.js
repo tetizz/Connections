@@ -2,6 +2,9 @@
  * Chess Connections Cloudflare Worker
  * -----------------------------------
  * - GET /games?key=username:recent:N caches sanitized Chess.com game rows.
+ * - POST /search/start starts a resumable server-side chain search job.
+ * - GET /search/job?id=... returns job progress or the final chain.
+ * - POST /search/warm prefetches top Chess.com targets into shared storage.
  * - POST /submit stores found chains for the global leaderboard.
  * - GET /leaderboard ranks middle players by how often they connect chains.
  * - GET /suggest?query=name returns cached username suggestions.
@@ -22,6 +25,16 @@ const MAX_ANALYTICS_LIMIT = 50;
 const MAX_ANALYTICS_EVENTS_PER_WINDOW = 80;
 const ANALYTICS_EVENTS_KEY = "analytics:events";
 const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
+const SEARCH_MAX_DEPTH = 5;
+const SEARCH_MAX_EXPANSIONS = 120;
+const SEARCH_FRONTIER_LIMIT = 80;
+const SEARCH_JOB_TTL_SECONDS = 2 * 60 * 60;
+const SEARCH_WINDOW_SECONDS = 60;
+const MAX_SEARCH_JOBS_PER_WINDOW = 16;
+const WARM_STATUS_KEY = "warm:leaderboard-targets";
+const WARM_INTERVAL_SECONDS = 6 * 60 * 60;
+const WARM_PLAYER_LIMIT = 36;
+const COMMON_WARM_TARGETS = ["magnuscarlsen", "hikaru", "danielnaroditsky", "fabianocaruana", "gothamchess"];
 const RATE_LIMIT_COOLDOWN_SECONDS = 90;
 const FETCH_RETRIES = 2;
 const FETCH_BACKOFF_MS = 450;
@@ -33,7 +46,7 @@ const CORS = {
 };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
@@ -58,6 +71,18 @@ export default {
 
     if (url.pathname === "/suggest" && request.method === "GET") {
       return handleSuggest(url, env);
+    }
+
+    if (url.pathname === "/search/start" && request.method === "POST") {
+      return handleSearchStart(request, env, ctx);
+    }
+
+    if (url.pathname === "/search/job" && request.method === "GET") {
+      return handleSearchJob(url, env);
+    }
+
+    if (url.pathname === "/search/warm" && (request.method === "GET" || request.method === "POST")) {
+      return handleWarm(url, env, ctx);
     }
 
     if (url.pathname === "/submit" && request.method === "POST") {
@@ -145,12 +170,13 @@ async function handleProfile(url, env) {
     : null;
   const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
 
-  if (cachedProfile && cachedProfile.stats && Date.now() - cachedAt < PROFILE_TTL_SECONDS * 1000) {
+  if (cachedProfile && cachedProfile.stats && Array.isArray(cachedProfile.recentGames) &&
+      Date.now() - cachedAt < PROFILE_TTL_SECONDS * 1000) {
     return json({ source: "cloudflare-kv", profile: cachedProfile });
   }
 
   try {
-    const profile = await fetchProfileDetails(username);
+    const profile = await fetchProfileDetails(username, env);
     await env.GAMES_CACHE.put(kvKey, JSON.stringify({ ts: Date.now(), profile }), {
       expirationTtl: KV_RETENTION_SECONDS,
       metadata: { username, type: "profile" },
@@ -221,6 +247,427 @@ async function handleSuggest(url, env) {
     .slice(0, limit);
 
   return json({ query, suggestions }, 200, "public, max-age=45");
+}
+
+async function handleSearchStart(request, env, ctx) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const rateLimitKey = `search:ratelimit:${ip}`;
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "bad json" }, 400);
+  }
+
+  const start = cleanUsername(body?.start);
+  const target = cleanUsername(body?.target);
+  const range = cleanRange(body?.range) || "instant";
+  const id = cleanAnalyticsId(body?.searchId || body?.jobId || body?.id) || crypto.randomUUID();
+  if (!start || !target || start === target) return json({ error: "missing fields" }, 400);
+
+  const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
+  if (submitWindow.count >= MAX_SEARCH_JOBS_PER_WINDOW) {
+    return json({
+      error: "too many searches, wait a moment",
+      retryAfter: Math.max(1, SEARCH_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
+    }, 429, "no-store");
+  }
+
+  const existing = await readSearchJob(env, id);
+  if (existing && !["expired", "failed"].includes(existing.status)) {
+    return json({ ok: true, job: publicSearchJob(existing), reused: true }, 200, "no-store");
+  }
+
+  const job = searchJobShape({
+    id,
+    start,
+    target,
+    range,
+    status: "queued",
+    progress: "Queued",
+    stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  await writeSearchJob(env, job);
+  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
+    startedAt: submitWindow.startedAt,
+    count: submitWindow.count + 1,
+  }), { expirationTtl: SEARCH_WINDOW_SECONDS * 2 });
+
+  const runPromise = runSearchJob(env, job).catch((error) =>
+    failSearchJob(env, job.id, error));
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(runPromise);
+  } else {
+    await runPromise;
+  }
+
+  return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
+}
+
+async function handleSearchJob(url, env) {
+  const id = cleanAnalyticsId(url.searchParams.get("id"));
+  if (!id) return json({ error: "missing id" }, 400, "no-store");
+  const job = await readSearchJob(env, id);
+  if (!job) return json({ error: "job not found" }, 404, "no-store");
+  return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
+}
+
+async function runSearchJob(env, queuedJob) {
+  const startedAt = Date.now();
+  let job = await updateSearchJob(env, queuedJob.id, {
+    status: "running",
+    progress: "Checking players",
+    startedAt,
+  });
+  if (!job) return;
+
+  const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+  const progress = async (message, patch = {}) => {
+    job = await updateSearchJob(env, queuedJob.id, {
+      progress: message,
+      stats: { ...stats },
+      ...patch,
+    }) || job;
+  };
+
+  try {
+    const [startProfile, targetProfile] = await Promise.all([
+      readOrFetchProfile(env, queuedJob.start),
+      readOrFetchProfile(env, queuedJob.target),
+    ]);
+    if (!startProfile || !targetProfile) {
+      await completeSearchJob(env, job, {
+        status: "not_found",
+        outcome: "not_found",
+        progress: "One of those players could not be found.",
+        stats,
+        durationMs: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    await progress("Searching recent wins");
+    const result = await findServerChain(env, queuedJob.start, queuedJob.target, queuedJob.range, stats, progress);
+    if (!result) {
+      await completeSearchJob(env, job, {
+        status: "not_found",
+        outcome: "not_found",
+        progress: "No connection found in this search.",
+        stats,
+        durationMs: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    const players = {};
+    await runThrottled(result.path.map((username) => async () => {
+      const profile = await readOrFetchProfile(env, username);
+      if (profile) players[username] = profile;
+    }), 3);
+
+    const chain = {
+      target: queuedJob.target,
+      display: targetProfile.name || targetProfile.username || queuedJob.target,
+      found: true,
+      length: Math.max(0, result.path.length - 1),
+      path: result.path,
+      hops: result.hops,
+    };
+
+    await completeSearchJob(env, job, {
+      status: "found",
+      outcome: "found",
+      progress: `Found ${queuedJob.start} to ${queuedJob.target}.`,
+      chain,
+      players,
+      stats,
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (error) {
+    await failSearchJob(env, queuedJob.id, error);
+  }
+}
+
+async function completeSearchJob(env, job, patch) {
+  const next = await updateSearchJob(env, job.id, {
+    ...patch,
+    updatedAt: Date.now(),
+  });
+  const event = searchJobAnalyticsEvent(next || { ...job, ...patch });
+  if (event) await saveAnalyticsEvent(env, event);
+}
+
+async function failSearchJob(env, id, error) {
+  const job = await updateSearchJob(env, id, {
+    status: isRateLimitError(error) ? "timeout" : "failed",
+    outcome: isRateLimitError(error) ? "timeout" : "error",
+    progress: isRateLimitError(error)
+      ? "Chess.com is throttling requests right now."
+      : "Search failed before it could finish.",
+    error: error?.message || String(error),
+    updatedAt: Date.now(),
+  });
+  const event = searchJobAnalyticsEvent(job);
+  if (event) await saveAnalyticsEvent(env, event);
+  console.warn(JSON.stringify({
+    event: "search_job_failed",
+    id,
+    message: error?.message || String(error),
+  }));
+}
+
+async function findServerChain(env, start, target, range, stats, progress) {
+  const archiveLimit = archiveLimitForRange(range);
+  const forwardVisited = new Map([[start, { prev: null, hopUrl: null }]]);
+  const backwardVisited = new Map([[target, { next: null, hopUrl: null }]]);
+  const forwardFrontier = [start];
+  const backwardFrontier = [target];
+  const edgesCache = new Map();
+
+  const totalVisited = () => forwardVisited.size + backwardVisited.size;
+  const getEdges = async (username) => {
+    const key = username.toLowerCase();
+    if (edgesCache.has(key)) return edgesCache.get(key);
+    const games = await readOrFetchGames(env, { username: key, archiveLimit }, stats);
+    const edges = edgesFromGames(key, games);
+    edgesCache.set(key, edges);
+    return edges;
+  };
+
+  for (let depth = 0; depth < SEARCH_MAX_DEPTH; depth++) {
+    const expandForward = forwardFrontier.length <= backwardFrontier.length;
+    const frontier = expandForward ? forwardFrontier : backwardFrontier;
+    if (!frontier.length) break;
+
+    const selectedFrontier = frontier.slice(0, SEARCH_FRONTIER_LIMIT);
+    await progress(`Step ${depth + 1}: checking ${selectedFrontier.length} players`, { depth });
+
+    let meeting = null;
+    let cursor = 0;
+    const nextFrontier = [];
+    const expandOne = async () => {
+      while (!meeting && cursor < selectedFrontier.length && stats.expanded < SEARCH_MAX_EXPANSIONS) {
+        const node = selectedFrontier[cursor++];
+        stats.expanded++;
+        const edges = await getEdges(node);
+        if (expandForward) {
+          for (const [opponent, urls] of edges.beatenByMe) {
+            if (forwardVisited.has(opponent)) continue;
+            forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
+            if (backwardVisited.has(opponent)) {
+              meeting = { node: opponent };
+              return;
+            }
+            nextFrontier.push(opponent);
+          }
+        } else {
+          for (const [opponent, urls] of edges.beatMe) {
+            if (backwardVisited.has(opponent)) continue;
+            backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
+            if (forwardVisited.has(opponent)) {
+              meeting = { node: opponent };
+              return;
+            }
+            nextFrontier.push(opponent);
+          }
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: ARCHIVE_CONCURRENCY }, expandOne));
+    await progress(`Checked ${stats.expanded} players, ${totalVisited()} candidates`);
+    if (meeting) return reconstructServerPath(meeting.node, forwardVisited, backwardVisited);
+    if (stats.expanded >= SEARCH_MAX_EXPANSIONS) break;
+
+    if (expandForward) {
+      forwardFrontier.length = 0;
+      for (const node of nextFrontier) forwardFrontier.push(node);
+    } else {
+      backwardFrontier.length = 0;
+      for (const node of nextFrontier) backwardFrontier.push(node);
+    }
+  }
+
+  return null;
+}
+
+function reconstructServerPath(mid, forwardVisited, backwardVisited) {
+  const hops = [];
+  let current = mid;
+  let guard = 0;
+  while (forwardVisited.get(current)?.prev && guard++ < 10000) {
+    const info = forwardVisited.get(current);
+    hops.unshift({ from: info.prev, to: current, url: info.hopUrl });
+    current = info.prev;
+  }
+  current = mid;
+  guard = 0;
+  while (backwardVisited.get(current)?.next && guard++ < 10000) {
+    const info = backwardVisited.get(current);
+    hops.push({ from: current, to: info.next, url: info.hopUrl });
+    current = info.next;
+  }
+  const path = hops.length ? [hops[0].from, ...hops.map((hop) => hop.to)] : [];
+  return path.length >= 2 ? { path, hops } : null;
+}
+
+function edgesFromGames(username, games) {
+  const beatenByMe = new Map();
+  const beatMe = new Map();
+  for (const game of games || []) {
+    if (game.timeClass === "daily") continue;
+    if (game.white === username) {
+      if (game.whiteResult === "win" && game.black) pushEdge(beatenByMe, game.black, game.url);
+      if (game.blackResult === "win" && game.black) pushEdge(beatMe, game.black, game.url);
+    } else if (game.black === username) {
+      if (game.blackResult === "win" && game.white) pushEdge(beatenByMe, game.white, game.url);
+      if (game.whiteResult === "win" && game.white) pushEdge(beatMe, game.white, game.url);
+    }
+  }
+  return { beatenByMe, beatMe };
+}
+
+function pushEdge(map, key, url) {
+  if (!map.has(key)) map.set(key, []);
+  map.get(key).push(url);
+}
+
+async function readOrFetchGames(env, parsed, stats = null) {
+  const key = cacheKeyFromParsed(parsed);
+  const kvKey = `games:${key}`;
+  const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
+  const cachedGames = Array.isArray(cached?.games) ? cached.games : null;
+  const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
+  if (cachedGames && Date.now() - cachedAt < TTL_SECONDS * 1000) {
+    if (stats) stats.cached++;
+    return cachedGames;
+  }
+
+  const activeLimit = await readRateLimit(env.GAMES_CACHE);
+  if (activeLimit && cachedGames) {
+    if (stats) stats.cached++;
+    return cachedGames;
+  }
+  if (activeLimit) {
+    throw new UpstreamHTTPError(429, `${CHESS_API}${parsed.username}/games/archives`, activeLimit.retryAfter);
+  }
+
+  try {
+    if (stats) stats.requests++;
+    const games = await fetchGames(parsed);
+    if (stats) stats.fetched++;
+    await putGamesCache(env.GAMES_CACHE, kvKey, parsed, games);
+    return games;
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
+      if (cachedGames) {
+        if (stats) stats.cached++;
+        return cachedGames;
+      }
+    }
+    throw error;
+  }
+}
+
+function cacheKeyFromParsed(parsed) {
+  return Number.isFinite(parsed.archiveLimit)
+    ? `${parsed.username}:recent:${parsed.archiveLimit}`
+    : `${parsed.username}:all`;
+}
+
+function archiveLimitForRange(range) {
+  if (range === "instant") return 2;
+  if (range === "6") return 6;
+  if (range === "12") return 12;
+  if (range === "all") return Infinity;
+  return 6;
+}
+
+async function handleWarm(url, env, ctx) {
+  const force = url.searchParams.get("force") === "1";
+  const status = await env.GAMES_CACHE.get(WARM_STATUS_KEY, { type: "json", cacheTtl: 60 });
+  const age = Date.now() - (Number.isFinite(status?.updatedAt) ? status.updatedAt : 0);
+  if (!force && status && age < WARM_INTERVAL_SECONDS * 1000) {
+    return json({ ok: true, status: publicWarmStatus(status), skipped: true }, 200, "no-store");
+  }
+
+  const next = {
+    status: "queued",
+    updatedAt: Date.now(),
+    warmed: Number.isFinite(status?.warmed) ? status.warmed : 0,
+    errors: 0,
+  };
+  await env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify(next), {
+    expirationTtl: KV_RETENTION_SECONDS,
+    metadata: { type: "warm" },
+  });
+
+  const warmPromise = warmLeaderboardTargets(env).catch((error) => {
+    console.warn(JSON.stringify({
+      event: "warm_failed",
+      message: error?.message || String(error),
+    }));
+    return env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify({
+      status: "failed",
+      updatedAt: Date.now(),
+      error: error?.message || String(error),
+      warmed: 0,
+      errors: 1,
+    }), { expirationTtl: KV_RETENTION_SECONDS, metadata: { type: "warm" } });
+  });
+  if (ctx?.waitUntil) ctx.waitUntil(warmPromise);
+  else await warmPromise;
+
+  return json({ ok: true, status: publicWarmStatus(next) }, 202, "no-store");
+}
+
+async function warmLeaderboardTargets(env) {
+  const startedAt = Date.now();
+  const players = new Set(COMMON_WARM_TARGETS);
+  const data = await fetchJSON("https://api.chess.com/pub/leaderboards");
+  for (const key of ["live_rapid", "live_blitz", "live_bullet"]) {
+    for (const row of (Array.isArray(data?.[key]) ? data[key] : []).slice(0, 10)) {
+      const username = cleanUsername(row?.username);
+      if (username) players.add(username);
+      if (players.size >= WARM_PLAYER_LIMIT) break;
+    }
+  }
+
+  let warmed = 0;
+  let errors = 0;
+  await runThrottled([...players].slice(0, WARM_PLAYER_LIMIT).map((username) => async () => {
+    try {
+      await readOrFetchProfile(env, username);
+      await readOrFetchGames(env, { username, archiveLimit: 2 });
+      warmed++;
+    } catch {
+      errors++;
+    }
+  }), 2);
+
+  await env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify({
+    status: "ready",
+    updatedAt: Date.now(),
+    startedAt,
+    warmed,
+    errors,
+  }), {
+    expirationTtl: KV_RETENTION_SECONDS,
+    metadata: { type: "warm" },
+  });
+}
+
+function publicWarmStatus(status) {
+  return {
+    status: String(status?.status || "queued"),
+    updatedAt: Number.isFinite(status?.updatedAt) ? status.updatedAt : Date.now(),
+    warmed: Number.isFinite(status?.warmed) ? status.warmed : 0,
+    errors: Number.isFinite(status?.errors) ? status.errors : 0,
+  };
 }
 
 async function handleSubmit(request, env) {
@@ -327,6 +774,43 @@ async function handleAnalyticsEvent(request, env) {
     }, 429);
   }
 
+  await saveAnalyticsEvent(env, event);
+  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
+    startedAt: submitWindow.startedAt,
+    count: submitWindow.count + 1,
+  }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
+
+  return json({ ok: true }, 200, "no-store");
+}
+
+async function handleAnalytics(url, request, env) {
+  if (!ownerAuthorized(request, env)) return json({ error: "unauthorized" }, 401, "no-store");
+
+  const parsedLimit = parseInt(url.searchParams.get("limit") || "30", 10);
+  const limit = Math.max(1, Math.min(MAX_ANALYTICS_LIMIT, Number.isFinite(parsedLimit) ? parsedLimit : 30));
+  const outcome = analyticsOutcomeFilter(url.searchParams.get("outcome"));
+  const username = cleanPartialUsername(url.searchParams.get("username"));
+  const allEvents = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
+  const events = allEvents.filter((event) => {
+    if (outcome && event.outcome !== outcome) return false;
+    if (username) {
+      const haystack = [event.start, event.target, ...(Array.isArray(event.path) ? event.path : [])]
+        .join(" ");
+      if (!haystack.includes(username)) return false;
+    }
+    return true;
+  });
+  return json({
+    events: events.slice(0, limit),
+    total: events.length,
+    storedTotal: allEvents.length,
+    filters: { outcome, username },
+    generatedAt: Date.now(),
+  }, 200, "no-store");
+}
+
+async function saveAnalyticsEvent(env, event) {
+  if (!event) return;
   const events = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
   const existingIndex = events.findIndex((item) => item.id === event.id);
   if (existingIndex >= 0) {
@@ -342,25 +826,135 @@ async function handleAnalyticsEvent(request, env) {
     expirationTtl: KV_RETENTION_SECONDS,
     metadata: { type: "analytics" },
   });
-  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
-    startedAt: submitWindow.startedAt,
-    count: submitWindow.count + 1,
-  }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
-
-  return json({ ok: true }, 200, "no-store");
 }
 
-async function handleAnalytics(url, request, env) {
-  if (!ownerAuthorized(request, env)) return json({ error: "unauthorized" }, 401, "no-store");
+async function readSearchJob(env, id) {
+  const record = await env.GAMES_CACHE.get(`search:job:${id}`, { type: "json" });
+  return searchJobShape(record);
+}
 
-  const parsedLimit = parseInt(url.searchParams.get("limit") || "30", 10);
-  const limit = Math.max(1, Math.min(MAX_ANALYTICS_LIMIT, Number.isFinite(parsedLimit) ? parsedLimit : 30));
-  const events = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
-  return json({
-    events: events.slice(0, limit),
-    total: events.length,
-    generatedAt: Date.now(),
-  }, 200, "no-store");
+async function writeSearchJob(env, job) {
+  const shaped = searchJobShape(job);
+  await env.GAMES_CACHE.put(`search:job:${shaped.id}`, JSON.stringify(shaped), {
+    expirationTtl: SEARCH_JOB_TTL_SECONDS,
+    metadata: { type: "search-job", start: shaped.start, target: shaped.target },
+  });
+  return shaped;
+}
+
+async function updateSearchJob(env, id, patch) {
+  const current = await readSearchJob(env, id);
+  if (!current) return null;
+  return writeSearchJob(env, {
+    ...current,
+    ...patch,
+    stats: patch.stats || current.stats,
+    updatedAt: Date.now(),
+  });
+}
+
+function searchJobShape(job) {
+  if (!job || typeof job !== "object") return null;
+  const id = cleanAnalyticsId(job.id);
+  const start = cleanUsername(job.start);
+  const target = cleanUsername(job.target);
+  if (!id || !start || !target || start === target) return null;
+  const status = ["queued", "running", "found", "not_found", "timeout", "failed", "expired"].includes(job.status)
+    ? job.status
+    : "queued";
+  const stats = job.stats && typeof job.stats === "object" ? job.stats : {};
+  const chain = job.chain && typeof job.chain === "object"
+    ? {
+        target: cleanUsername(job.chain.target || target),
+        display: String(job.chain.display || job.chain.target || target).slice(0, 80),
+        found: Boolean(job.chain.found),
+        length: Number.isFinite(job.chain.length) ? Math.max(0, Math.min(12, job.chain.length)) : null,
+        path: Array.isArray(job.chain.path) ? job.chain.path.slice(0, 12).map(cleanUsername).filter(Boolean) : [],
+        hops: Array.isArray(job.chain.hops) ? job.chain.hops.slice(0, 11).map((hop) => ({
+          from: cleanUsername(hop?.from),
+          to: cleanUsername(hop?.to),
+          url: String(hop?.url || ""),
+        })).filter((hop) => hop.from && hop.to) : [],
+      }
+    : null;
+  const players = job.players && typeof job.players === "object" ? job.players : {};
+  return {
+    id,
+    start,
+    target,
+    range: cleanRange(job.range) || "instant",
+    depth: Number.isFinite(job.depth) ? Math.max(1, Math.min(SEARCH_MAX_DEPTH, job.depth)) : SEARCH_MAX_DEPTH,
+    status,
+    outcome: analyticsOutcomeFilter(job.outcome) || statusToOutcome(status),
+    progress: String(job.progress || "").slice(0, 180),
+    error: String(job.error || "").slice(0, 240),
+    stats: {
+      fetched: cleanNonNegativeNumber(stats.fetched, 100000) || 0,
+      requests: cleanNonNegativeNumber(stats.requests, 100000) || 0,
+      cached: cleanNonNegativeNumber(stats.cached, 100000) || 0,
+      expanded: cleanNonNegativeNumber(stats.expanded, 100000) || 0,
+    },
+    chain,
+    players,
+    createdAt: Number.isFinite(job.createdAt) ? job.createdAt : Date.now(),
+    startedAt: Number.isFinite(job.startedAt) ? job.startedAt : null,
+    updatedAt: Number.isFinite(job.updatedAt) ? job.updatedAt : Date.now(),
+    durationMs: cleanNonNegativeNumber(job.durationMs, 10 * 60 * 1000),
+  };
+}
+
+function publicSearchJob(job) {
+  const shaped = searchJobShape(job);
+  if (!shaped) return null;
+  return {
+    id: shaped.id,
+    start: shaped.start,
+    target: shaped.target,
+    range: shaped.range,
+    status: shaped.status,
+    outcome: shaped.outcome,
+    progress: shaped.progress,
+    error: shaped.error,
+    stats: shaped.stats,
+    chain: shaped.chain,
+    players: shaped.players,
+    createdAt: shaped.createdAt,
+    updatedAt: shaped.updatedAt,
+    durationMs: shaped.durationMs,
+  };
+}
+
+function searchJobAnalyticsEvent(job) {
+  const shaped = searchJobShape(job);
+  if (!shaped) return null;
+  return {
+    id: shaped.id,
+    jobId: shaped.id,
+    ts: Date.now(),
+    outcome: shaped.outcome,
+    start: shaped.start,
+    target: shaped.target,
+    depth: shaped.depth,
+    range: shaped.range,
+    length: shaped.chain?.length ?? null,
+    steps: Array.isArray(shaped.chain?.path) && shaped.chain.path.length >= 2
+      ? shaped.chain.path.length - 1
+      : null,
+    path: Array.isArray(shaped.chain?.path) ? shaped.chain.path : [],
+    durationMs: shaped.durationMs,
+    requests: shaped.stats.requests,
+    cached: shaped.stats.cached,
+    country: "",
+    device: "server",
+  };
+}
+
+function statusToOutcome(status) {
+  if (status === "found") return "found";
+  if (status === "not_found") return "not_found";
+  if (status === "timeout") return "timeout";
+  if (status === "failed") return "error";
+  return "started";
 }
 
 function analyticsEventShape(body, request) {
@@ -398,6 +992,10 @@ function analyticsEventShape(body, request) {
     length,
     steps,
     path,
+    jobId: cleanAnalyticsId(body?.jobId || body?.searchId || body?.id),
+    durationMs: cleanNonNegativeNumber(body?.durationMs, 10 * 60 * 1000),
+    requests: cleanNonNegativeNumber(body?.requests, 100000),
+    cached: cleanNonNegativeNumber(body?.cached, 100000),
     country: cleanCountry(request.cf?.country),
     device: deviceLabel(request.headers.get("User-Agent") || ""),
   };
@@ -426,6 +1024,10 @@ function normalizeAnalyticsEvents(events) {
         length: Number.isFinite(event.length) ? Math.max(0, Math.min(10, event.length)) : null,
         steps: Number.isFinite(event.steps) ? Math.max(0, Math.min(12, event.steps)) : null,
         path: normalizedPath,
+        jobId: cleanAnalyticsId(event.jobId) || "",
+        durationMs: cleanNonNegativeNumber(event.durationMs, 10 * 60 * 1000),
+        requests: cleanNonNegativeNumber(event.requests, 100000),
+        cached: cleanNonNegativeNumber(event.cached, 100000),
         country: cleanCountry(event.country),
         device: deviceLabel(event.device || ""),
       };
@@ -447,6 +1049,18 @@ function analyticsOutcome(value) {
     : "started";
 }
 
+function analyticsOutcomeFilter(value) {
+  const clean = String(value || "").toLowerCase().replace(/-/g, "_");
+  return ["started", "saved", "found", "not_found", "timeout", "error"].includes(clean)
+    ? clean
+    : "";
+}
+
+function cleanNonNegativeNumber(value, max) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.min(max, Math.round(number))) : null;
+}
+
 function cleanRange(value) {
   const clean = String(value || "").toLowerCase().trim().replace(/[^a-z0-9_-]/g, "");
   return ["instant", "6", "12", "all"].includes(clean) ? clean : "";
@@ -462,7 +1076,7 @@ function deviceLabel(value) {
   if (!text) return "";
   if (text.includes("tablet") || text.includes("ipad")) return "tablet";
   if (text.includes("mobi") || text.includes("iphone") || text.includes("android")) return "mobile";
-  if (["desktop", "mobile", "tablet"].includes(text)) return text;
+  if (["desktop", "mobile", "tablet", "server"].includes(text)) return text;
   return "desktop";
 }
 
@@ -522,6 +1136,7 @@ async function fetchGames({ username, archiveLimit }) {
         blackResult: game.black?.result,
         url: game.url,
         timeClass: game.time_class,
+        endTime: Number.isFinite(game.end_time) ? game.end_time : null,
       });
     }
   }
@@ -551,7 +1166,7 @@ function profileShape(data, fallbackUsername) {
   };
 }
 
-async function fetchProfileDetails(username) {
+async function fetchProfileDetails(username, env = null) {
   const data = await fetchJSON(`${CHESS_API}${username}`);
   const profile = profileShape(data, username);
   try {
@@ -560,7 +1175,45 @@ async function fetchProfileDetails(username) {
   } catch {
     profile.stats = {};
   }
+  if (env) {
+    try {
+      profile.recentGames = await fetchRecentProfileGames(env, username);
+    } catch {
+      profile.recentGames = [];
+    }
+  }
   return profile;
+}
+
+async function fetchRecentProfileGames(env, username) {
+  const games = await readOrFetchGames(env, { username, archiveLimit: 2 });
+  return games
+    .filter((game) => game.white === username || game.black === username)
+    .sort((a, b) => (b.endTime || 0) - (a.endTime || 0))
+    .slice(0, 5)
+    .map((game) => recentGameShape(game, username))
+    .filter(Boolean);
+}
+
+function recentGameShape(game, username) {
+  const isWhite = game.white === username;
+  const opponent = isWhite ? game.black : game.white;
+  if (!opponent) return null;
+  const mine = isWhite ? game.whiteResult : game.blackResult;
+  const theirs = isWhite ? game.blackResult : game.whiteResult;
+  const result = mine === "win"
+    ? "win"
+    : theirs === "win"
+      ? "loss"
+      : "draw";
+  return {
+    opponent,
+    result,
+    color: isWhite ? "white" : "black",
+    timeClass: String(game.timeClass || ""),
+    url: String(game.url || ""),
+    endTime: Number.isFinite(game.endTime) ? game.endTime : null,
+  };
 }
 
 function statsShape(stats) {

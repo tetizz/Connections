@@ -2057,7 +2057,73 @@ html[data-theme="dark"] .card__avatar-fallback {
   line-height: 1;
 }
 
-.profile-popover a {
+.profile-games {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+}
+
+.profile-games__title {
+  color: rgba(246, 239, 226, .58);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+.profile-game {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  min-height: 32px;
+  padding: 6px 7px;
+  color: rgba(246, 239, 226, .72);
+  background: rgba(255, 253, 248, .045);
+  border: 1px solid rgba(255, 253, 248, .08);
+  border-radius: 7px;
+  text-decoration: none;
+}
+
+.profile-game:hover {
+  border-color: rgba(240, 201, 119, .28);
+  background: rgba(240, 201, 119, .08);
+}
+
+.profile-game strong,
+.profile-game small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-game strong {
+  color: #fff8e8;
+  font-size: 12px;
+}
+
+.profile-game small {
+  color: rgba(246, 239, 226, .52);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.profile-game__result {
+  color: rgba(246, 239, 226, .64);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.profile-game__result.is-win {
+  color: #f4d282;
+}
+
+.profile-game__result.is-loss {
+  color: #ffb49b;
+}
+
+.profile-popover__open {
   min-height: 34px;
   display: inline-flex;
   align-items: center;
@@ -2207,6 +2273,17 @@ html[data-theme="dark"] .setting__btn--gold {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
   align-items: center;
+}
+
+.owner-filters {
+  display: grid;
+  grid-template-columns: minmax(120px, .45fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.owner-filters[hidden] {
+  display: none;
 }
 
 .owner-analytics {
@@ -2548,6 +2625,10 @@ html[data-theme="dark"] .setting__btn--gold {
   }
 
   .owner-unlock {
+    grid-template-columns: 1fr;
+  }
+
+  .owner-filters {
     grid-template-columns: 1fr;
   }
 

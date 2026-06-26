@@ -11,10 +11,15 @@ Live site: https://tetizz.github.io/Connections/
 ## What the site does
 
 - Searches for a verified win chain between two Chess.com usernames.
+- Runs new searches as backend jobs so the page can show progress and resume after a refresh.
 - Shows the chain as an animated graph.
 - Ranks the top connector players by how often they appear in the middle of submitted chains.
 - Lists every hop with a link back to the original Chess.com game.
-- Saves fetched game histories in the browser and shared Cloudflare KV cache for a week so repeated searches are faster.
+- Builds shareable result links with the exact chain, proof games, graph, and profile data.
+- Shows player profile cards with avatars, flags, ratings, joined date, status, and recent public games.
+- Saves fetched game histories in shared Cloudflare KV cache for a week so repeated searches are faster.
+- Warms the cache around live Rapid, Blitz, and Bullet leaderboard players plus common targets.
+- Includes a private owner debug panel for recent search outcomes, timings, request counts, reused cache hits, and errors.
 - Defaults to an instant bridge check so a random username gets a fast answer instead of a long crawl.
 - Ships with precomputed example chains so the page has something useful to show immediately.
 
@@ -53,11 +58,11 @@ Main files:
 
 - `scripts/chess_beaten_chain.py` builds the directed graph. `A -> B` means A beat B in a standard live game.
 - `scripts/compute_chains.py` runs the configured searches and writes JSON.
-- `site/engine.js` runs the bidirectional search in the browser.
+- `site/engine.js` keeps a browser fallback search for local/offline testing.
 - `site/cache.js` reads from IndexedDB first, then the shared Cloudflare Worker cache when configured.
-- `site/app.js` renders the graph, ledger, settings, and search states.
+- `site/app.js` renders the graph, ledger, settings, profile cards, share links, job progress, and search states.
 - `site/leaderboard.js` auto-submits found chains and displays the top 10 connector players with Chess.com profile photos.
-- `worker/` is the Cloudflare Worker backend for the leaderboard and shared game-history cache.
+- `worker/` is the Cloudflare Worker backend for search jobs, cache warming, profiles, suggestions, the leaderboard, owner debug data, and shared game-history cache.
 
 ## Cloudflare backend
 
@@ -70,8 +75,15 @@ https://connections-cache.tetizz.workers.dev
 Endpoints:
 
 - `GET /games?key=username:recent:N` checks KV first, then fetches public Chess.com archives on a miss and stores sanitized game rows for seven days.
+- `POST /search/start` starts a bounded backend chain search and returns a job ID.
+- `GET /search/job?id=...` returns live progress or the finished chain.
+- `GET|POST /search/warm` refreshes common target/profile/game caches in the background.
+- `GET /profile?username=...` returns Chess.com profile details, ratings, and recent public games.
+- `GET /suggest?query=...` returns username autocomplete suggestions.
 - `POST /submit` stores an automatically submitted found chain, rejects duplicate exact paths, dedupes by `(start,target)` while keeping the chain with the most middle connections, and rate-limits writes by IP.
 - `GET /leaderboard?limit=50` returns connector-player rankings built from stored chains.
+- `POST /analytics/event` records search lifecycle events.
+- `GET /analytics?limit=30` returns owner-only debug timeline data.
 - `GET /health` is an uptime check.
 
 Useful commands:
@@ -137,7 +149,7 @@ Commit the updated JSON if you want the hosted examples to change.
 
 - Data comes from the public Chess.com Published Data API.
 - Searches can get expensive quickly because each player can add many more players to the graph.
-- The browser app chooses the deepest practical search automatically; visitors only pick how wide the game-history range should be.
+- The app chooses the practical search depth automatically; visitors only pick how wide the game-history range should be.
 - `Instant bridge` checks the starting player's latest two monthly archives for a direct win or a known connector into a saved master-player route. It returns fast and stops there.
 - `Recent fast` checks the latest six monthly archives for each player it touches.
 - `Last year` checks the latest twelve monthly archives and can use the shared Cloudflare cache.

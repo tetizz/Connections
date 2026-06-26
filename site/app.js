@@ -16,8 +16,10 @@
   const LS_THEME_KEY = "chess-connections:theme";
   const LS_RANGE_KEY = "chess-connections:range";
   const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
+  const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v1";
   const INTRO_COMPLETE_KEY = "chess-connections:intro-complete:v1";
-  const SHARE_PARAM = "share";
+  const CHAIN_PARAM = "chain";
+  const LEGACY_SHARE_PARAM = "share";
   const DEFAULT_TARGET = "magnuscarlsen";
   const AUTO_SEARCH_DEPTH = 5;
   const LEGACY_DEPTH_KEY = "chess-connections:depth";
@@ -538,8 +540,9 @@
 
   function buildShareUrl(chain) {
     const url = new URL(location.href);
-    url.searchParams.set(SHARE_PARAM, encodeSharePayload(chain));
-    url.searchParams.set("v", "shared");
+    url.searchParams.set(CHAIN_PARAM, encodeSharePayload(chain));
+    url.searchParams.delete(LEGACY_SHARE_PARAM);
+    url.searchParams.set("v", "chain");
     return url.toString();
   }
 
@@ -591,7 +594,7 @@
 
   function loadSharedChainFromUrl() {
     const params = new URL(location.href).searchParams;
-    const shared = decodeSharePayload(params.get(SHARE_PARAM));
+    const shared = decodeSharePayload(params.get(CHAIN_PARAM) || params.get(LEGACY_SHARE_PARAM));
     if (!shared) return false;
     state.players = state.players || {};
     for (const [username, profile] of Object.entries(shared.players || {})) {
@@ -666,7 +669,7 @@
       window.crypto.getRandomValues(values);
       return `search-${Date.now().toString(36)}-${values[0].toString(36)}${values[1].toString(36)}`;
     }
-    return `search-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    return `search-${Date.now().toString(36)}-${String(performance.now()).replace(/[^0-9]/g, "").slice(0, 10)}`;
   }
 
   function recordSearchEvent(outcome, detail = {}) {
@@ -674,6 +677,7 @@
     if (!remoteBase) return;
     const payload = {
       searchId: detail.searchId,
+      jobId: detail.jobId || detail.searchId,
       outcome,
       start: detail.start,
       target: detail.target,
@@ -682,6 +686,9 @@
       length: Number.isFinite(detail.length) ? detail.length : null,
       steps: Number.isFinite(detail.steps) ? detail.steps : null,
       path: Array.isArray(detail.path) ? detail.path : [],
+      durationMs: Number.isFinite(detail.durationMs) ? detail.durationMs : null,
+      requests: Number.isFinite(detail.requests) ? detail.requests : null,
+      cached: Number.isFinite(detail.cached) ? detail.cached : null,
     };
     fetch(`${remoteBase}/analytics/event`, {
       method: "POST",
@@ -697,12 +704,14 @@
     const status = $("#owner-status");
     const wrap = $("#owner-analytics");
     const btn = $("#owner-load");
+    const filters = $("#owner-filters");
     const code = String(codeInput?.value || "").trim();
     if (!remoteBase || !codeInput || !status || !wrap || !btn) return;
     if (!code) {
       status.hidden = false;
       status.textContent = "Enter the owner code first.";
       wrap.hidden = true;
+      if (filters) filters.hidden = true;
       return;
     }
 
@@ -710,7 +719,13 @@
     status.hidden = false;
     status.textContent = "Loading recent searches...";
     try {
-      const res = await fetch(`${remoteBase}/analytics?limit=${OWNER_ANALYTICS_LIMIT}`, {
+      const url = new URL(`${remoteBase}/analytics`);
+      url.searchParams.set("limit", OWNER_ANALYTICS_LIMIT);
+      const outcome = String($("#owner-filter-outcome")?.value || "").trim();
+      const username = String($("#owner-filter-username")?.value || "").trim();
+      if (outcome) url.searchParams.set("outcome", outcome);
+      if (username) url.searchParams.set("username", username);
+      const res = await fetch(url.toString(), {
         headers: {
           "Accept": "application/json",
           "X-Owner-Code": code,
@@ -723,10 +738,12 @@
       const data = await res.json();
       renderOwnerAnalytics(data);
       state.ownerCode = code;
+      if (filters) filters.hidden = false;
       status.hidden = false;
-      status.textContent = `${Number(data.total || 0).toLocaleString()} recent search${Number(data.total || 0) === 1 ? "" : "es"} available.`;
+      status.textContent = `${Number(data.total || 0).toLocaleString()} matching search${Number(data.total || 0) === 1 ? "" : "es"}.`;
     } catch (error) {
       wrap.hidden = true;
+      if (filters) filters.hidden = true;
       status.hidden = false;
       status.textContent = error.message || "Could not load analytics.";
     } finally {
@@ -740,12 +757,12 @@
     const events = Array.isArray(data?.events) ? data.events : [];
     wrap.hidden = false;
     if (!events.length) {
-      wrap.innerHTML = `<div class="owner-summary"><span>No searches recorded yet.</span></div>`;
+      wrap.innerHTML = `<div class="owner-summary"><span>No matching searches.</span></div>`;
       return;
     }
     wrap.innerHTML = `
       <div class="owner-summary">
-        <span>Last ${events.length} searches</span>
+        <span>Last ${events.length} matching searches</span>
         <span>${esc(new Date(data.generatedAt || Date.now()).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</span>
       </div>
       ${events.map(ownerEventRow).join("")}
@@ -757,10 +774,13 @@
     const path = Array.isArray(event.path) && event.path.length > 1
       ? `<div class="owner-event__chain">${esc(event.path.join(" -> "))}</div>`
       : "";
-    const depth = Number.isFinite(event.depth) ? `${event.depth} steps` : "depth n/a";
     const range = event.range ? String(event.range).replace(/_/g, " ") : "range n/a";
     const place = [event.country, event.device].filter(Boolean).join(" · ") || "visitor";
     const when = Number.isFinite(event.ts) ? timeAgo(event.ts) : "just now";
+    const duration = Number.isFinite(event.durationMs) ? `${(event.durationMs / 1000).toFixed(event.durationMs < 10000 ? 1 : 0)}s` : "";
+    const requests = Number.isFinite(event.requests) ? `${event.requests} requests` : "";
+    const cached = Number.isFinite(event.cached) ? `${event.cached} reused` : "";
+    const stats = [duration, requests, cached].filter(Boolean).join(" · ");
     return `
       <div class="owner-event">
         <div class="owner-event__top">
@@ -768,7 +788,7 @@
           <span class="owner-event__status is-${esc(outcome)}">${esc(statusText(event.outcome))}</span>
         </div>
         <div class="owner-event__meta">
-          <span>${esc(when)} · ${esc(depth)} · ${esc(range)}</span>
+          <span>${esc(when)} · ${esc(range)}${stats ? ` · ${esc(stats)}` : ""}</span>
           <span>${esc(place)}</span>
         </div>
         ${path}
@@ -1313,7 +1333,10 @@
       ? `<img src="${esc(profile.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer">`
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
     const joined = profile?.joined ? `<span>Joined ${esc(formatProfileDate(profile.joined))}</span>` : `<span>Joined unavailable</span>`;
-    const country = profile?.country ? `<span class="profile-popover__country">${flagIcon(profile.country, "profile-popover__flag")}${esc(profile.country.toUpperCase())}</span>` : "";
+    const countryFlag = profile?.country ? flagIcon(profile.country, "profile-popover__flag") : "";
+    const country = countryFlag
+      ? `<span class="profile-popover__country" title="${esc(profile.country.toUpperCase())}">${countryFlag}</span>`
+      : "";
     const followers = Number.isFinite(profile?.followers)
       ? `<span>${Number(profile.followers).toLocaleString()} followers</span>`
       : "";
@@ -1325,6 +1348,7 @@
       : "";
     const url = profile?.url || `https://www.chess.com/member/${encodeURIComponent(handle)}`;
     const stats = renderProfileStats(profile?.stats);
+    const recentGames = renderProfileRecentGames(profile?.recentGames);
 
     pop.innerHTML = `
       <div class="profile-popover__top">
@@ -1336,7 +1360,8 @@
       </div>
       <div class="profile-popover__meta">${country}${followers}${joined}${online}${location}${fide}${status}</div>
       ${stats}
-      <a href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>
+      ${recentGames}
+      <a class="profile-popover__open" href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>
     `;
     pop.hidden = false;
     positionProfilePopover(pop, anchor);
@@ -1417,6 +1442,244 @@
     return `<div class="profile-stats" aria-label="Player ratings">${cells}</div>`;
   }
 
+  function renderProfileRecentGames(games) {
+    const rows = Array.isArray(games) ? games.slice(0, 5) : [];
+    if (!rows.length) return "";
+    return `
+      <div class="profile-games" aria-label="Recent public games">
+        <span class="profile-games__title">Recent games</span>
+        ${rows.map((game) => {
+          const result = String(game.result || "game").replace(/_/g, " ");
+          const tone = result === "win" ? " is-win" : result === "loss" ? " is-loss" : "";
+          const when = Number.isFinite(game.endTime) ? timeAgo(game.endTime * 1000) : "";
+          const label = result === "win" ? "Beat" : result === "loss" ? "Lost to" : "Drew";
+          const url = String(game.url || "");
+          const body = `
+            <span class="profile-game__result${tone}">${esc(label)}</span>
+            <strong>${esc(game.opponent || "opponent")}</strong>
+            <small>${esc([game.timeClass, when].filter(Boolean).join(" · "))}</small>
+          `;
+          return url
+            ? `<a class="profile-game" href="${esc(url)}" target="_blank" rel="noopener">${body}</a>`
+            : `<div class="profile-game">${body}</div>`;
+        }).join("")}
+      </div>
+    `;
+  }
+
+  async function runServerSearchFlow({ start, target, range, analyticsBase, mode, btn, status, logEl }) {
+    const remoteBase = workerBase();
+    if (!remoteBase) return false;
+
+    let lastMessage = "";
+    const logLine = (msg) => {
+      if (!logEl || msg === lastMessage) return;
+      lastMessage = msg;
+      const div = document.createElement("div");
+      div.className = "log__line";
+      div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.appendChild(div);
+      while (logEl.children.length > 12) logEl.removeChild(logEl.firstChild);
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    try {
+      btn.disabled = true;
+      status.hidden = false;
+      status.className = "search__status is-working";
+      logEl.hidden = false;
+      logEl.innerHTML = "";
+      showStatus("working", "starting server search...");
+      logLine(`queued ${start} -> ${target} (${mode.label})`);
+
+      const res = await fetch(`${remoteBase}/search/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({
+          start,
+          target,
+          range,
+          searchId: analyticsBase.searchId,
+        }),
+      });
+      if (!res.ok) throw new Error(`job start failed (${res.status})`);
+      const data = await res.json();
+      const job = data.job;
+      if (!job?.id) throw new Error("job start failed");
+      saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId });
+      const finished = await pollServerSearchJob(job.id, { analyticsBase, logLine });
+      clearActiveJob(job.id);
+      if (finished?.chain?.found) {
+        await applyServerChain(finished, analyticsBase);
+      } else {
+        const outcome = finished?.outcome || (finished?.status === "timeout" ? "timeout" : "not_found");
+        showStatus(outcome === "timeout" ? "error" : "error",
+          finished?.progress || "no connection found in this search.");
+        renderChain({
+          target,
+          display: target,
+          found: false,
+          length: null,
+          path: [],
+          hops: [],
+        });
+        recordSearchEvent(outcome, {
+          ...analyticsBase,
+          jobId: finished?.id,
+          durationMs: finished?.durationMs,
+          requests: finished?.stats?.requests,
+          cached: finished?.stats?.cached,
+        });
+      }
+      return true;
+    } catch (error) {
+      logLine(`server search unavailable: ${error.message}`);
+      return false;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function pollServerSearchJob(id, { analyticsBase = null, logLine = null } = {}) {
+    const remoteBase = workerBase();
+    if (!remoteBase || !id) return null;
+    let job = null;
+    for (let attempt = 0; attempt < 150; attempt++) {
+      const res = await fetch(`${remoteBase}/search/job?id=${encodeURIComponent(id)}`, {
+        headers: { "Accept": "application/json" },
+      });
+      if (!res.ok) throw new Error(`job poll failed (${res.status})`);
+      const data = await res.json();
+      job = data.job;
+      if (!job) throw new Error("job missing");
+      showServerJobProgress(job);
+      if (logLine) logLine(job.progress || statusText(job.status));
+      if (["found", "not_found", "timeout", "failed"].includes(job.status)) return job;
+      await new Promise((resolve) => setTimeout(resolve, attempt < 8 ? 900 : 1500));
+    }
+    return {
+      id,
+      status: "timeout",
+      outcome: "timeout",
+      progress: "Search is still running. Reopen the page and it will resume.",
+      start: analyticsBase?.start,
+      target: analyticsBase?.target,
+    };
+  }
+
+  function showServerJobProgress(job) {
+    const status = $("#search-status");
+    if (!status || !job) return;
+    const stats = job.stats || {};
+    status.hidden = false;
+    status.className = "search__status is-working";
+    status.innerHTML =
+      `<span class="spinner"></span>${esc(job.progress || "searching...")}` +
+      `<span class="counters">checked <b>${Number(stats.expanded || 0)}</b> players · ` +
+      `${Number(stats.requests || 0)} requests · ${Number(stats.cached || 0)} reused</span>`;
+  }
+
+  async function applyServerChain(job, analyticsBase) {
+    const chain = job.chain;
+    state.players = state.players || {};
+    for (const [username, profile] of Object.entries(job.players || {})) {
+      const key = username.toLowerCase();
+      state.players[key] = {
+        ...(state.players[key] || {}),
+        ...metaShape({ username: key, ...profile }),
+        profileComplete: Boolean(profile?.stats),
+      };
+    }
+    await hydratePlayers(chain.path || [], {
+      fetchJSON: (url) => fetch(url, { headers: { "Accept": "application/json" } }).then((res) => res.json()),
+      API: "https://api.chess.com/pub/player/",
+    });
+    showStatus("done",
+      `✓ found it — ${esc(job.start)} connects to ${esc(job.target)} in ${stepText((chain.path || []).length - 1)}. ` +
+      `checked ${Number(job.stats?.expanded || 0)} players, made ${Number(job.stats?.requests || 0)} requests` +
+      (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ".");
+    setActiveChip(job.target);
+    renderChain(chain);
+    submitLeaderboardChain(job.start, job.target, chain);
+    recordSearchEvent("found", {
+      ...analyticsBase,
+      jobId: job.id,
+      length: chain.length,
+      steps: Math.max(0, (chain.path || []).length - 1),
+      path: chain.path || [],
+      durationMs: job.durationMs,
+      requests: job.stats?.requests,
+      cached: job.stats?.cached,
+    });
+    document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+  }
+
+  function saveActiveJob(job) {
+    try {
+      localStorage.setItem(LS_ACTIVE_JOB_KEY, JSON.stringify({ ...job, ts: Date.now() }));
+    } catch {
+      // Non-critical.
+    }
+  }
+
+  function clearActiveJob(id = "") {
+    try {
+      const current = JSON.parse(localStorage.getItem(LS_ACTIVE_JOB_KEY) || "null");
+      if (!id || !current?.id || current.id === id) localStorage.removeItem(LS_ACTIVE_JOB_KEY);
+    } catch {
+      localStorage.removeItem(LS_ACTIVE_JOB_KEY);
+    }
+  }
+
+  async function resumeActiveSearchJob() {
+    let record = null;
+    try {
+      record = JSON.parse(localStorage.getItem(LS_ACTIVE_JOB_KEY) || "null");
+    } catch {
+      clearActiveJob();
+    }
+    if (!record?.id || Date.now() - Number(record.ts || 0) > 2 * 60 * 60 * 1000) {
+      clearActiveJob();
+      return;
+    }
+    $("#search-start").value = record.start || $("#search-start").value;
+    $("#search-target").value = record.target || $("#search-target").value;
+    showStatus("working", "resuming search...");
+    try {
+      const job = await pollServerSearchJob(record.id, {
+        analyticsBase: {
+          searchId: record.searchId || record.id,
+          start: record.start,
+          target: record.target,
+          range: record.range,
+          depth: AUTO_SEARCH_DEPTH,
+        },
+      });
+      clearActiveJob(record.id);
+      if (job?.chain?.found) {
+        await applyServerChain(job, {
+          searchId: record.searchId || record.id,
+          start: record.start,
+          target: record.target,
+          range: record.range,
+          depth: AUTO_SEARCH_DEPTH,
+        });
+      }
+    } catch {
+      clearActiveJob(record.id);
+    }
+  }
+
+  function warmSharedCaches() {
+    const remoteBase = workerBase();
+    if (!remoteBase) return;
+    fetch(`${remoteBase}/search/warm`, {
+      method: "POST",
+      headers: { "Accept": "application/json" },
+      keepalive: true,
+    }).catch(() => {});
+  }
+
   // ---------- live search ----------
   async function runSearch(startRaw, targetRaw, range) {
     const start = startRaw.trim().toLowerCase();
@@ -1435,6 +1698,7 @@
       showStatus("error", "those are the same player — pick two different ones.");
       return;
     }
+    const searchStartedAt = performance.now();
     const analyticsBase = { searchId: newSearchEventId(), start, target, depth, range };
     recordSearchEvent("started", analyticsBase);
 
@@ -1461,10 +1725,23 @@
         length: renderedChain.length,
         steps: Math.max(0, renderedChain.path.length - 1),
         path: renderedChain.path,
+        durationMs: performance.now() - searchStartedAt,
       });
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
       return;
     }
+
+    const handledByServer = await runServerSearchFlow({
+      start,
+      target,
+      range,
+      analyticsBase,
+      mode,
+      btn,
+      status,
+      logEl,
+    });
+    if (handledByServer) return;
 
     btn.disabled = true;
     status.hidden = false;
@@ -1527,12 +1804,18 @@
       ]);
       if (!startMeta) {
         showStatus("error", `couldn't find "${esc(start)}" on chess.com — check the spelling?`);
-        recordSearchEvent("not_found", analyticsBase);
+        recordSearchEvent("not_found", {
+          ...analyticsBase,
+          durationMs: performance.now() - searchStartedAt,
+        });
         return;
       }
       if (!targetMeta) {
         showStatus("error", `couldn't find "${esc(target)}" on chess.com — check the spelling?`);
-        recordSearchEvent("not_found", analyticsBase);
+        recordSearchEvent("not_found", {
+          ...analyticsBase,
+          durationMs: performance.now() - searchStartedAt,
+        });
         return;
       }
       state.players = state.players || {};
@@ -1554,7 +1837,12 @@
             target, display: targetMeta.name || target,
             found: false, length: null, path: [], hops: [],
           });
-          recordSearchEvent("timeout", analyticsBase);
+          recordSearchEvent("timeout", {
+            ...analyticsBase,
+            durationMs: performance.now() - searchStartedAt,
+            requests: bridgeEngine.stats.apiCalls,
+            cached: bridgeEngine.stats.cached,
+          });
           return;
         }
       }
@@ -1577,6 +1865,9 @@
           length: bridged.length,
           steps: Math.max(0, bridged.path.length - 1),
           path: bridged.path,
+          durationMs: performance.now() - searchStartedAt,
+          requests: bridgeEngine.stats.apiCalls,
+          cached: bridgeEngine.stats.cached,
         });
         document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
         return;
@@ -1591,7 +1882,12 @@
           target, display: targetMeta.name || target,
           found: false, length: null, path: [], hops: [],
         });
-        recordSearchEvent("not_found", analyticsBase);
+        recordSearchEvent("not_found", {
+          ...analyticsBase,
+          durationMs: performance.now() - searchStartedAt,
+          requests: bridgeEngine.stats.apiCalls,
+          cached: bridgeEngine.stats.cached,
+        });
         return;
       }
 
@@ -1610,7 +1906,12 @@
           target, display: targetMeta.name || target,
           found: false, length: null, path: [], hops: [],
         });
-        recordSearchEvent("not_found", analyticsBase);
+        recordSearchEvent("not_found", {
+          ...analyticsBase,
+          durationMs: performance.now() - searchStartedAt,
+          requests: engine.stats.apiCalls,
+          cached: engine.stats.cached,
+        });
         return;
       }
 
@@ -1634,16 +1935,22 @@
       renderChain(renderedChain);
       submitLeaderboardChain(start, target, renderedChain);
       recordSearchEvent("found", {
-        ...analyticsBase,
-        length: renderedChain.length,
-        steps: Math.max(0, renderedChain.path.length - 1),
-        path: renderedChain.path,
-      });
+          ...analyticsBase,
+          length: renderedChain.length,
+          steps: Math.max(0, renderedChain.path.length - 1),
+          path: renderedChain.path,
+          durationMs: performance.now() - searchStartedAt,
+          requests: engine.stats.apiCalls,
+          cached: engine.stats.cached,
+        });
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
     } catch (e) {
       console.error(e);
       showStatus("error", `something went wrong: ${esc(e.message)}`);
-      recordSearchEvent("error", analyticsBase);
+      recordSearchEvent("error", {
+        ...analyticsBase,
+        durationMs: performance.now() - searchStartedAt,
+      });
     } finally {
       btn.disabled = false;
       const est = await cache.estimate();
@@ -1672,7 +1979,8 @@
       location: p.location,
       fide: p.fide,
       stats: p.stats,
-      profileComplete: Boolean(p.profileComplete),
+      recentGames: Array.isArray(p.recentGames) ? p.recentGames : [],
+      profileComplete: Boolean(p.profileComplete || p.stats),
     };
   }
 
@@ -1760,10 +2068,12 @@
     refreshCacheSize();
     const ownerStatus = $("#owner-status");
     const ownerAnalytics = $("#owner-analytics");
+    const ownerFilters = $("#owner-filters");
     if (ownerStatus) {
       ownerStatus.hidden = true;
       ownerStatus.textContent = "";
     }
+    if (ownerFilters && !state.ownerCode) ownerFilters.hidden = true;
     if (ownerAnalytics) {
       ownerAnalytics.hidden = true;
       ownerAnalytics.innerHTML = "";
@@ -1794,6 +2104,9 @@
   });
   $("#owner-form")?.addEventListener("submit", (e) => {
     e.preventDefault();
+    loadOwnerAnalytics();
+  });
+  $("#owner-filter-apply")?.addEventListener("click", () => {
     loadOwnerAnalytics();
   });
 
@@ -1968,9 +2281,11 @@
     }
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
     if (!introComplete()) openIntroGate();
+    warmSharedCaches();
     loadShowcase().then(() => {
-      loadSharedChainFromUrl();
+      const sharedLoaded = loadSharedChainFromUrl();
       loadLeaderboardTargets();
+      if (!sharedLoaded) resumeActiveSearchJob();
     });
     // load the global leaderboard in the background
     if (window.Leaderboard) window.Leaderboard.load();

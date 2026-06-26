@@ -13,7 +13,7 @@
     document.documentElement.dataset.theme =
       localStorage.getItem("chess-connections:theme") || "dark";
   </script>
-  <link rel="stylesheet" href="styles.css?v=auto-depth-20260626" />
+  <link rel="stylesheet" href="styles.css?v=jobs-timeline-20260626" />
 </head>
 <body>
   <div class="site-shell">
@@ -216,6 +216,18 @@
                    spellcheck="false" autocapitalize="none" autocomplete="off" />
             <button class="setting__btn setting__btn--gold" id="owner-load" type="submit">Unlock</button>
           </form>
+          <div class="owner-filters" id="owner-filters" hidden>
+            <select id="owner-filter-outcome" aria-label="Filter owner debug by result">
+              <option value="">All results</option>
+              <option value="found">Found</option>
+              <option value="not_found">Not found</option>
+              <option value="timeout">Timeout</option>
+              <option value="error">Error</option>
+            </select>
+            <input id="owner-filter-username" type="text" placeholder="filter username"
+                   spellcheck="false" autocapitalize="none" autocomplete="off" />
+            <button class="setting__btn" id="owner-filter-apply" type="button">Apply</button>
+          </div>
           <span class="setting__hint" id="owner-status" hidden></span>
           <div class="owner-analytics" id="owner-analytics" hidden></div>
         </div>
@@ -225,10 +237,10 @@
 
   <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
 
-  <script src="config.js?v=auto-depth-20260626"></script>
-  <script src="cache.js?v=auto-depth-20260626"></script>
-  <script src="engine.js?v=auto-depth-20260626"></script>
-  <script src="leaderboard.js?v=auto-depth-20260626"></script>
-  <script src="app.js?v=auto-depth-20260626"></script>
+  <script src="config.js?v=jobs-timeline-20260626"></script>
+  <script src="cache.js?v=jobs-timeline-20260626"></script>
+  <script src="engine.js?v=jobs-timeline-20260626"></script>
+  <script src="leaderboard.js?v=jobs-timeline-20260626"></script>
+  <script src="app.js?v=jobs-timeline-20260626"></script>
 </body>
 </html>

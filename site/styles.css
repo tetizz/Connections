@@ -573,7 +573,29 @@ html[data-theme="dark"] .search__field select {
 
 .username-suggest__flag {
   flex: 0 0 auto;
-  font-size: 15px;
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 15px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 253, 248, .16);
+  border-radius: 3px;
+  background: rgba(255, 253, 248, .08);
+  box-shadow: 0 2px 7px rgba(0, 0, 0, .22);
+}
+
+.username-suggest__flag img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.username-suggest__flag-code {
+  color: rgba(255, 253, 248, .8);
+  font-size: 8px;
+  font-weight: 900;
+  line-height: 1;
 }
 
 .username-suggest__handle {

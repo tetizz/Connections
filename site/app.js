@@ -383,8 +383,7 @@
       ? `<img src="${esc(item.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer" loading="lazy" decoding="async">`
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
     const title = item.title ? `<span class="username-suggest__title">${esc(item.title)}</span>` : "";
-    const flag = countryFlag(item.country);
-    const country = flag ? `<span class="username-suggest__flag" title="${esc(item.country.toUpperCase())}">${flag}</span>` : "";
+    const country = countryFlagIcon(item.country);
     const source = item.source ? `<span>${esc(item.source)}</span>` : "";
     return `
       <button class="username-suggest__row${index === state.suggest.activeIndex ? " is-active" : ""}" type="button"
@@ -442,10 +441,22 @@
     input?.setAttribute("aria-expanded", "false");
   }
 
-  function countryFlag(country) {
-    const code = countryCode(country).toUpperCase();
-    if (!/^[A-Z]{2}$/.test(code)) return "";
-    return [...code].map((char) => String.fromCodePoint(0x1f1e6 + char.charCodeAt(0) - 65)).join("");
+  function countryFlagIcon(country) {
+    const code = countryCode(country).toLowerCase();
+    if (!/^[a-z]{2}$/.test(code)) return "";
+    const label = code.toUpperCase();
+    return `
+      <span class="username-suggest__flag" title="${esc(label)}">
+        <img src="https://flagcdn.com/w20/${esc(code)}.png"
+             srcset="https://flagcdn.com/w40/${esc(code)}.png 2x"
+             alt="${esc(label)} flag"
+             loading="lazy"
+             decoding="async"
+             referrerpolicy="no-referrer"
+             onerror="this.remove(); this.nextElementSibling.hidden = false;">
+        <span class="username-suggest__flag-code" hidden>${esc(label)}</span>
+      </span>
+    `;
   }
 
   // ---------- render a chain (shared by showcase + live search) ----------

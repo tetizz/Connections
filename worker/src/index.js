@@ -28,6 +28,13 @@ const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
 const SEARCH_MAX_DEPTH = 5;
 const SEARCH_MAX_EXPANSIONS = 120;
 const SEARCH_FRONTIER_LIMIT = 80;
+const SEARCH_CHUNK_EXPANSIONS = 24;
+const SEARCH_CHUNK_TIME_MS = 6500;
+const SEARCH_BACKGROUND_TIME_MS = 24000;
+const SEARCH_LEASE_MS = 12000;
+const SEARCH_VISITED_LIMIT = 8000;
+const SEARCH_NEXT_FRONTIER_LIMIT = 1600;
+const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SEARCH_JOB_TTL_SECONDS = 2 * 60 * 60;
 const SEARCH_WINDOW_SECONDS = 60;
 const MAX_SEARCH_JOBS_PER_WINDOW = 16;
@@ -266,17 +273,48 @@ async function handleSearchStart(request, env, ctx) {
   const id = cleanAnalyticsId(body?.searchId || body?.jobId || body?.id) || crypto.randomUUID();
   if (!start || !target || start === target) return json({ error: "missing fields" }, 400);
 
-  const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
-  if (submitWindow.count >= MAX_SEARCH_JOBS_PER_WINDOW) {
-    return json({
-      error: "too many searches, wait a moment",
-      retryAfter: Math.max(1, SEARCH_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
-    }, 429, "no-store");
-  }
-
   const existing = await readSearchJob(env, id);
   if (existing && !["expired", "failed"].includes(existing.status)) {
     return json({ ok: true, job: publicSearchJob(existing), reused: true }, 200, "no-store");
+  }
+
+  const storedPair = await readPairChain(env, start, target, range);
+  const requestPair = pairChainShape({
+    start,
+    target,
+    range,
+    chain: body?.knownChain,
+    players: body?.knownPlayers || {},
+    savedAt: Date.now(),
+    checkedAt: null,
+  }, start, target, range);
+  const cachedPair = storedPair || requestPair;
+  if (!storedPair && requestPair) {
+    await writePairChain(env, {
+      id,
+      start,
+      target,
+      range,
+      status: "found",
+      chain: requestPair.chain,
+      players: requestPair.players || {},
+      stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
+  if (!cachedPair) {
+    const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
+    if (submitWindow.count >= MAX_SEARCH_JOBS_PER_WINDOW) {
+      return json({
+        error: "too many searches, wait a moment",
+        retryAfter: Math.max(1, SEARCH_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
+      }, 429, "no-store");
+    }
+    await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
+      startedAt: submitWindow.startedAt,
+      count: submitWindow.count + 1,
+    }), { expirationTtl: SEARCH_WINDOW_SECONDS * 2 });
   }
 
   const job = searchJobShape({
@@ -284,25 +322,20 @@ async function handleSearchStart(request, env, ctx) {
     start,
     target,
     range,
-    status: "queued",
-    progress: "Queued",
+    status: cachedPair ? "running" : "queued",
+    progress: cachedPair
+      ? "Loaded saved connection instantly. Checking for a shorter route."
+      : "Queued",
     stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+    chain: cachedPair?.chain,
+    players: cachedPair?.players || {},
+    refreshCached: Boolean(cachedPair),
+    cachedAt: cachedPair?.savedAt || null,
+    search: initialSearchState(start, target),
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
   await writeSearchJob(env, job);
-  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
-    startedAt: submitWindow.startedAt,
-    count: submitWindow.count + 1,
-  }), { expirationTtl: SEARCH_WINDOW_SECONDS * 2 });
-
-  const runPromise = runSearchJob(env, job).catch((error) =>
-    failSearchJob(env, job.id, error));
-  if (ctx?.waitUntil) {
-    ctx.waitUntil(runPromise);
-  } else {
-    await runPromise;
-  }
 
   return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
 }
@@ -310,85 +343,313 @@ async function handleSearchStart(request, env, ctx) {
 async function handleSearchJob(url, env) {
   const id = cleanAnalyticsId(url.searchParams.get("id"));
   if (!id) return json({ error: "missing id" }, 400, "no-store");
-  const job = await readSearchJob(env, id);
+  let job = await readSearchJob(env, id);
   if (!job) return json({ error: "job not found" }, 404, "no-store");
+  if (isActiveSearchStatus(job.status) && Date.now() >= Number(job.processingUntil || 0)) {
+    job = await runSearchJobChunk(env, id, {
+      expansionBudget: SEARCH_CHUNK_EXPANSIONS,
+      timeBudgetMs: SEARCH_CHUNK_TIME_MS,
+    }) || await readSearchJob(env, id) || job;
+  }
   return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
 }
 
 async function runSearchJob(env, queuedJob) {
-  const startedAt = Date.now();
-  let job = await updateSearchJob(env, queuedJob.id, {
-    status: "running",
-    progress: "Checking players",
-    startedAt,
-  });
-  if (!job) return;
+  const deadline = Date.now() + SEARCH_BACKGROUND_TIME_MS;
+  let job = await readSearchJob(env, queuedJob.id);
+  while (job && isActiveSearchStatus(job.status) && Date.now() < deadline) {
+    job = await runSearchJobChunk(env, queuedJob.id, {
+      expansionBudget: SEARCH_CHUNK_EXPANSIONS,
+      timeBudgetMs: SEARCH_CHUNK_TIME_MS,
+    });
+  }
+}
 
-  const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+async function runSearchJobChunk(env, id, options = {}) {
+  const chunkStartedAt = Date.now();
+  const expansionBudget = Math.max(1, Math.min(SEARCH_CHUNK_EXPANSIONS, Number(options.expansionBudget) || SEARCH_CHUNK_EXPANSIONS));
+  const timeBudgetMs = Math.max(1000, Math.min(SEARCH_CHUNK_TIME_MS, Number(options.timeBudgetMs) || SEARCH_CHUNK_TIME_MS));
+  let job = await readSearchJob(env, id);
+  if (!job || !isActiveSearchStatus(job.status)) return job;
+  if (Number(job.processingUntil || 0) > Date.now()) return job;
+
+  const startedAt = job.startedAt || Date.now();
+  const stats = job.searchInitialized
+    ? { ...(job.stats || {}) }
+    : { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+  const search = searchStateShape(job.search, job.start, job.target);
   const progress = async (message, patch = {}) => {
-    job = await updateSearchJob(env, queuedJob.id, {
+    job = await updateSearchJob(env, id, {
+      status: "running",
       progress: message,
+      startedAt,
+      processingUntil: Date.now() + SEARCH_LEASE_MS,
       stats: { ...stats },
+      search,
       ...patch,
     }) || job;
   };
 
+  await progress(job.progress || "Checking players");
   try {
-    const [startProfile, targetProfile] = await Promise.all([
-      readOrFetchProfile(env, queuedJob.start),
-      readOrFetchProfile(env, queuedJob.target),
-    ]);
-    if (!startProfile || !targetProfile) {
+    if (!search.profileChecked) {
+      const [startProfile, targetProfile] = await Promise.all([
+        readOrFetchProfile(env, job.start),
+        readOrFetchProfile(env, job.target),
+      ]);
+      if (!startProfile || !targetProfile) {
+        await completeSearchJob(env, job, {
+          status: "not_found",
+          outcome: "not_found",
+          progress: "One of those players could not be found.",
+          stats,
+          search,
+          processingUntil: 0,
+          durationMs: Date.now() - startedAt,
+        });
+        return readSearchJob(env, id);
+      }
+      search.profileChecked = true;
+      await progress("Searching recent wins");
+    }
+
+    const result = await advanceServerSearch(env, job, search, stats, progress, {
+      expansionBudget,
+      timeBudgetMs,
+      chunkStartedAt,
+    });
+
+    if (result?.status === "running") {
+      return updateSearchJob(env, id, {
+        status: "running",
+        progress: result.progress,
+        stats,
+        search,
+        processingUntil: 0,
+        startedAt,
+      });
+    }
+
+    if (!result || result.status === "not_found") {
+      if (job.chain?.found) {
+        await completeSearchJob(env, job, {
+          status: "found",
+          outcome: "found",
+          progress: "Saved connection is still the best route found.",
+          chain: job.chain,
+          players: job.players || {},
+          stats,
+          search,
+          processingUntil: 0,
+          durationMs: Date.now() - startedAt,
+        });
+        return readSearchJob(env, id);
+      }
       await completeSearchJob(env, job, {
         status: "not_found",
         outcome: "not_found",
-        progress: "One of those players could not be found.",
+        progress: result?.progress || "No connection found in this search.",
         stats,
+        search,
+        processingUntil: 0,
         durationMs: Date.now() - startedAt,
       });
-      return;
+      return readSearchJob(env, id);
     }
 
-    await progress("Searching recent wins");
-    const result = await findServerChain(env, queuedJob.start, queuedJob.target, queuedJob.range, stats, progress);
-    if (!result) {
+    const chainResult = result.chain;
+    if (!chainResult) {
       await completeSearchJob(env, job, {
         status: "not_found",
         outcome: "not_found",
         progress: "No connection found in this search.",
         stats,
+        search,
+        processingUntil: 0,
         durationMs: Date.now() - startedAt,
       });
-      return;
+      return readSearchJob(env, id);
     }
 
     const players = {};
-    await runThrottled(result.path.map((username) => async () => {
+    await runThrottled(chainResult.path.map((username) => async () => {
       const profile = await readOrFetchProfile(env, username);
       if (profile) players[username] = profile;
     }), 3);
+    const targetProfile = players[job.target] || await readOrFetchProfile(env, job.target) || {};
 
     const chain = {
-      target: queuedJob.target,
-      display: targetProfile.name || targetProfile.username || queuedJob.target,
+      target: job.target,
+      display: targetProfile.name || targetProfile.username || job.target,
       found: true,
-      length: Math.max(0, result.path.length - 1),
-      path: result.path,
-      hops: result.hops,
+      length: Math.max(0, chainResult.path.length - 1),
+      path: chainResult.path,
+      hops: chainResult.hops,
     };
+    const cachedChain = job.chain?.found ? job.chain : null;
+    const useCached = cachedChain && chainStepCount(cachedChain) <= chainStepCount(chain);
+    const finalChain = useCached ? cachedChain : chain;
+    const finalPlayers = useCached ? { ...players, ...(job.players || {}) } : { ...(job.players || {}), ...players };
 
     await completeSearchJob(env, job, {
       status: "found",
       outcome: "found",
-      progress: `Found ${queuedJob.start} to ${queuedJob.target}.`,
-      chain,
-      players,
+      progress: useCached
+        ? "Saved connection is still the best route found."
+        : cachedChain
+          ? `Found a shorter connection for ${job.start} to ${job.target}.`
+          : `Found ${job.start} to ${job.target}.`,
+      chain: finalChain,
+      players: finalPlayers,
       stats,
+      search,
+      processingUntil: 0,
       durationMs: Date.now() - startedAt,
     });
+    return readSearchJob(env, id);
   } catch (error) {
-    await failSearchJob(env, queuedJob.id, error);
+    await failSearchJob(env, id, error);
+    return readSearchJob(env, id);
   }
+}
+
+async function advanceServerSearch(env, job, search, stats, progress, options = {}) {
+  const archiveLimit = archiveLimitForRange(job.range);
+  const expansionBudget = Math.max(1, Number(options.expansionBudget) || SEARCH_CHUNK_EXPANSIONS);
+  const chunkStartedAt = Number(options.chunkStartedAt) || Date.now();
+  const deadline = chunkStartedAt + (Number(options.timeBudgetMs) || SEARCH_CHUNK_TIME_MS);
+  const forwardVisited = visitedObjectToMap(search.forwardVisited);
+  const backwardVisited = visitedObjectToMap(search.backwardVisited);
+  const edgesCache = new Map();
+  let processed = 0;
+  let meeting = null;
+
+  const syncSearch = () => {
+    search.forwardVisited = visitedMapToObject(forwardVisited);
+    search.backwardVisited = visitedMapToObject(backwardVisited);
+  };
+  const totalVisited = () => forwardVisited.size + backwardVisited.size;
+  const freshUsers = job.refreshCached && Array.isArray(job.chain?.path)
+    ? new Set(job.chain.path.map(cleanUsername).filter(Boolean))
+    : new Set();
+  const getEdges = async (username) => {
+    const key = username.toLowerCase();
+    if (edgesCache.has(key)) return edgesCache.get(key);
+    const games = await readOrFetchGames(env, {
+      username: key,
+      archiveLimit,
+      forceFresh: freshUsers.has(key) || (job.refreshCached && (key === job.start || key === job.target)),
+    }, stats);
+    const edges = edgesFromGames(key, games);
+    edgesCache.set(key, edges);
+    return edges;
+  };
+  const beginLayer = async () => {
+    if (search.depth >= SEARCH_MAX_DEPTH || stats.expanded >= SEARCH_MAX_EXPANSIONS) return false;
+    const forwardCount = search.forwardFrontier.length;
+    const backwardCount = search.backwardFrontier.length;
+    if (!forwardCount && !backwardCount) return false;
+    const expandForward = forwardCount > 0 && (!backwardCount || forwardCount <= backwardCount);
+    const side = expandForward ? "forward" : "backward";
+    const source = expandForward ? search.forwardFrontier : search.backwardFrontier;
+    const selected = uniqueUsernameList(source, SEARCH_FRONTIER_LIMIT);
+    if (!selected.length) return false;
+
+    search.activeSide = side;
+    search.activeFrontier = selected;
+    search.activeCursor = 0;
+    search.activeNextFrontier = [];
+    if (side === "forward") search.forwardFrontier = [];
+    else search.backwardFrontier = [];
+
+    syncSearch();
+    await progress(`Step ${search.depth + 1}: checking ${selected.length} players`, { depth: search.depth });
+    return true;
+  };
+  const finishLayer = async () => {
+    const next = uniqueUsernameList(search.activeNextFrontier, SEARCH_NEXT_FRONTIER_LIMIT);
+    if (search.activeSide === "forward") search.forwardFrontier = next;
+    if (search.activeSide === "backward") search.backwardFrontier = next;
+    search.activeSide = "";
+    search.activeFrontier = [];
+    search.activeCursor = 0;
+    search.activeNextFrontier = [];
+    search.depth += 1;
+    syncSearch();
+    await progress(`Checked ${stats.expanded} players, ${totalVisited()} candidates`, { depth: search.depth });
+  };
+
+  while (processed < expansionBudget && Date.now() < deadline && stats.expanded < SEARCH_MAX_EXPANSIONS) {
+    if (!search.activeSide) {
+      const startedLayer = await beginLayer();
+      if (!startedLayer) {
+        syncSearch();
+        return { status: "not_found", progress: "No connection found in this search." };
+      }
+    }
+
+    if (search.activeCursor >= search.activeFrontier.length) {
+      await finishLayer();
+      continue;
+    }
+
+    const node = search.activeFrontier[search.activeCursor++];
+    if (!node) continue;
+    stats.expanded++;
+    processed++;
+
+    const edges = await getEdges(node);
+    if (search.activeSide === "forward") {
+      for (const [opponent, urls] of edges.beatenByMe) {
+        if (forwardVisited.has(opponent)) continue;
+        if (backwardVisited.has(opponent)) {
+          forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
+          meeting = opponent;
+          break;
+        }
+        if (forwardVisited.size < SEARCH_VISITED_LIMIT && search.activeNextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) {
+          forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
+          search.activeNextFrontier.push(opponent);
+        }
+      }
+    } else {
+      for (const [opponent, urls] of edges.beatMe) {
+        if (backwardVisited.has(opponent)) continue;
+        if (forwardVisited.has(opponent)) {
+          backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
+          meeting = opponent;
+          break;
+        }
+        if (backwardVisited.size < SEARCH_VISITED_LIMIT && search.activeNextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) {
+          backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
+          search.activeNextFrontier.push(opponent);
+        }
+      }
+    }
+
+    if (meeting) {
+      syncSearch();
+      return { status: "found", chain: reconstructServerPath(meeting, forwardVisited, backwardVisited) };
+    }
+
+    if (search.activeCursor >= search.activeFrontier.length) {
+      await finishLayer();
+    } else if (processed % 6 === 0) {
+      syncSearch();
+      await progress(`Step ${search.depth + 1}: checking ${search.activeFrontier.length} players`, { depth: search.depth });
+    }
+  }
+
+  syncSearch();
+  if (stats.expanded >= SEARCH_MAX_EXPANSIONS || search.depth >= SEARCH_MAX_DEPTH) {
+    return { status: "not_found", progress: "No connection found in this search." };
+  }
+  return {
+    status: "running",
+    progress: search.activeSide
+      ? `Step ${search.depth + 1}: checking ${search.activeFrontier.length} players`
+      : `Checked ${stats.expanded} players, ${totalVisited()} candidates`,
+  };
 }
 
 async function completeSearchJob(env, job, patch) {
@@ -396,7 +657,11 @@ async function completeSearchJob(env, job, patch) {
     ...patch,
     updatedAt: Date.now(),
   });
-  const event = searchJobAnalyticsEvent(next || { ...job, ...patch });
+  const completed = next || { ...job, ...patch };
+  if (completed?.status === "found" && completed.chain?.found) {
+    await writePairChain(env, completed);
+  }
+  const event = searchJobAnalyticsEvent(completed);
   if (event) await saveAnalyticsEvent(env, event);
 }
 
@@ -408,6 +673,7 @@ async function failSearchJob(env, id, error) {
       ? "Chess.com is throttling requests right now."
       : "Search failed before it could finish.",
     error: error?.message || String(error),
+    processingUntil: 0,
     updatedAt: Date.now(),
   });
   const event = searchJobAnalyticsEvent(job);
@@ -541,7 +807,7 @@ async function readOrFetchGames(env, parsed, stats = null) {
   const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
   const cachedGames = Array.isArray(cached?.games) ? cached.games : null;
   const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
-  if (cachedGames && Date.now() - cachedAt < TTL_SECONDS * 1000) {
+  if (!parsed.forceFresh && cachedGames && Date.now() - cachedAt < TTL_SECONDS * 1000) {
     if (stats) stats.cached++;
     return cachedGames;
   }
@@ -853,6 +1119,100 @@ async function updateSearchJob(env, id, patch) {
   });
 }
 
+async function readPairChain(env, start, target, range) {
+  const key = pairChainKey(start, target, range);
+  const record = await env.GAMES_CACHE.get(key, { type: "json", cacheTtl: 60 });
+  return pairChainShape(record, start, target, range);
+}
+
+async function writePairChain(env, job) {
+  const shaped = searchJobShape(job);
+  if (!shaped?.chain?.found) return null;
+  const key = pairChainKey(shaped.start, shaped.target, shaped.range);
+  const current = await readPairChain(env, shaped.start, shaped.target, shaped.range);
+  const currentSteps = chainStepCount(current?.chain);
+  const nextSteps = chainStepCount(shaped.chain);
+  const keepCurrent = current?.chain?.found && currentSteps < nextSteps;
+  const record = keepCurrent
+    ? {
+        ...current,
+        checkedAt: Date.now(),
+      }
+    : {
+        start: shaped.start,
+        target: shaped.target,
+        range: shaped.range,
+        chain: shaped.chain,
+        players: shaped.players || {},
+        savedAt: current?.savedAt || Date.now(),
+        checkedAt: Date.now(),
+      };
+  await env.GAMES_CACHE.put(key, JSON.stringify(record), {
+    expirationTtl: PAIR_CHAIN_TTL_SECONDS,
+    metadata: {
+      type: "pair-chain",
+      start: shaped.start,
+      target: shaped.target,
+      range: shaped.range,
+    },
+  });
+  return pairChainShape(record, shaped.start, shaped.target, shaped.range);
+}
+
+function pairChainKey(start, target, range) {
+  return `search:pair:${cleanUsername(start)}:${cleanUsername(target)}:${cleanRange(range) || "instant"}`;
+}
+
+function pairChainShape(record, start, target, range) {
+  if (!record || typeof record !== "object") return null;
+  const chain = chainShape(record.chain, target);
+  if (!chain?.found || !Array.isArray(chain.path) || chain.path.length < 2) return null;
+  const normalizedStart = cleanUsername(start || record.start);
+  const normalizedTarget = cleanUsername(target || record.target || chain.target);
+  const normalizedRange = cleanRange(range || record.range) || "instant";
+  const path = normalizePath(normalizedStart, normalizedTarget, chain.path);
+  const hops = Array.isArray(chain.hops)
+    ? chain.hops.filter((hop) => hop.from && hop.to && path.includes(hop.from) && path.includes(hop.to))
+    : [];
+  if (!normalizedStart || !normalizedTarget || path[0] !== normalizedStart || path[path.length - 1] !== normalizedTarget) {
+    return null;
+  }
+  return {
+    start: normalizedStart,
+    target: normalizedTarget,
+    range: normalizedRange,
+    chain: {
+      ...chain,
+      target: normalizedTarget,
+      length: Math.max(0, path.length - 1),
+      path,
+      hops: hops.length === path.length - 1 ? hops : chain.hops,
+    },
+    players: record.players && typeof record.players === "object" ? record.players : {},
+    savedAt: Number.isFinite(record.savedAt) ? record.savedAt : Date.now(),
+    checkedAt: Number.isFinite(record.checkedAt) ? record.checkedAt : null,
+  };
+}
+
+function chainShape(rawChain, target) {
+  if (!rawChain || typeof rawChain !== "object") return null;
+  const normalizedTarget = cleanUsername(rawChain.target || target);
+  const path = Array.isArray(rawChain.path) ? rawChain.path.slice(0, 12).map(cleanUsername).filter(Boolean) : [];
+  const hops = Array.isArray(rawChain.hops) ? rawChain.hops.slice(0, 11).map((hop) => ({
+    from: cleanUsername(hop?.from),
+    to: cleanUsername(hop?.to),
+    url: cleanUrl(hop?.url),
+  })).filter((hop) => hop.from && hop.to) : [];
+  return {
+    target: normalizedTarget,
+    display: String(rawChain.display || normalizedTarget).slice(0, 80),
+    found: Boolean(rawChain.found),
+    length: Number.isFinite(rawChain.length) ? Math.max(0, Math.min(12, rawChain.length)) : Math.max(0, path.length - 1),
+    path,
+    hops,
+  };
+}
+
 function searchJobShape(job) {
   if (!job || typeof job !== "object") return null;
   const id = cleanAnalyticsId(job.id);
@@ -899,7 +1259,12 @@ function searchJobShape(job) {
     createdAt: Number.isFinite(job.createdAt) ? job.createdAt : Date.now(),
     startedAt: Number.isFinite(job.startedAt) ? job.startedAt : null,
     updatedAt: Number.isFinite(job.updatedAt) ? job.updatedAt : Date.now(),
+    processingUntil: Number.isFinite(job.processingUntil) ? Math.max(0, job.processingUntil) : 0,
+    refreshCached: Boolean(job.refreshCached),
+    cachedAt: Number.isFinite(job.cachedAt) ? job.cachedAt : null,
     durationMs: cleanNonNegativeNumber(job.durationMs, 10 * 60 * 1000),
+    searchInitialized: Boolean(job.search && typeof job.search === "object"),
+    search: searchStateShape(job.search, start, target),
   };
 }
 
@@ -918,10 +1283,115 @@ function publicSearchJob(job) {
     stats: shaped.stats,
     chain: shaped.chain,
     players: shaped.players,
+    refreshCached: shaped.refreshCached,
+    cachedAt: shaped.cachedAt,
     createdAt: shaped.createdAt,
     updatedAt: shaped.updatedAt,
     durationMs: shaped.durationMs,
   };
+}
+
+function isActiveSearchStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+function initialSearchState(start, target) {
+  return {
+    profileChecked: false,
+    depth: 0,
+    forwardVisited: { [start]: { prev: "", hopUrl: "" } },
+    backwardVisited: { [target]: { next: "", hopUrl: "" } },
+    forwardFrontier: [start],
+    backwardFrontier: [target],
+    activeSide: "",
+    activeFrontier: [],
+    activeCursor: 0,
+    activeNextFrontier: [],
+  };
+}
+
+function searchStateShape(state, start, target) {
+  const base = initialSearchState(start, target);
+  if (!state || typeof state !== "object") return base;
+  const forwardVisited = cleanVisitedObject(state.forwardVisited, "forward");
+  const backwardVisited = cleanVisitedObject(state.backwardVisited, "backward");
+  if (!forwardVisited[start]) forwardVisited[start] = { prev: "", hopUrl: "" };
+  if (!backwardVisited[target]) backwardVisited[target] = { next: "", hopUrl: "" };
+  const activeSide = ["forward", "backward"].includes(state.activeSide) ? state.activeSide : "";
+  return {
+    profileChecked: Boolean(state.profileChecked),
+    depth: cleanNonNegativeNumber(state.depth, SEARCH_MAX_DEPTH + 1) || 0,
+    forwardVisited,
+    backwardVisited,
+    forwardFrontier: cleanUsernameList(state.forwardFrontier, SEARCH_NEXT_FRONTIER_LIMIT),
+    backwardFrontier: cleanUsernameList(state.backwardFrontier, SEARCH_NEXT_FRONTIER_LIMIT),
+    activeSide,
+    activeFrontier: activeSide ? cleanUsernameList(state.activeFrontier, SEARCH_FRONTIER_LIMIT) : [],
+    activeCursor: cleanNonNegativeNumber(state.activeCursor, SEARCH_FRONTIER_LIMIT) || 0,
+    activeNextFrontier: activeSide ? cleanUsernameList(state.activeNextFrontier, SEARCH_NEXT_FRONTIER_LIMIT) : [],
+  };
+}
+
+function cleanUsernameList(value, max) {
+  if (!Array.isArray(value)) return [];
+  return uniqueUsernameList(value.map(cleanUsername).filter(Boolean), max);
+}
+
+function uniqueUsernameList(value, max) {
+  const seen = new Set();
+  const out = [];
+  for (const item of Array.isArray(value) ? value : []) {
+    const username = cleanUsername(item);
+    if (!username || seen.has(username)) continue;
+    seen.add(username);
+    out.push(username);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function cleanVisitedObject(value, side) {
+  const out = {};
+  if (!value || typeof value !== "object") return out;
+  for (const [rawUsername, rawInfo] of Object.entries(value)) {
+    const username = cleanUsername(rawUsername);
+    if (!username) continue;
+    const info = rawInfo && typeof rawInfo === "object" ? rawInfo : {};
+    out[username] = side === "forward"
+      ? {
+          prev: cleanUsername(info.prev),
+          hopUrl: cleanUrl(info.hopUrl),
+        }
+      : {
+          next: cleanUsername(info.next),
+          hopUrl: cleanUrl(info.hopUrl),
+        };
+    if (Object.keys(out).length >= SEARCH_VISITED_LIMIT) break;
+  }
+  return out;
+}
+
+function visitedObjectToMap(value) {
+  const map = new Map();
+  for (const [username, info] of Object.entries(value || {})) {
+    map.set(username, { ...info });
+  }
+  return map;
+}
+
+function visitedMapToObject(map) {
+  const out = {};
+  for (const [username, info] of map.entries()) {
+    const key = cleanUsername(username);
+    if (!key) continue;
+    out[key] = {
+      prev: cleanUsername(info?.prev),
+      next: cleanUsername(info?.next),
+      hopUrl: cleanUrl(info?.hopUrl),
+    };
+    if (Object.keys(out).length >= SEARCH_VISITED_LIMIT) break;
+  }
+  return out;
 }
 
 function searchJobAnalyticsEvent(job) {
@@ -1069,6 +1539,11 @@ function cleanRange(value) {
 function cleanCountry(value) {
   const clean = String(value || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2);
   return /^[A-Z]{2}$/.test(clean) ? clean : "";
+}
+
+function cleanUrl(value) {
+  const text = String(value || "").trim();
+  return /^https:\/\/www\.chess\.com\/game\//i.test(text) ? text.slice(0, 240) : "";
 }
 
 function deviceLabel(value) {
@@ -1435,6 +1910,12 @@ function normalizePath(start, target, path) {
 
 function chainKey(path) {
   return path.map(cleanUsername).filter(Boolean).join(">");
+}
+
+function chainStepCount(chain) {
+  return Array.isArray(chain?.path) && chain.path.length >= 2
+    ? chain.path.length - 1
+    : Number.POSITIVE_INFINITY;
 }
 
 function connectionCount(path, fallback) {

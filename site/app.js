@@ -1467,7 +1467,7 @@
     `;
   }
 
-  async function runServerSearchFlow({ start, target, range, analyticsBase, mode, btn, status, logEl }) {
+  async function runServerSearchFlow({ start, target, range, analyticsBase, mode, btn, status, logEl, knownChain = null }) {
     const remoteBase = workerBase();
     if (!remoteBase) return false;
 
@@ -1500,6 +1500,7 @@
           target,
           range,
           searchId: analyticsBase.searchId,
+          knownChain,
         }),
       });
       if (!res.ok) throw new Error(`job start failed (${res.status})`);
@@ -1507,10 +1508,48 @@
       const job = data.job;
       if (!job?.id) throw new Error("job start failed");
       saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId });
+      let showedInstantChain = false;
+      let instantChainKey = "";
+      if (job.chain?.found) {
+        showedInstantChain = true;
+        instantChainKey = chainKey(job.chain.path || []);
+        await applyServerChain(job, analyticsBase, {
+          checking: false,
+          recordOutcome: "saved",
+          submit: true,
+        });
+        logLine("loaded saved connection instantly; checking for a shorter route");
+        showStatus("done",
+          `✓ loaded saved connection — ${esc(start)} connects to ${esc(target)} in ` +
+          `${stepText((job.chain.path || []).length - 1)}. Checking newer games in the background.`);
+        btn.disabled = false;
+        pollServerSearchJob(job.id, { analyticsBase, logLine, background: true })
+          .then(async (finished) => {
+            clearActiveJob(job.id);
+            if (state.activeSearchId !== analyticsBase.searchId) return;
+            if (finished?.chain?.found) {
+              const finalChainKey = chainKey(finished.chain.path || []);
+              await applyServerChain(finished, analyticsBase, {
+                recordOutcome: finalChainKey === instantChainKey ? "saved" : "found",
+                scroll: finalChainKey !== instantChainKey,
+              });
+            }
+          })
+          .catch((error) => {
+            logLine(`shorter-route check paused: ${error.message}`);
+          })
+          .finally(() => {
+            if (state.activeSearchId === analyticsBase.searchId) btn.disabled = false;
+          });
+        return true;
+      }
       const finished = await pollServerSearchJob(job.id, { analyticsBase, logLine });
       clearActiveJob(job.id);
       if (finished?.chain?.found) {
-        await applyServerChain(finished, analyticsBase);
+        const finalChainKey = chainKey(finished.chain.path || []);
+        await applyServerChain(finished, analyticsBase, {
+          recordOutcome: showedInstantChain && finalChainKey === instantChainKey ? "saved" : "found",
+        });
       } else {
         const outcome = finished?.outcome || (finished?.status === "timeout" ? "timeout" : "not_found");
         showStatus(outcome === "timeout" ? "error" : "error",
@@ -1540,11 +1579,11 @@
     }
   }
 
-  async function pollServerSearchJob(id, { analyticsBase = null, logLine = null } = {}) {
+  async function pollServerSearchJob(id, { analyticsBase = null, logLine = null, background = false } = {}) {
     const remoteBase = workerBase();
     if (!remoteBase || !id) return null;
     let job = null;
-    for (let attempt = 0; attempt < 150; attempt++) {
+    for (let attempt = 0; attempt < 360; attempt++) {
       const res = await fetch(`${remoteBase}/search/job?id=${encodeURIComponent(id)}`, {
         headers: { "Accept": "application/json" },
       });
@@ -1552,7 +1591,7 @@
       const data = await res.json();
       job = data.job;
       if (!job) throw new Error("job missing");
-      showServerJobProgress(job);
+      if (!background) showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
       if (["found", "not_found", "timeout", "failed"].includes(job.status)) return job;
       await new Promise((resolve) => setTimeout(resolve, attempt < 8 ? 900 : 1500));
@@ -1561,7 +1600,7 @@
       id,
       status: "timeout",
       outcome: "timeout",
-      progress: "Search is still running. Reopen the page and it will resume.",
+      progress: "Search is still running. Keep this tab open and it will keep checking.",
       start: analyticsBase?.start,
       target: analyticsBase?.target,
     };
@@ -1579,7 +1618,13 @@
       `${Number(stats.requests || 0)} requests · ${Number(stats.cached || 0)} reused</span>`;
   }
 
-  async function applyServerChain(job, analyticsBase) {
+  async function applyServerChain(job, analyticsBase, options = {}) {
+    const {
+      checking = false,
+      recordOutcome = "found",
+      submit = true,
+      scroll = true,
+    } = options;
     const chain = job.chain;
     state.players = state.players || {};
     for (const [username, profile] of Object.entries(job.players || {})) {
@@ -1594,14 +1639,20 @@
       fetchJSON: (url) => fetch(url, { headers: { "Accept": "application/json" } }).then((res) => res.json()),
       API: "https://api.chess.com/pub/player/",
     });
-    showStatus("done",
-      `✓ found it — ${esc(job.start)} connects to ${esc(job.target)} in ${stepText((chain.path || []).length - 1)}. ` +
-      `checked ${Number(job.stats?.expanded || 0)} players, made ${Number(job.stats?.requests || 0)} requests` +
-      (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ".");
+    if (checking) {
+      showStatus("working",
+        `loaded saved connection instantly — checking newer games for a shorter route.`);
+    } else {
+      showStatus("done",
+        `${job.progress && /saved connection/i.test(job.progress) ? "✓" : "✓ found it"} — ` +
+        `${esc(job.start)} connects to ${esc(job.target)} in ${stepText((chain.path || []).length - 1)}. ` +
+        `checked ${Number(job.stats?.expanded || 0)} players, made ${Number(job.stats?.requests || 0)} requests` +
+        (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ".");
+    }
     setActiveChip(job.target);
     renderChain(chain);
-    submitLeaderboardChain(job.start, job.target, chain);
-    recordSearchEvent("found", {
+    if (submit) submitLeaderboardChain(job.start, job.target, chain);
+    recordSearchEvent(recordOutcome, {
       ...analyticsBase,
       jobId: job.id,
       length: chain.length,
@@ -1611,7 +1662,7 @@
       requests: job.stats?.requests,
       cached: job.stats?.cached,
     });
-    document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+    if (scroll) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
   }
 
   function saveActiveJob(job) {
@@ -1700,6 +1751,7 @@
     }
     const searchStartedAt = performance.now();
     const analyticsBase = { searchId: newSearchEventId(), start, target, depth, range };
+    state.activeSearchId = analyticsBase.searchId;
     recordSearchEvent("started", analyticsBase);
 
     // remember the username for next time
@@ -1728,6 +1780,18 @@
         durationMs: performance.now() - searchStartedAt,
       });
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+      const handledByServer = await runServerSearchFlow({
+        start,
+        target,
+        range,
+        analyticsBase,
+        mode,
+        btn,
+        status,
+        logEl,
+        knownChain: renderedChain,
+      });
+      if (handledByServer) return;
       return;
     }
 
@@ -1999,6 +2063,12 @@
     const raw = String(value || "").trim();
     if (!raw) return "";
     return raw.includes("/") ? raw.split("/").pop() : raw;
+  }
+
+  function chainKey(path) {
+    return Array.isArray(path)
+      ? path.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean).join(">")
+      : "";
   }
 
   function showStatus(kind, msg) {

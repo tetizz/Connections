@@ -21,7 +21,7 @@
   const DEFAULT_TARGET = "magnuscarlsen";
   const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
   const SUGGEST_MIN_CHARS = 2;
-  const SUGGEST_LIMIT = 6;
+  const SUGGEST_LIMIT = 10;
   let introCompletedThisSession = false;
   const QUICK_TARGET_GROUPS = [
     {
@@ -50,6 +50,7 @@
     activeTarget: null,
     currentChain: null,
     profilePromises: new Map(),
+    profilePopoverToken: 0,
     suggest: {
       items: [],
       activeIndex: -1,
@@ -183,8 +184,8 @@
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
     return `
       <button class="chip quick-player${username === active ? " is-active" : ""}" type="button"
-              data-target="${esc(username)}" data-display="${esc(display)}" data-profile-user="${esc(username)}" style="--player-index:${index}"${index >= 5 ? " hidden" : ""}>
-        <span class="quick-player__avatar">${avatar}</span>
+              data-target="${esc(username)}" data-display="${esc(display)}" style="--player-index:${index}"${index >= 5 ? " hidden" : ""}>
+        <span class="quick-player__avatar" data-profile-trigger data-profile-user="${esc(username)}" title="Open ${esc(display)} profile">${avatar}</span>
         <span class="quick-player__body">
           <span class="quick-player__name">${rank}<strong>${esc(display)}</strong></span>
           <span class="quick-player__meta">${title}${score}</span>
@@ -302,7 +303,7 @@
   function localUsernameSuggestions(query) {
     const q = query.toLowerCase();
     const all = Object.values(state.players || {})
-      .map((player) => normalizeSuggestion({ ...player, source: "loaded player" }))
+      .map((player) => normalizeSuggestion(player))
       .filter(Boolean)
       .filter((player) => player.username.includes(q) || String(player.name || "").toLowerCase().includes(q));
     return all
@@ -323,7 +324,6 @@
           title: item.title || current?.title || "",
           name: item.name || current?.name || "",
           country: item.country || current?.country || "",
-          source: item.source || current?.source || "",
         });
       }
     }
@@ -342,7 +342,6 @@
       url: String(item?.url || `https://www.chess.com/member/${username}`),
       followers: Number.isFinite(item?.followers) ? item.followers : null,
       status: String(item?.status || ""),
-      source: String(item?.source || ""),
       score: Number.isFinite(item?.score) ? item.score : null,
       rank: Number.isFinite(item?.rank) ? item.rank : null,
     };
@@ -370,7 +369,7 @@
     box.hidden = false;
     box.innerHTML = `
       <div class="username-suggest__panel">
-        ${options.loading ? `<div class="username-suggest__status">Searching shared cache...</div>` : ""}
+        ${options.loading ? `<div class="username-suggest__status">Searching players...</div>` : ""}
         ${state.suggest.items.length ? state.suggest.items.map((item, index) => usernameSuggestionRow(item, index)).join("") : usernameSuggestEmpty(query)}
         <button class="username-suggest__all" type="button" data-exact="${esc(query)}">Use exact username "${esc(query)}"</button>
       </div>
@@ -384,7 +383,6 @@
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
     const title = item.title ? `<span class="username-suggest__title">${esc(item.title)}</span>` : "";
     const country = countryFlagIcon(item.country);
-    const source = item.source ? `<span>${esc(item.source)}</span>` : "";
     return `
       <button class="username-suggest__row${index === state.suggest.activeIndex ? " is-active" : ""}" type="button"
               role="option" aria-selected="${index === state.suggest.activeIndex ? "true" : "false"}"
@@ -392,7 +390,7 @@
         <span class="username-suggest__avatar">${avatar}</span>
         <span class="username-suggest__body">
           <span class="username-suggest__name">${title}<strong>${esc(display)}</strong>${country}</span>
-          <span class="username-suggest__handle">@${esc(item.username)}${source}</span>
+          <span class="username-suggest__handle">@${esc(item.username)}</span>
         </span>
       </button>
     `;
@@ -401,7 +399,7 @@
   function usernameSuggestEmpty(query) {
     return `
       <div class="username-suggest__empty">
-        <strong>No cached match yet.</strong>
+        <strong>No matching player yet.</strong>
         <span>Press Enter to check ${esc(query)} directly.</span>
       </div>
     `;
@@ -442,19 +440,24 @@
   }
 
   function countryFlagIcon(country) {
+    return flagIcon(country, "username-suggest__flag");
+  }
+
+  function flagIcon(country, className = "flag-icon") {
     const code = countryCode(country).toLowerCase();
     if (!/^[a-z]{2}$/.test(code)) return "";
     const label = code.toUpperCase();
+    const safeClass = esc(className);
     return `
-      <span class="username-suggest__flag" title="${esc(label)}">
+      <span class="${safeClass}" title="${esc(label)}">
         <img src="https://flagcdn.com/w20/${esc(code)}.png"
              srcset="https://flagcdn.com/w40/${esc(code)}.png 2x"
              alt="${esc(label)} flag"
              loading="lazy"
              decoding="async"
              referrerpolicy="no-referrer"
-             onerror="this.remove(); this.nextElementSibling.hidden = false;">
-        <span class="username-suggest__flag-code" hidden>${esc(label)}</span>
+             onerror="if(this.nextElementSibling)this.nextElementSibling.hidden=false; this.remove();">
+        <span class="${safeClass}-code" hidden>${esc(label)}</span>
       </span>
     `;
   }
@@ -1061,11 +1064,15 @@
       img.src = av;
       img.alt = nameOf(username);
       img.dataset.profileUser = username.toLowerCase();
+      img.dataset.profileTrigger = "";
       img.referrerPolicy = "no-referrer";
       img.addEventListener("error", () => {
         const fb = document.createElement("div");
         fb.className = "card__avatar-fallback";
         fb.textContent = (nameOf(username)[0] || "?").toUpperCase();
+        fb.dataset.profileUser = username.toLowerCase();
+        fb.dataset.profileTrigger = "";
+        fb.tabIndex = 0;
         img.replaceWith(fb);
       });
       return img;
@@ -1074,6 +1081,7 @@
     fb.className = "card__avatar-fallback";
     fb.textContent = (nameOf(username)[0] || "?").toUpperCase();
     fb.dataset.profileUser = username.toLowerCase();
+    fb.dataset.profileTrigger = "";
     fb.tabIndex = 0;
     return fb;
   }
@@ -1082,7 +1090,7 @@
     const key = String(username || "").trim().toLowerCase();
     if (!key) return null;
     const existing = state.players?.[key];
-    if (existing?.profileComplete || existing?.country || existing?.followers || existing?.joined) return existing;
+    if (existing?.profileComplete) return existing;
     if (state.profilePromises.has(key)) return state.profilePromises.get(key);
 
     const promise = (async () => {
@@ -1134,13 +1142,19 @@
     const avatar = profile?.avatar
       ? `<img src="${esc(profile.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer">`
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
-    const joined = profile?.joined ? `<span>Joined ${esc(formatProfileDate(profile.joined))}</span>` : "";
-    const country = profile?.country ? `<span>${esc(profile.country.toUpperCase())}</span>` : "";
+    const joined = profile?.joined ? `<span>Joined ${esc(formatProfileDate(profile.joined))}</span>` : `<span>Joined unavailable</span>`;
+    const country = profile?.country ? `<span class="profile-popover__country">${flagIcon(profile.country, "profile-popover__flag")}${esc(profile.country.toUpperCase())}</span>` : "";
     const followers = Number.isFinite(profile?.followers)
       ? `<span>${Number(profile.followers).toLocaleString()} followers</span>`
       : "";
-    const status = profile?.status ? `<span>${esc(profile.status)}</span>` : "";
+    const online = profile?.lastOnline ? `<span>Seen ${esc(timeAgo(profile.lastOnline * 1000))}</span>` : "";
+    const location = profile?.location ? `<span>${esc(profile.location)}</span>` : "";
+    const fide = Number.isFinite(profile?.fide) ? `<span>FIDE ${Number(profile.fide).toLocaleString()}</span>` : "";
+    const status = profile?.status
+      ? `<span class="profile-popover__status${String(profile.status).toLowerCase() === "premium" ? " is-premium" : ""}">${esc(profileStatusLabel(profile.status))}</span>`
+      : "";
     const url = profile?.url || `https://www.chess.com/member/${encodeURIComponent(handle)}`;
+    const stats = renderProfileStats(profile?.stats);
 
     pop.innerHTML = `
       <div class="profile-popover__top">
@@ -1150,7 +1164,8 @@
           <small>@${esc(handle)}</small>
         </span>
       </div>
-      <div class="profile-popover__meta">${country}${followers}${joined}${status}</div>
+      <div class="profile-popover__meta">${country}${followers}${joined}${online}${location}${fide}${status}</div>
+      ${stats}
       <a href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>
     `;
     pop.hidden = false;
@@ -1173,27 +1188,63 @@
 
   async function showProfilePopover(username, anchor) {
     const key = String(username || "").trim().toLowerCase();
-    if (!key) return;
+    if (!key || !anchor) return;
+    const token = ++state.profilePopoverToken;
     const pop = $("#profile-popover");
     if (pop) {
       pop.hidden = false;
-      pop.innerHTML = `<div class="profile-popover__loading">Loading ${esc(key)}…</div>`;
+      pop.innerHTML = `<div class="profile-popover__loading">Loading ${esc(key)}...</div>`;
       positionProfilePopover(pop, anchor);
     }
     const profile = await fetchProfile(key);
+    if (token !== state.profilePopoverToken || $("#profile-popover")?.hidden) return;
     if (!profile) return;
     renderProfilePopover(profile, key, anchor);
   }
 
   function hideProfilePopover() {
+    state.profilePopoverToken++;
     const pop = $("#profile-popover");
-    if (pop) pop.hidden = true;
+    if (pop) {
+      pop.hidden = true;
+      pop.innerHTML = "";
+    }
   }
 
   function formatProfileDate(seconds) {
     const date = new Date(seconds * 1000);
     if (!Number.isFinite(date.getTime())) return "";
     return date.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+  }
+
+  function profileStatusLabel(status) {
+    return String(status || "")
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, (char) => char.toUpperCase());
+  }
+
+  function renderProfileStats(stats) {
+    const modes = [
+      ["rapid", "Rapid"],
+      ["blitz", "Blitz"],
+      ["bullet", "Bullet"],
+    ];
+    const cells = modes.map(([key, label]) => {
+      const stat = stats?.[key];
+      if (!stat?.rating) {
+        return `<div class="profile-stat"><span>${label}</span><strong>--</strong><small>No rating</small></div>`;
+      }
+      const games = Number.isFinite(stat.games) ? `${Number(stat.games).toLocaleString()} games` : "rated";
+      const best = Number.isFinite(stat.best) ? `best ${Number(stat.best).toLocaleString()}` : games;
+      return `
+        <div class="profile-stat">
+          <span>${label}</span>
+          <strong>${Number(stat.rating).toLocaleString()}</strong>
+          <small>${esc(best)}</small>
+        </div>
+      `;
+    }).join("");
+    return `<div class="profile-stats" aria-label="Player ratings">${cells}</div>`;
   }
 
   // ---------- live search ----------
@@ -1271,7 +1322,7 @@
         status.innerHTML =
           `<span class="spinner"></span>${esc(msg)}` +
           `<span class="counters">scanned <b>${stats.fetched}</b> users · ` +
-          `${stats.apiCalls} API calls · ${stats.cached} cached</span>`;
+          `${stats.apiCalls} requests · ${stats.cached} reused</span>`;
         // log significant events (filter out only the high-frequency
         // per-node progress lines to keep the log readable)
         const isPerNodeLine = /^  (forward|backward) \d+\/\d+ expanded/.test(msg);
@@ -1329,9 +1380,9 @@
         await hydratePlayers(bridged.path, bridgeEngine);
         const bridgeWork = bridgeEngine.stats.apiCalls
           ? `made ${bridgeEngine.stats.apiCalls} quick requests` +
-            (bridgeEngine.stats.cached ? `, ${bridgeEngine.stats.cached} from shared cache` : "")
+            (bridgeEngine.stats.cached ? `, reused ${bridgeEngine.stats.cached}` : "")
           : bridgeEngine.stats.cached
-            ? `read ${bridgeEngine.stats.cached} shared cache hit${bridgeEngine.stats.cached === 1 ? "" : "s"}`
+            ? `reused ${bridgeEngine.stats.cached} previous result${bridgeEngine.stats.cached === 1 ? "" : "s"}`
           : "used the saved bridge index";
         showStatus("done",
           `✓ found it fast — ${esc(start)} connects to ${esc(target)} in ${stepText(bridged.length)}. ` +
@@ -1379,7 +1430,7 @@
       showStatus("done",
         `✓ found it — ${esc(start)} connects to ${esc(target)} in ${stepText(result.path.length - 1)}. ` +
         `looked at ${engine.stats.fetched} players, made ${engine.stats.apiCalls} requests` +
-        (engine.stats.cached ? `, ${engine.stats.cached} from shared cache` : "") + ".");
+        (engine.stats.cached ? `, reused ${engine.stats.cached}` : "") + ".");
       setActiveChip(target);
 
       const renderedChain = {
@@ -1403,8 +1454,8 @@
         const info = $("#cache-info");
         info.hidden = false;
         info.textContent = est.remote
-          ? "using the shared Cloudflare cache; no game history is stored in this browser"
-          : "shared Cloudflare cache is unavailable; this browser did not store game history";
+          ? "Large game histories stay out of this browser."
+          : "Game history is not being stored in this browser.";
       }
     }
   }
@@ -1421,8 +1472,22 @@
       joined: p.joined,
       lastOnline: p.lastOnline || p.last_online,
       status: p.status,
+      location: p.location,
+      fide: p.fide,
+      stats: p.stats,
       profileComplete: Boolean(p.profileComplete),
     };
+  }
+
+  function timeAgo(ts) {
+    const value = Number(ts);
+    if (!Number.isFinite(value)) return "";
+    const seconds = Math.max(0, Math.floor((Date.now() - value) / 1000));
+    if (seconds < 60) return "just now";
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    if (seconds < 2592000) return `${Math.floor(seconds / 86400)}d ago`;
+    return formatProfileDate(Math.floor(value / 1000));
   }
 
   function countryCode(value) {
@@ -1508,7 +1573,7 @@
     const el = $("#setting-cache-size");
     const cache = new window.GameCache();
     const est = await cache.estimate();
-    el.textContent = est?.remote ? "Cloudflare shared cache active" : "shared cache unavailable";
+    el.textContent = est?.remote ? "Game data ready" : "Game data unavailable";
   }
 
   $("#settings-open").addEventListener("click", openSettings);
@@ -1617,6 +1682,15 @@
   });
 
   $(".quick-targets")?.addEventListener("click", (event) => {
+    const profileTrigger = event.target.closest("[data-profile-trigger][data-profile-user]");
+    if (profileTrigger) {
+      event.preventDefault();
+      event.stopPropagation();
+      hideUsernameSuggest();
+      showProfilePopover(profileTrigger.dataset.profileUser, profileTrigger);
+      return;
+    }
+
     const more = event.target.closest(".quick-more[data-group]");
     if (more) {
       const group = more.closest(".quick-group");
@@ -1647,41 +1721,18 @@
     setActiveChip(e.target.value.trim().toLowerCase());
   });
 
-  document.addEventListener("pointerover", (event) => {
-    const target = event.target.closest("[data-profile-user]");
-    if (!target) return;
-    showProfilePopover(target.dataset.profileUser, target);
-  });
-
-  document.addEventListener("focusin", (event) => {
-    const target = event.target.closest("[data-profile-user]");
-    if (!target) return;
-    showProfilePopover(target.dataset.profileUser, target);
-  });
-
-  document.addEventListener("pointerout", (event) => {
-    const target = event.target.closest("[data-profile-user]");
-    if (!target) return;
-    if (event.relatedTarget?.closest?.("[data-profile-user], #profile-popover")) return;
-    hideProfilePopover();
-  });
-
-  document.addEventListener("focusout", (event) => {
-    if (event.relatedTarget?.closest?.("[data-profile-user], #profile-popover")) return;
-    hideProfilePopover();
-  });
-
   document.addEventListener("click", (event) => {
     if (!event.target.closest(".search__field--username")) {
       state.suggest.focused = false;
       hideUsernameSuggest();
     }
-    const target = event.target.closest("[data-profile-user]");
-    if (target && !target.closest(".quick-player")) {
+    const target = event.target.closest("[data-profile-trigger][data-profile-user]");
+    if (target) {
+      hideUsernameSuggest();
       showProfilePopover(target.dataset.profileUser, target);
       return;
     }
-    if (!target && !event.target.closest("#profile-popover")) hideProfilePopover();
+    if (!event.target.closest("#profile-popover")) hideProfilePopover();
   });
 
   function setActiveChip(target) {

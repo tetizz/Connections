@@ -49,7 +49,7 @@ window.GameCache = class GameCache {
       const data = await res.json();
       return Array.isArray(data.games) ? data.games : null;
     } catch (e) {
-      console.warn("shared cache read failed:", e.message);
+      console.warn("game data read failed:", e.message);
       return null;
     } finally {
       clearTimeout(timeout);

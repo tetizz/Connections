@@ -12,7 +12,8 @@ const TTL_SECONDS = 7 * 24 * 60 * 60;
 const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const KV_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const MAX_LEADERBOARD_ENTRIES = 1000;
-const MAX_SUGGESTIONS = 8;
+const MAX_SUGGESTIONS = 10;
+const TITLED_GROUPS = ["GM", "IM", "FM", "NM", "WGM", "WIM", "WFM", "CM", "WCM"];
 const ARCHIVE_CONCURRENCY = 4;
 const SUBMIT_WINDOW_SECONDS = 60;
 const MAX_SUBMITS_PER_WINDOW = 30;
@@ -132,13 +133,12 @@ async function handleProfile(url, env) {
     : null;
   const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
 
-  if (cachedProfile && Date.now() - cachedAt < PROFILE_TTL_SECONDS * 1000) {
+  if (cachedProfile && cachedProfile.stats && Date.now() - cachedAt < PROFILE_TTL_SECONDS * 1000) {
     return json({ source: "cloudflare-kv", profile: cachedProfile });
   }
 
   try {
-    const data = await fetchJSON(`${CHESS_API}${username}`);
-    const profile = profileShape(data, username);
+    const profile = await fetchProfileDetails(username);
     await env.GAMES_CACHE.put(kvKey, JSON.stringify({ ts: Date.now(), profile }), {
       expirationTtl: KV_RETENTION_SECONDS,
       metadata: { username, type: "profile" },
@@ -188,6 +188,7 @@ async function handleSuggest(url, env) {
 
   await addProfilesFromKV(env, query, seen, limit * 3);
   await addLeaderboardSuggestions(query, seen, limit * 3);
+  await addTitledSuggestions(env, query, seen, limit * 4);
 
   const missingProfiles = [...seen.values()]
     .filter((item) => !item.avatar && !item.name && !item.profileComplete)
@@ -348,10 +349,50 @@ function profileShape(data, fallbackUsername) {
     avatar: String(data?.avatar || ""),
     url: String(data?.url || `https://www.chess.com/member/${username}`),
     country,
+    location: String(data?.location || ""),
+    fide: Number.isFinite(data?.fide) ? data.fide : null,
+    playerId: Number.isFinite(data?.player_id) ? data.player_id : null,
+    isStreamer: Boolean(data?.is_streamer),
+    twitchUrl: String(data?.twitch_url || ""),
     followers: Number.isFinite(data?.followers) ? data.followers : null,
     joined: Number.isFinite(data?.joined) ? data.joined : null,
     lastOnline: Number.isFinite(data?.last_online) ? data.last_online : null,
     status: String(data?.status || ""),
+  };
+}
+
+async function fetchProfileDetails(username) {
+  const data = await fetchJSON(`${CHESS_API}${username}`);
+  const profile = profileShape(data, username);
+  try {
+    const stats = await fetchJSON(`${CHESS_API}${username}/stats`);
+    profile.stats = statsShape(stats);
+  } catch {
+    profile.stats = {};
+  }
+  return profile;
+}
+
+function statsShape(stats) {
+  return {
+    rapid: gameStatShape(stats?.chess_rapid),
+    blitz: gameStatShape(stats?.chess_blitz),
+    bullet: gameStatShape(stats?.chess_bullet),
+  };
+}
+
+function gameStatShape(stat) {
+  if (!stat || typeof stat !== "object") return null;
+  const record = stat.record || {};
+  const games = ["win", "loss", "draw"].reduce((sum, key) =>
+    sum + (Number.isFinite(record[key]) ? record[key] : 0), 0);
+  return {
+    rating: Number.isFinite(stat.last?.rating) ? stat.last.rating : null,
+    best: Number.isFinite(stat.best?.rating) ? stat.best.rating : null,
+    games: games || null,
+    wins: Number.isFinite(record.win) ? record.win : null,
+    losses: Number.isFinite(record.loss) ? record.loss : null,
+    draws: Number.isFinite(record.draw) ? record.draw : null,
   };
 }
 
@@ -367,7 +408,7 @@ function suggestionShape(data, source = "cloudflare") {
     country: String(data?.country || ""),
     followers: Number.isFinite(data?.followers) ? data.followers : null,
     status: String(data?.status || ""),
-    source,
+    source: "",
     score: Number.isFinite(data?.score) ? data.score : null,
     rank: Number.isFinite(data?.rank) ? data.rank : null,
   };
@@ -439,6 +480,41 @@ async function addLeaderboardSuggestions(query, seen, maxCandidates) {
     }
   } catch {
     // Suggestions are best-effort; cached/profile matches still work.
+  }
+}
+
+async function addTitledSuggestions(env, query, seen, maxCandidates) {
+  if (seen.size >= maxCandidates) return;
+  for (const title of TITLED_GROUPS) {
+    const players = await readTitledPlayers(env, title);
+    for (const username of players) {
+      const key = cleanUsername(username);
+      if (!key || !key.includes(query) || seen.has(key)) continue;
+      const item = suggestionShape({ username: key, title }, "");
+      if (item) seen.set(item.username, item);
+      if (seen.size >= maxCandidates) return;
+    }
+  }
+}
+
+async function readTitledPlayers(env, title) {
+  const key = `titled:${title.toLowerCase()}`;
+  try {
+    const cached = await env.GAMES_CACHE.get(key, { type: "json", cacheTtl: 300 });
+    if (Array.isArray(cached?.players)) return cached.players;
+  } catch {
+    // Continue to live fetch.
+  }
+  try {
+    const data = await fetchJSON(`https://api.chess.com/pub/titled/${title}`);
+    const players = Array.isArray(data?.players) ? data.players.map(cleanUsername).filter(Boolean) : [];
+    await env.GAMES_CACHE.put(key, JSON.stringify({ ts: Date.now(), players }), {
+      expirationTtl: KV_RETENTION_SECONDS,
+      metadata: { title, type: "titled" },
+    });
+    return players;
+  } catch {
+    return [];
   }
 }
 
@@ -643,7 +719,7 @@ function staleGames(key, games, retryAfter, reason = "rate-limited") {
 
 function rateLimited(key, retryAfter) {
   return json({
-    error: "Chess.com rate limited the shared cache. Try again shortly.",
+    error: "Chess.com rate limited this request. Try again shortly.",
     key,
     retryAfter,
   }, 429, "no-store", {

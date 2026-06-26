@@ -130,7 +130,7 @@ window.ChessChain = class ChessChain {
       if (hit) {
         this.stats.cached++;
         this._gamesCache.set(cacheKey, hit);
-        this.log(`shared cache had ${u}'s ${this._archiveLabel()}`);
+        this.log(`reused ${u}'s ${this._archiveLabel()}`);
         return hit;
       }
     }

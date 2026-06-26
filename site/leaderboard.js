@@ -61,7 +61,6 @@ window.Leaderboard = (() => {
     el.innerHTML = top.map((e, i) => {
       const profile = profiles.get(e.username) || {};
       const rankClass = i === 0 ? " is-gold" : i === 1 ? " is-silver" : i === 2 ? " is-bronze" : "";
-      const profileUrl = profile.url || `https://www.chess.com/member/${encodeURIComponent(e.username)}`;
       const title = profile.title ? `<span class="lb-title">${esc(profile.title)}</span>` : "";
       const avatar = profile.avatar
         ? `<img class="lb-avatar" src="${esc(profile.avatar)}" alt="${esc(e.username)} profile photo" referrerpolicy="no-referrer" loading="lazy">`
@@ -72,14 +71,15 @@ window.Leaderboard = (() => {
       const ago = timeAgo(e.latestTs || e.ts);
       const count = Number(e.count) || 0;
       return `
-        <a class="lb-row${i < 3 ? " lb-row--top" : ""}" style="--row-index:${i}" href="${esc(profileUrl)}" target="_blank" rel="noopener">
+        <button class="lb-row${i < 3 ? " lb-row--top" : ""}" type="button" style="--row-index:${i}"
+                data-profile-trigger data-profile-user="${esc(e.username)}" title="Open ${esc(e.username)} profile">
           <div class="lb-rank${rankClass}"><span>${i + 1}</span></div>
           ${avatar}
           <div class="lb-main">
             <div class="lb-path">${title}${esc(e.username)}</div>
             <div class="lb-meta">${count} chain${count === 1 ? "" : "s"} · ${esc(examples)} · ${ago}</div>
           </div>
-        </a>`;
+        </button>`;
     }).join("");
   }
 

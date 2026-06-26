@@ -13,7 +13,7 @@
     document.documentElement.dataset.theme =
       localStorage.getItem("chess-connections:theme") || "dark";
   </script>
-  <link rel="stylesheet" href="styles.css?v=username-suggest-flags-20260625" />
+  <link rel="stylesheet" href="styles.css?v=profile-overlay-stats-20260626" />
 </head>
 <body>
   <div class="site-shell">
@@ -147,12 +147,12 @@
 
       <section class="explain" aria-labelledby="explain-heading">
         <div>
-          <p class="eyebrow">Source</p>
+          <p class="eyebrow">How it works</p>
           <h2 id="explain-heading">Public games, local search</h2>
         </div>
         <p>
-          The app reads public Chess.com game archives through the shared Cloudflare cache,
-          filters to standard live games, and keeps large game histories out of your browser.
+          The app reads public Chess.com game archives, filters to standard live games,
+          and keeps large game histories out of your browser.
         </p>
         <a class="text-link" href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">Read the code</a>
       </section>
@@ -170,7 +170,7 @@
     </main>
 
     <footer class="footer">
-      <p>Built from public Chess.com data. Recent searches can use the shared Cloudflare cache.</p>
+      <p>Built from public Chess.com data.</p>
     </footer>
   </div>
 
@@ -216,12 +216,12 @@
           <span class="setting__hint">Deeper searches can touch a lot more Chess.com archives.</span>
         </label>
         <div class="setting">
-          <span class="setting__label">Cache</span>
+          <span class="setting__label">Saved data</span>
           <div class="cache-controls">
             <button class="setting__btn" id="setting-clear-cache" type="button">Clear saved data</button>
             <span class="setting__hint" id="setting-cache-size">…</span>
           </div>
-          <span class="setting__hint">Game histories and profiles come from the shared Cloudflare cache.</span>
+          <span class="setting__hint">Game histories stay out of this browser.</span>
         </div>
       </div>
     </div>
@@ -229,10 +229,10 @@
 
   <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
 
-  <script src="config.js?v=username-suggest-flags-20260625"></script>
-  <script src="cache.js?v=username-suggest-flags-20260625"></script>
-  <script src="engine.js?v=username-suggest-flags-20260625"></script>
-  <script src="leaderboard.js?v=username-suggest-flags-20260625"></script>
-  <script src="app.js?v=username-suggest-flags-20260625"></script>
+  <script src="config.js?v=profile-overlay-stats-20260626"></script>
+  <script src="cache.js?v=profile-overlay-stats-20260626"></script>
+  <script src="engine.js?v=profile-overlay-stats-20260626"></script>
+  <script src="leaderboard.js?v=profile-overlay-stats-20260626"></script>
+  <script src="app.js?v=profile-overlay-stats-20260626"></script>
 </body>
 </html>

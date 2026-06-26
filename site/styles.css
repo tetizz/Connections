@@ -363,6 +363,7 @@ h1 {
 .search {
   width: 100%;
   position: relative;
+  z-index: 60;
   isolation: isolate;
   display: grid;
   grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) minmax(96px, .35fr) minmax(128px, .45fr) auto;
@@ -458,15 +459,16 @@ html[data-theme="dark"] .search__field select {
 }
 
 .search__field--username {
-  z-index: 8;
+  z-index: 90;
 }
 
 .username-suggest {
   position: absolute;
   left: 0;
-  right: 0;
+  right: auto;
   top: calc(100% + 10px);
-  z-index: 30;
+  z-index: 220;
+  width: min(520px, calc(100vw - 48px));
 }
 
 .username-suggest[hidden] {
@@ -474,7 +476,8 @@ html[data-theme="dark"] .search__field select {
 }
 
 .username-suggest__panel {
-  overflow: hidden;
+  overflow: auto;
+  max-height: min(480px, calc(100vh - 180px));
   padding: 8px;
   color: #f7f1e8;
   background:
@@ -804,6 +807,8 @@ html[data-theme="dark"] .search__status.is-error {
 }
 
 .quick-targets {
+  position: relative;
+  z-index: 1;
   margin-top: 18px;
   padding: 14px;
   background:
@@ -1031,6 +1036,12 @@ html[data-theme="dark"] .search__status.is-error {
   font-size: 14px;
   font-weight: 900;
   transition: border-color .18s ease, box-shadow .18s ease;
+}
+
+.quick-player__avatar[data-profile-trigger],
+[data-profile-trigger].card__avatar,
+[data-profile-trigger].card__avatar-fallback {
+  cursor: pointer;
 }
 
 .quick-player__photo,
@@ -1894,8 +1905,8 @@ html[data-theme="dark"] .card__avatar-fallback {
 
 .profile-popover {
   position: fixed;
-  z-index: 45;
-  width: min(320px, calc(100vw - 24px));
+  z-index: 260;
+  width: min(430px, calc(100vw - 24px));
   padding: 14px;
   color: #f6efe2;
   background:
@@ -1971,6 +1982,10 @@ html[data-theme="dark"] .card__avatar-fallback {
 }
 
 .profile-popover__meta span {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   border: 1px solid rgba(255, 253, 248, .10);
   border-radius: 999px;
   padding: 3px 7px;
@@ -1978,6 +1993,72 @@ html[data-theme="dark"] .card__avatar-fallback {
   background: rgba(255, 253, 248, .045);
   font-size: 11px;
   font-weight: 800;
+}
+
+.profile-popover__flag {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 15px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: rgba(255, 253, 248, .08);
+  box-shadow: 0 2px 7px rgba(0, 0, 0, .22);
+}
+
+.profile-popover__flag img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.profile-popover__flag-code {
+  color: rgba(255, 253, 248, .8);
+  font-size: 8px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.profile-popover__status.is-premium {
+  color: #231607;
+  background: linear-gradient(145deg, #fff0b3, var(--gold) 58%, #9c6a1d);
+  border-color: rgba(255, 240, 179, .62);
+  box-shadow: 0 0 18px rgba(240, 201, 119, .18);
+}
+
+.profile-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0 14px;
+}
+
+.profile-stat {
+  min-width: 0;
+  padding: 9px 8px;
+  background: rgba(255, 253, 248, .045);
+  border: 1px solid rgba(255, 253, 248, .09);
+  border-radius: 7px;
+}
+
+.profile-stat span,
+.profile-stat small {
+  display: block;
+  overflow: hidden;
+  color: rgba(246, 239, 226, .58);
+  font-size: 10px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-stat strong {
+  display: block;
+  margin: 3px 0 2px;
+  color: #fff8e8;
+  font-family: var(--mono);
+  font-size: 18px;
+  line-height: 1;
 }
 
 .profile-popover a {
@@ -2247,9 +2328,10 @@ html[data-theme="dark"] .setting__btn:hover {
   }
 
   .username-suggest {
-    position: relative;
-    top: auto;
-    margin-top: 8px;
+    position: absolute;
+    top: calc(100% + 8px);
+    margin-top: 0;
+    width: min(100%, calc(100vw - 88px));
   }
 
   .search__btn {
@@ -2412,6 +2494,8 @@ html[data-theme="dark"] .leaderboard-section {
 
 .lb-row {
   position: relative;
+  width: 100%;
+  appearance: none;
   display: flex;
   align-items: center;
   gap: 16px;
@@ -2424,7 +2508,10 @@ html[data-theme="dark"] .leaderboard-section {
   border-radius: var(--radius);
   box-shadow: var(--shadow-soft), inset 0 1px 0 rgba(255, 253, 248, .32);
   color: inherit;
+  font: inherit;
   text-decoration: none;
+  text-align: left;
+  cursor: pointer;
   opacity: 0;
   overflow: hidden;
   animation: rowReveal .5s cubic-bezier(.2, .8, .2, 1) both;

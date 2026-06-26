@@ -657,10 +657,21 @@
     return /^https?:\/\//.test(remoteBase) ? remoteBase : "";
   }
 
+  function newSearchEventId() {
+    if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+    if (window.crypto?.getRandomValues) {
+      const values = new Uint32Array(2);
+      window.crypto.getRandomValues(values);
+      return `search-${Date.now().toString(36)}-${values[0].toString(36)}${values[1].toString(36)}`;
+    }
+    return `search-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  }
+
   function recordSearchEvent(outcome, detail = {}) {
     const remoteBase = workerBase();
     if (!remoteBase) return;
     const payload = {
+      searchId: detail.searchId,
       outcome,
       start: detail.start,
       target: detail.target,
@@ -687,12 +698,14 @@
     const code = String(codeInput?.value || "").trim();
     if (!remoteBase || !codeInput || !status || !wrap || !btn) return;
     if (!code) {
+      status.hidden = false;
       status.textContent = "Enter the owner code first.";
       wrap.hidden = true;
       return;
     }
 
     btn.disabled = true;
+    status.hidden = false;
     status.textContent = "Loading recent searches...";
     try {
       const res = await fetch(`${remoteBase}/analytics?limit=${OWNER_ANALYTICS_LIMIT}`, {
@@ -708,9 +721,11 @@
       const data = await res.json();
       renderOwnerAnalytics(data);
       state.ownerCode = code;
+      status.hidden = false;
       status.textContent = `${Number(data.total || 0).toLocaleString()} recent search${Number(data.total || 0) === 1 ? "" : "es"} available.`;
     } catch (error) {
       wrap.hidden = true;
+      status.hidden = false;
       status.textContent = error.message || "Could not load analytics.";
     } finally {
       btn.disabled = false;
@@ -1417,7 +1432,8 @@
       showStatus("error", "those are the same player — pick two different ones.");
       return;
     }
-    const analyticsBase = { start, target, depth, range };
+    const analyticsBase = { searchId: newSearchEventId(), start, target, depth, range };
+    recordSearchEvent("started", analyticsBase);
 
     // remember the username for next time
     localStorage.setItem(LS_KEY, start);
@@ -1743,6 +1759,16 @@
     const savedDepth = localStorage.getItem(LS_DEPTH_KEY) || $("#search-depth").value;
     $("#setting-depth").value = savedDepth;
     refreshCacheSize();
+    const ownerStatus = $("#owner-status");
+    const ownerAnalytics = $("#owner-analytics");
+    if (ownerStatus) {
+      ownerStatus.hidden = true;
+      ownerStatus.textContent = "";
+    }
+    if (ownerAnalytics) {
+      ownerAnalytics.hidden = true;
+      ownerAnalytics.innerHTML = "";
+    }
   }
   function closeSettings() {
     $("#settings-modal").hidden = true;

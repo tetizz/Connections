@@ -328,7 +328,14 @@ async function handleAnalyticsEvent(request, env) {
   }
 
   const events = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
-  events.unshift(event);
+  const existingIndex = events.findIndex((item) => item.id === event.id);
+  if (existingIndex >= 0) {
+    const existing = events[existingIndex];
+    events.splice(existingIndex, 1);
+    events.unshift({ ...existing, ...event, firstTs: existing.firstTs || existing.ts || event.ts });
+  } else {
+    events.unshift(event);
+  }
   if (events.length > MAX_ANALYTICS_EVENTS) events.length = MAX_ANALYTICS_EVENTS;
 
   await env.GAMES_CACHE.put(ANALYTICS_EVENTS_KEY, JSON.stringify(events), {
@@ -360,6 +367,7 @@ function analyticsEventShape(body, request) {
   const start = cleanUsername(body?.start);
   const target = cleanUsername(body?.target);
   if (!start || !target || start === target) return null;
+  const id = cleanAnalyticsId(body?.searchId || body?.id) || crypto.randomUUID();
 
   const rawPath = Array.isArray(body?.path)
     ? body.path.slice(0, 12).map(cleanUsername).filter(Boolean)
@@ -380,7 +388,7 @@ function analyticsEventShape(body, request) {
       : null;
 
   return {
-    id: crypto.randomUUID(),
+    id,
     ts: Date.now(),
     outcome: analyticsOutcome(body?.outcome),
     start,
@@ -407,8 +415,9 @@ function normalizeAnalyticsEvents(events) {
         : [];
       const normalizedPath = path.length >= 2 ? normalizePath(start, target, path) : [];
       return {
-        id: String(event.id || crypto.randomUUID()).slice(0, 80),
+        id: cleanAnalyticsId(event.id) || crypto.randomUUID(),
         ts: Number.isFinite(event.ts) ? event.ts : Date.now(),
+        firstTs: Number.isFinite(event.firstTs) ? event.firstTs : null,
         outcome: analyticsOutcome(event.outcome),
         start,
         target,
@@ -424,6 +433,11 @@ function normalizeAnalyticsEvents(events) {
     .filter(Boolean)
     .sort((a, b) => b.ts - a.ts)
     .slice(0, MAX_ANALYTICS_EVENTS);
+}
+
+function cleanAnalyticsId(value) {
+  const clean = String(value || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+  return clean.length >= 8 ? clean : "";
 }
 
 function analyticsOutcome(value) {

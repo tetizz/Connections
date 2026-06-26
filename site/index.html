@@ -13,7 +13,7 @@
     document.documentElement.dataset.theme =
       localStorage.getItem("chess-connections:theme") || "dark";
   </script>
-  <link rel="stylesheet" href="styles.css?v=glare-fix-20260626" />
+  <link rel="stylesheet" href="styles.css?v=owner-debug-settings-20260626" />
 </head>
 <body>
   <div class="site-shell">
@@ -227,13 +227,13 @@
           <span class="setting__hint">Game histories stay out of this browser.</span>
         </div>
         <div class="setting owner-setting">
-          <span class="setting__label">Owner analytics</span>
+          <span class="setting__label">Owner debug settings</span>
           <form class="owner-unlock" id="owner-form">
             <input id="owner-code" type="password" placeholder="owner code"
                    spellcheck="false" autocapitalize="none" autocomplete="off" />
             <button class="setting__btn setting__btn--gold" id="owner-load" type="submit">Unlock</button>
           </form>
-          <span class="setting__hint" id="owner-status">Enter the owner code to view recent searches.</span>
+          <span class="setting__hint" id="owner-status" hidden></span>
           <div class="owner-analytics" id="owner-analytics" hidden></div>
         </div>
       </div>
@@ -242,10 +242,10 @@
 
   <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
 
-  <script src="config.js?v=glare-fix-20260626"></script>
-  <script src="cache.js?v=glare-fix-20260626"></script>
-  <script src="engine.js?v=glare-fix-20260626"></script>
-  <script src="leaderboard.js?v=glare-fix-20260626"></script>
-  <script src="app.js?v=glare-fix-20260626"></script>
+  <script src="config.js?v=owner-debug-settings-20260626"></script>
+  <script src="cache.js?v=owner-debug-settings-20260626"></script>
+  <script src="engine.js?v=owner-debug-settings-20260626"></script>
+  <script src="leaderboard.js?v=owner-debug-settings-20260626"></script>
+  <script src="app.js?v=owner-debug-settings-20260626"></script>
 </body>
 </html>

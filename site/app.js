@@ -19,6 +19,8 @@
   const INTRO_COMPLETE_KEY = "chess-connections:intro-complete:v1";
   const SHARE_PARAM = "share";
   const DEFAULT_TARGET = "magnuscarlsen";
+  const AUTO_SEARCH_DEPTH = 5;
+  const LEGACY_DEPTH_KEY = "chess-connections:depth";
   const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
   const SUGGEST_MIN_CHARS = 2;
   const SUGGEST_LIMIT = 10;
@@ -1416,13 +1418,14 @@
   }
 
   // ---------- live search ----------
-  async function runSearch(startRaw, targetRaw, depth, range) {
+  async function runSearch(startRaw, targetRaw, range) {
     const start = startRaw.trim().toLowerCase();
     const target = targetRaw.trim().toLowerCase();
     const status = $("#search-status");
     const logEl = $("#search-log");
     const btn = $(".search__btn");
     const mode = parseSearchMode(range);
+    const depth = AUTO_SEARCH_DEPTH;
 
     if (!start || !target) {
       showStatus("error", "put in both usernames first.");
@@ -1514,7 +1517,7 @@
     attachProgress(engine);
     attachProgress(bridgeEngine);
     showStatus("working", "looking up the players…");
-    logLine(`connecting ${start} → ${target}  (${mode.label}${mode.instantOnly ? "" : `, up to ${depth} steps deep`})`);
+    logLine(`connecting ${start} → ${target}  (${mode.label}${mode.instantOnly ? "" : ", automatic search"})`);
 
     try {
       // check both players exist + grab their info for the display
@@ -1598,7 +1601,7 @@
 
       if (!result) {
         showStatus("error",
-          `no connection found within ${depth} steps. ` +
+          `no connection found in this search. ` +
           (Number.isFinite(mode.archiveLimit)
             ? `Fast mode only checked the ${esc(mode.crawlLabel)}. Try Full slow if you want a deeper crawl. `
             : "") +
@@ -1749,15 +1752,11 @@
   }
 
   // ---------- settings modal ----------
-  const LS_DEPTH_KEY = "chess-connections:depth";
-
   function openSettings() {
     const modal = $("#settings-modal");
     modal.hidden = false;
     // populate fields from current state / storage
     $("#setting-username").value = localStorage.getItem(LS_KEY) || "";
-    const savedDepth = localStorage.getItem(LS_DEPTH_KEY) || $("#search-depth").value;
-    $("#setting-depth").value = savedDepth;
     refreshCacheSize();
     const ownerStatus = $("#owner-status");
     const ownerAnalytics = $("#owner-analytics");
@@ -1809,11 +1808,6 @@
       $("#search-start").value = "";
     }
   });
-  // persist default depth
-  $("#setting-depth").addEventListener("change", (e) => {
-    localStorage.setItem(LS_DEPTH_KEY, e.target.value);
-    $("#search-depth").value = e.target.value;
-  });
   // clear cache button
   $("#setting-clear-cache").addEventListener("click", async (e) => {
     const btn = e.currentTarget;
@@ -1824,7 +1818,7 @@
       await cache.clear();
       localStorage.removeItem(LS_KEY);
       localStorage.removeItem(LS_RANGE_KEY);
-      localStorage.removeItem(LS_DEPTH_KEY);
+      localStorage.removeItem(LEGACY_DEPTH_KEY);
       $("#search-start").value = "";
       $("#setting-username").value = "";
       btn.textContent = "local prefs cleared";
@@ -1848,8 +1842,7 @@
   $("#search-form").addEventListener("submit", (e) => {
     e.preventDefault();
     hideUsernameSuggest();
-    const depth = parseInt($("#search-depth").value, 10) || 3;
-    runSearch($("#search-start").value, $("#search-target").value, depth, $("#search-range").value);
+    runSearch($("#search-start").value, $("#search-target").value, $("#search-range").value);
   });
 
   function wireSuggestInput(selector, field) {
@@ -1963,8 +1956,7 @@
     // (don't pre-fill with any default)
     const saved = localStorage.getItem(LS_KEY);
     if (saved) $("#search-start").value = saved;
-    const savedDepth = localStorage.getItem(LS_DEPTH_KEY);
-    if (savedDepth) $("#search-depth").value = savedDepth;
+    localStorage.removeItem(LEGACY_DEPTH_KEY);
     const migratedRange = localStorage.getItem(LS_RANGE_MIGRATION_KEY);
     const savedRange = migratedRange ? localStorage.getItem(LS_RANGE_KEY) : "instant";
     if (savedRange && $("#search-range").querySelector(`option[value="${savedRange}"]`)) {

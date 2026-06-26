@@ -311,7 +311,7 @@ window.ChessChain = class ChessChain {
         for (let i = 0; i < nextFrontier.length; i++) backwardFrontier.push(nextFrontier[i]);
       }
     }
-    this.log(`no connection found within ${maxDepth} steps. ` +
+    this.log(`no connection found in this search. ` +
              `(looked through ${totalVisited()} players in total)`);
     return null;
   }

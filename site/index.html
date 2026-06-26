@@ -13,7 +13,7 @@
     document.documentElement.dataset.theme =
       localStorage.getItem("chess-connections:theme") || "dark";
   </script>
-  <link rel="stylesheet" href="styles.css?v=owner-debug-settings-20260626" />
+  <link rel="stylesheet" href="styles.css?v=auto-depth-20260626" />
 </head>
 <body>
   <div class="site-shell">
@@ -66,14 +66,6 @@
                    aria-autocomplete="list" aria-controls="target-suggest"
                    aria-expanded="false" />
             <div class="username-suggest target-suggest" id="target-suggest" role="listbox" aria-label="Target suggestions" hidden></div>
-          </div>
-          <div class="search__field search__field--narrow">
-            <label for="search-depth">Depth</label>
-            <select id="search-depth">
-              <option value="3" selected>3 steps</option>
-              <option value="4">4 steps</option>
-              <option value="5">5 steps</option>
-            </select>
           </div>
           <div class="search__field search__field--range">
             <label for="search-range">Range</label>
@@ -209,15 +201,6 @@
                  spellcheck="false" autocapitalize="none" />
           <span class="setting__hint">Used to prefill the next search on this browser.</span>
         </label>
-        <label class="setting">
-          <span class="setting__label">Default search depth</span>
-          <select id="setting-depth">
-            <option value="3">3 steps</option>
-            <option value="4">4 steps</option>
-            <option value="5">5 steps</option>
-          </select>
-          <span class="setting__hint">Deeper searches can touch a lot more Chess.com archives.</span>
-        </label>
         <div class="setting">
           <span class="setting__label">Saved data</span>
           <div class="cache-controls">
@@ -242,10 +225,10 @@
 
   <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
 
-  <script src="config.js?v=owner-debug-settings-20260626"></script>
-  <script src="cache.js?v=owner-debug-settings-20260626"></script>
-  <script src="engine.js?v=owner-debug-settings-20260626"></script>
-  <script src="leaderboard.js?v=owner-debug-settings-20260626"></script>
-  <script src="app.js?v=owner-debug-settings-20260626"></script>
+  <script src="config.js?v=auto-depth-20260626"></script>
+  <script src="cache.js?v=auto-depth-20260626"></script>
+  <script src="engine.js?v=auto-depth-20260626"></script>
+  <script src="leaderboard.js?v=auto-depth-20260626"></script>
+  <script src="app.js?v=auto-depth-20260626"></script>
 </body>
 </html>

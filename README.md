@@ -137,12 +137,12 @@ Commit the updated JSON if you want the hosted examples to change.
 
 - Data comes from the public Chess.com Published Data API.
 - Searches can get expensive quickly because each player can add many more players to the graph.
-- Depth 3 is the practical default for a browser session.
+- The browser app chooses the deepest practical search automatically; visitors only pick how wide the game-history range should be.
 - `Instant bridge` checks the starting player's latest two monthly archives for a direct win or a known connector into a saved master-player route. It returns fast and stops there.
 - `Recent fast` checks the latest six monthly archives for each player it touches.
 - `Last year` checks the latest twelve monthly archives and can use the shared Cloudflare cache.
 - `Full slow` checks all available archives and can take much longer, especially for famous players.
-- If no chain is found, that means no chain was found inside the chosen depth, not that no chain exists.
+- If no chain is found, that means no chain was found inside the selected game-history range, not that no chain exists.
 
 ## License
 

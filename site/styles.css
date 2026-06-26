@@ -366,7 +366,7 @@ h1 {
   z-index: 60;
   isolation: isolate;
   display: grid;
-  grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) minmax(96px, .35fr) minmax(150px, .48fr) auto;
+  grid-template-columns: minmax(170px, 1fr) minmax(170px, 1fr) minmax(150px, .5fr) auto;
   gap: 10px;
   align-items: end;
   padding: 10px;

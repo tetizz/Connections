@@ -13,7 +13,7 @@
     document.documentElement.dataset.theme =
       localStorage.getItem("chess-connections:theme") || "dark";
   </script>
-  <link rel="stylesheet" href="styles.css?v=profile-overlay-stats-20260626" />
+  <link rel="stylesheet" href="styles.css?v=owner-analytics-20260626" />
 </head>
 <body>
   <div class="site-shell">
@@ -59,10 +59,13 @@
                    aria-expanded="false" />
             <div class="username-suggest" id="username-suggest" role="listbox" aria-label="Username suggestions" hidden></div>
           </div>
-          <div class="search__field">
+          <div class="search__field search__field--target">
             <label for="search-target">Connect to</label>
             <input id="search-target" type="text" value="magnuscarlsen" placeholder="magnuscarlsen"
-                   spellcheck="false" autocapitalize="none" />
+                   spellcheck="false" autocapitalize="none" autocomplete="off"
+                   aria-autocomplete="list" aria-controls="target-suggest"
+                   aria-expanded="false" />
+            <div class="username-suggest target-suggest" id="target-suggest" role="listbox" aria-label="Target suggestions" hidden></div>
           </div>
           <div class="search__field search__field--narrow">
             <label for="search-depth">Depth</label>
@@ -132,7 +135,7 @@
           </button>
         </div>
         <div class="graph-wrap">
-          <svg id="graph" viewBox="0 0 1040 360" preserveAspectRatio="xMidYMid meet" aria-label="Connection graph"></svg>
+          <svg id="graph" viewBox="0 0 1040 420" preserveAspectRatio="xMidYMid meet" aria-label="Connection graph"></svg>
         </div>
         <p class="graph-hint" id="graph-hint"></p>
       </section>
@@ -223,16 +226,26 @@
           </div>
           <span class="setting__hint">Game histories stay out of this browser.</span>
         </div>
+        <div class="setting owner-setting">
+          <span class="setting__label">Owner analytics</span>
+          <form class="owner-unlock" id="owner-form">
+            <input id="owner-code" type="password" placeholder="owner code"
+                   spellcheck="false" autocapitalize="none" autocomplete="off" />
+            <button class="setting__btn setting__btn--gold" id="owner-load" type="submit">Unlock</button>
+          </form>
+          <span class="setting__hint" id="owner-status">Enter the owner code to view recent searches.</span>
+          <div class="owner-analytics" id="owner-analytics" hidden></div>
+        </div>
       </div>
     </div>
   </div>
 
   <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
 
-  <script src="config.js?v=profile-overlay-stats-20260626"></script>
-  <script src="cache.js?v=profile-overlay-stats-20260626"></script>
-  <script src="engine.js?v=profile-overlay-stats-20260626"></script>
-  <script src="leaderboard.js?v=profile-overlay-stats-20260626"></script>
-  <script src="app.js?v=profile-overlay-stats-20260626"></script>
+  <script src="config.js?v=owner-analytics-20260626"></script>
+  <script src="cache.js?v=owner-analytics-20260626"></script>
+  <script src="engine.js?v=owner-analytics-20260626"></script>
+  <script src="leaderboard.js?v=owner-analytics-20260626"></script>
+  <script src="app.js?v=owner-analytics-20260626"></script>
 </body>
 </html>

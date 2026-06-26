@@ -17,6 +17,10 @@ const TITLED_GROUPS = ["GM", "IM", "FM", "NM", "WGM", "WIM", "WFM", "CM", "WCM"]
 const ARCHIVE_CONCURRENCY = 4;
 const SUBMIT_WINDOW_SECONDS = 60;
 const MAX_SUBMITS_PER_WINDOW = 30;
+const MAX_ANALYTICS_EVENTS = 120;
+const MAX_ANALYTICS_LIMIT = 50;
+const MAX_ANALYTICS_EVENTS_PER_WINDOW = 80;
+const ANALYTICS_EVENTS_KEY = "analytics:events";
 const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
 const RATE_LIMIT_COOLDOWN_SECONDS = 90;
 const FETCH_RETRIES = 2;
@@ -25,7 +29,7 @@ const FETCH_BACKOFF_MS = 450;
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Accept, Content-Type",
+  "Access-Control-Allow-Headers": "Accept, Content-Type, X-Owner-Code",
 };
 
 export default {
@@ -58,6 +62,14 @@ export default {
 
     if (url.pathname === "/submit" && request.method === "POST") {
       return handleSubmit(request, env);
+    }
+
+    if (url.pathname === "/analytics/event" && request.method === "POST") {
+      return handleAnalyticsEvent(request, env);
+    }
+
+    if (url.pathname === "/analytics" && request.method === "GET") {
+      return handleAnalytics(url, request, env);
     }
 
     return json({ error: "not found" }, 404);
@@ -291,6 +303,170 @@ async function handleSubmit(request, env) {
   }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
 
   return json({ ok: true, entry }, 200, "no-store");
+}
+
+async function handleAnalyticsEvent(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const rateLimitKey = `analytics:ratelimit:${ip}`;
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "bad json" }, 400);
+  }
+
+  const event = analyticsEventShape(body, request);
+  if (!event) return json({ error: "missing fields" }, 400);
+
+  const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
+  if (submitWindow.count >= MAX_ANALYTICS_EVENTS_PER_WINDOW) {
+    return json({
+      error: "too many events, wait a moment",
+      retryAfter: Math.max(1, SUBMIT_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
+    }, 429);
+  }
+
+  const events = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
+  events.unshift(event);
+  if (events.length > MAX_ANALYTICS_EVENTS) events.length = MAX_ANALYTICS_EVENTS;
+
+  await env.GAMES_CACHE.put(ANALYTICS_EVENTS_KEY, JSON.stringify(events), {
+    expirationTtl: KV_RETENTION_SECONDS,
+    metadata: { type: "analytics" },
+  });
+  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
+    startedAt: submitWindow.startedAt,
+    count: submitWindow.count + 1,
+  }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
+
+  return json({ ok: true }, 200, "no-store");
+}
+
+async function handleAnalytics(url, request, env) {
+  if (!ownerAuthorized(request, env)) return json({ error: "unauthorized" }, 401, "no-store");
+
+  const parsedLimit = parseInt(url.searchParams.get("limit") || "30", 10);
+  const limit = Math.max(1, Math.min(MAX_ANALYTICS_LIMIT, Number.isFinite(parsedLimit) ? parsedLimit : 30));
+  const events = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
+  return json({
+    events: events.slice(0, limit),
+    total: events.length,
+    generatedAt: Date.now(),
+  }, 200, "no-store");
+}
+
+function analyticsEventShape(body, request) {
+  const start = cleanUsername(body?.start);
+  const target = cleanUsername(body?.target);
+  if (!start || !target || start === target) return null;
+
+  const rawPath = Array.isArray(body?.path)
+    ? body.path.slice(0, 12).map(cleanUsername).filter(Boolean)
+    : [];
+  const path = rawPath.length >= 2 ? normalizePath(start, target, rawPath) : [];
+  const rawDepth = parseInt(body?.depth, 10);
+  const rawSteps = parseInt(body?.steps, 10);
+  const rawLength = parseInt(body?.length, 10);
+  const steps = path.length >= 2
+    ? path.length - 1
+    : Number.isFinite(rawSteps)
+      ? Math.max(0, Math.min(12, rawSteps))
+      : null;
+  const length = path.length >= 2
+    ? connectionCount(path, rawLength)
+    : Number.isFinite(rawLength)
+      ? Math.max(0, Math.min(10, rawLength))
+      : null;
+
+  return {
+    id: crypto.randomUUID(),
+    ts: Date.now(),
+    outcome: analyticsOutcome(body?.outcome),
+    start,
+    target,
+    depth: Number.isFinite(rawDepth) ? Math.max(1, Math.min(5, rawDepth)) : null,
+    range: cleanRange(body?.range),
+    length,
+    steps,
+    path,
+    country: cleanCountry(request.cf?.country),
+    device: deviceLabel(request.headers.get("User-Agent") || ""),
+  };
+}
+
+function normalizeAnalyticsEvents(events) {
+  if (!Array.isArray(events)) return [];
+  return events
+    .map((event) => {
+      const start = cleanUsername(event?.start);
+      const target = cleanUsername(event?.target);
+      if (!start || !target || start === target) return null;
+      const path = Array.isArray(event.path)
+        ? event.path.slice(0, 12).map(cleanUsername).filter(Boolean)
+        : [];
+      const normalizedPath = path.length >= 2 ? normalizePath(start, target, path) : [];
+      return {
+        id: String(event.id || crypto.randomUUID()).slice(0, 80),
+        ts: Number.isFinite(event.ts) ? event.ts : Date.now(),
+        outcome: analyticsOutcome(event.outcome),
+        start,
+        target,
+        depth: Number.isFinite(event.depth) ? Math.max(1, Math.min(5, event.depth)) : null,
+        range: cleanRange(event.range),
+        length: Number.isFinite(event.length) ? Math.max(0, Math.min(10, event.length)) : null,
+        steps: Number.isFinite(event.steps) ? Math.max(0, Math.min(12, event.steps)) : null,
+        path: normalizedPath,
+        country: cleanCountry(event.country),
+        device: deviceLabel(event.device || ""),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, MAX_ANALYTICS_EVENTS);
+}
+
+function analyticsOutcome(value) {
+  const clean = String(value || "started").toLowerCase().replace(/-/g, "_");
+  return ["started", "saved", "found", "not_found", "timeout", "error"].includes(clean)
+    ? clean
+    : "started";
+}
+
+function cleanRange(value) {
+  const clean = String(value || "").toLowerCase().trim().replace(/[^a-z0-9_-]/g, "");
+  return ["instant", "6", "12", "all"].includes(clean) ? clean : "";
+}
+
+function cleanCountry(value) {
+  const clean = String(value || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2);
+  return /^[A-Z]{2}$/.test(clean) ? clean : "";
+}
+
+function deviceLabel(value) {
+  const text = String(value || "").toLowerCase();
+  if (!text) return "";
+  if (text.includes("tablet") || text.includes("ipad")) return "tablet";
+  if (text.includes("mobi") || text.includes("iphone") || text.includes("android")) return "mobile";
+  if (["desktop", "mobile", "tablet"].includes(text)) return text;
+  return "desktop";
+}
+
+function ownerAuthorized(request, env) {
+  const expected = String(env.OWNER_CODE || "");
+  const provided = String(request.headers.get("X-Owner-Code") || "");
+  return Boolean(expected) && safeEqual(provided, expected);
+}
+
+function safeEqual(leftValue, rightValue) {
+  const left = String(leftValue || "");
+  const right = String(rightValue || "");
+  const max = Math.max(left.length, right.length, 1);
+  let diff = left.length ^ right.length;
+  for (let i = 0; i < max; i++) {
+    diff |= (left.charCodeAt(i) || 0) ^ (right.charCodeAt(i) || 0);
+  }
+  return diff === 0;
 }
 
 function parseGameCacheKey(key) {

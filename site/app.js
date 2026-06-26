@@ -22,6 +22,7 @@
   const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
   const SUGGEST_MIN_CHARS = 2;
   const SUGGEST_LIMIT = 10;
+  const OWNER_ANALYTICS_LIMIT = 30;
   let introCompletedThisSession = false;
   const QUICK_TARGET_GROUPS = [
     {
@@ -54,11 +55,13 @@
     suggest: {
       items: [],
       activeIndex: -1,
+      field: "start",
       focused: false,
       timer: null,
       controller: null,
       seq: 0,
     },
+    ownerCode: "",
   };
 
   // ---------- small utils ----------
@@ -146,7 +149,6 @@
         <span>Retry in a moment. You can still type any Chess.com username into Connect to.</span>
       </div>
     `;
-    if (error) console.debug("leaderboard targets unavailable:", error.message || error);
   }
 
   function renderQuickTargets(groups) {
@@ -265,27 +267,36 @@
   }
 
   // ---------- username autocomplete ----------
-  function scheduleUsernameSuggest(value) {
+  function suggestConfig(field = state.suggest.field || "start") {
+    return field === "target"
+      ? { field: "target", input: "#search-target", box: "#target-suggest" }
+      : { field: "start", input: "#search-start", box: "#username-suggest" };
+  }
+
+  function scheduleUsernameSuggest(value, field = "start") {
     clearTimeout(state.suggest.timer);
+    state.suggest.field = field;
+    state.suggest.focused = true;
     const query = cleanUsernameInput(value);
     if (query.length < SUGGEST_MIN_CHARS) {
       hideUsernameSuggest();
       return;
     }
-    renderUsernameSuggest(query, localUsernameSuggestions(query), { loading: true });
-    state.suggest.timer = setTimeout(() => loadUsernameSuggestions(query), 180);
+    renderUsernameSuggest(query, localUsernameSuggestions(query), { loading: true }, field);
+    state.suggest.timer = setTimeout(() => loadUsernameSuggestions(query, field), 180);
   }
 
-  async function loadUsernameSuggestions(query) {
-    const input = $("#search-start");
+  async function loadUsernameSuggestions(query, field = state.suggest.field) {
+    const config = suggestConfig(field);
+    const input = $(config.input);
     if (!input || cleanUsernameInput(input.value) !== query) return;
     state.suggest.controller?.abort();
     const seq = ++state.suggest.seq;
     const controller = new AbortController();
     state.suggest.controller = controller;
     const remote = await fetchUsernameSuggestions(query, controller.signal).catch(() => []);
-    if (seq !== state.suggest.seq || cleanUsernameInput(input.value) !== query) return;
-    renderUsernameSuggest(query, mergeUsernameSuggestions(remote, localUsernameSuggestions(query)));
+    if (seq !== state.suggest.seq || state.suggest.field !== field || cleanUsernameInput(input.value) !== query) return;
+    renderUsernameSuggest(query, mergeUsernameSuggestions(remote, localUsernameSuggestions(query)), {}, field);
   }
 
   async function fetchUsernameSuggestions(query, signal) {
@@ -359,13 +370,23 @@
     return score;
   }
 
-  function renderUsernameSuggest(query, items, options = {}) {
-    const box = $("#username-suggest");
-    const input = $("#search-start");
-    if (!box || !input || !state.suggest.focused || query.length < SUGGEST_MIN_CHARS) return;
+  function renderUsernameSuggest(query, items, options = {}, field = state.suggest.field) {
+    const config = suggestConfig(field);
+    const box = $(config.box);
+    const input = $(config.input);
+    if (!box || !input || !state.suggest.focused || state.suggest.field !== field || query.length < SUGGEST_MIN_CHARS) return;
     state.suggest.items = items.slice(0, SUGGEST_LIMIT);
     state.suggest.activeIndex = state.suggest.items.length ? 0 : -1;
     input.setAttribute("aria-expanded", "true");
+    for (const other of ["start", "target"]) {
+      if (other !== field) {
+        const otherConfig = suggestConfig(other);
+        const otherBox = $(otherConfig.box);
+        const otherInput = $(otherConfig.input);
+        if (otherBox) otherBox.hidden = true;
+        otherInput?.setAttribute("aria-expanded", "false");
+      }
+    }
     box.hidden = false;
     box.innerHTML = `
       <div class="username-suggest__panel">
@@ -407,8 +428,9 @@
 
   function moveUsernameSuggest(delta) {
     if (!state.suggest.items.length) return;
+    const config = suggestConfig();
     state.suggest.activeIndex = (state.suggest.activeIndex + delta + state.suggest.items.length) % state.suggest.items.length;
-    $("#username-suggest")?.querySelectorAll(".username-suggest__row").forEach((row, index) => {
+    $(config.box)?.querySelectorAll(".username-suggest__row").forEach((row, index) => {
       const active = index === state.suggest.activeIndex;
       row.classList.toggle("is-active", active);
       row.setAttribute("aria-selected", active ? "true" : "false");
@@ -416,9 +438,16 @@
     });
   }
 
-  function selectUsernameSuggestion(username) {
+  function selectUsernameSuggestion(username, field = state.suggest.field) {
     const value = cleanUsernameInput(username);
     if (!value) return;
+    if (field === "target") {
+      $("#search-target").value = value;
+      setActiveChip(value);
+      hideUsernameSuggest();
+      $(".search__btn")?.focus();
+      return;
+    }
     $("#search-start").value = value;
     $("#setting-username").value = value;
     hideUsernameSuggest();
@@ -426,17 +455,20 @@
   }
 
   function hideUsernameSuggest() {
-    const box = $("#username-suggest");
-    const input = $("#search-start");
     clearTimeout(state.suggest.timer);
     state.suggest.controller?.abort();
     state.suggest.items = [];
     state.suggest.activeIndex = -1;
-    if (box) {
-      box.hidden = true;
-      box.innerHTML = "";
+    for (const field of ["start", "target"]) {
+      const config = suggestConfig(field);
+      const box = $(config.box);
+      const input = $(config.input);
+      if (box) {
+        box.hidden = true;
+        box.innerHTML = "";
+      }
+      input?.setAttribute("aria-expanded", "false");
     }
-    input?.setAttribute("aria-expanded", "false");
   }
 
   function countryFlagIcon(country) {
@@ -620,6 +652,119 @@
       .then(() => window.Leaderboard && window.Leaderboard.load());
   }
 
+  function workerBase() {
+    const remoteBase = String(window.CONNECTIONS_CACHE_API || "").replace(/\/+$/, "");
+    return /^https?:\/\//.test(remoteBase) ? remoteBase : "";
+  }
+
+  function recordSearchEvent(outcome, detail = {}) {
+    const remoteBase = workerBase();
+    if (!remoteBase) return;
+    const payload = {
+      outcome,
+      start: detail.start,
+      target: detail.target,
+      depth: detail.depth,
+      range: detail.range,
+      length: Number.isFinite(detail.length) ? detail.length : null,
+      steps: Number.isFinite(detail.steps) ? detail.steps : null,
+      path: Array.isArray(detail.path) ? detail.path : [],
+    };
+    fetch(`${remoteBase}/analytics/event`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify(payload),
+      keepalive: true,
+    }).catch(() => {});
+  }
+
+  async function loadOwnerAnalytics() {
+    const remoteBase = workerBase();
+    const codeInput = $("#owner-code");
+    const status = $("#owner-status");
+    const wrap = $("#owner-analytics");
+    const btn = $("#owner-load");
+    const code = String(codeInput?.value || "").trim();
+    if (!remoteBase || !codeInput || !status || !wrap || !btn) return;
+    if (!code) {
+      status.textContent = "Enter the owner code first.";
+      wrap.hidden = true;
+      return;
+    }
+
+    btn.disabled = true;
+    status.textContent = "Loading recent searches...";
+    try {
+      const res = await fetch(`${remoteBase}/analytics?limit=${OWNER_ANALYTICS_LIMIT}`, {
+        headers: {
+          "Accept": "application/json",
+          "X-Owner-Code": code,
+        },
+      });
+      if (res.status === 401 || res.status === 403) {
+        throw new Error("Wrong owner code.");
+      }
+      if (!res.ok) throw new Error("Analytics are unavailable right now.");
+      const data = await res.json();
+      renderOwnerAnalytics(data);
+      state.ownerCode = code;
+      status.textContent = `${Number(data.total || 0).toLocaleString()} recent search${Number(data.total || 0) === 1 ? "" : "es"} available.`;
+    } catch (error) {
+      wrap.hidden = true;
+      status.textContent = error.message || "Could not load analytics.";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderOwnerAnalytics(data) {
+    const wrap = $("#owner-analytics");
+    if (!wrap) return;
+    const events = Array.isArray(data?.events) ? data.events : [];
+    wrap.hidden = false;
+    if (!events.length) {
+      wrap.innerHTML = `<div class="owner-summary"><span>No searches recorded yet.</span></div>`;
+      return;
+    }
+    wrap.innerHTML = `
+      <div class="owner-summary">
+        <span>Last ${events.length} searches</span>
+        <span>${esc(new Date(data.generatedAt || Date.now()).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</span>
+      </div>
+      ${events.map(ownerEventRow).join("")}
+    `;
+  }
+
+  function ownerEventRow(event) {
+    const outcome = String(event.outcome || "search").replace(/_/g, "-");
+    const path = Array.isArray(event.path) && event.path.length > 1
+      ? `<div class="owner-event__chain">${esc(event.path.join(" -> "))}</div>`
+      : "";
+    const depth = Number.isFinite(event.depth) ? `${event.depth} steps` : "depth n/a";
+    const range = event.range ? String(event.range).replace(/_/g, " ") : "range n/a";
+    const place = [event.country, event.device].filter(Boolean).join(" · ") || "visitor";
+    const when = Number.isFinite(event.ts) ? timeAgo(event.ts) : "just now";
+    return `
+      <div class="owner-event">
+        <div class="owner-event__top">
+          <span class="owner-event__path">${esc(event.start || "?")} -> ${esc(event.target || "?")}</span>
+          <span class="owner-event__status is-${esc(outcome)}">${esc(statusText(event.outcome))}</span>
+        </div>
+        <div class="owner-event__meta">
+          <span>${esc(when)} · ${esc(depth)} · ${esc(range)}</span>
+          <span>${esc(place)}</span>
+        </div>
+        ${path}
+      </div>
+    `;
+  }
+
+  function statusText(value) {
+    return String(value || "search")
+      .replace(/[-_]/g, " ")
+      .replace(/\b\w/g, (char) => char.toUpperCase());
+  }
+
   function precomputedChain(start, target) {
     if (!state.chains?.chains?.length) return null;
     if ((state.chains.start || "").toLowerCase() !== start) return null;
@@ -750,6 +895,7 @@
   function renderGraph(chain) {
     const svg = $("#graph");
     svg.innerHTML = "";
+    svg.setAttribute("viewBox", "0 0 1040 420");
 
     const defs = el("defs");
     const grad = el("linearGradient", { id: "edge-grad", x1: "0", y1: "0", x2: "1", y2: "0" });
@@ -776,10 +922,10 @@
 
     const nodes = chain.path;
     const n = nodes.length;
-    const PAD = 96, W = 1040;
+    const PAD = 128, W = 1040;
     const usable = W - PAD * 2;
     const stepX = n > 1 ? usable / (n - 1) : 0;
-    const y = 170;
+    const y = 196;
     const positions = nodes.map((_, i) => ({ x: PAD + stepX * i, y }));
 
     const edgesGroup = el("g");
@@ -828,21 +974,21 @@
         g.appendChild(ic);
       }
 
-      const label = el("text", { class: "node__label", x: 0, y: 56 });
-      label.textContent = nameOf(u);
+      const label = el("text", { class: "node__label", x: 0, y: 58 });
+      label.textContent = compactGraphLabel(nameOf(u), n > 7 ? 11 : 15);
       g.appendChild(label);
 
       const title = titleOf(u);
       if (title) {
-        const ttag = el("text", { class: "node__title", x: 0, y: 72 });
+        const ttag = el("text", { class: "node__title", x: 0, y: 76 });
         ttag.textContent = title + (isTarget ? " · TARGET" : "");
         g.appendChild(ttag);
       } else if (isTarget) {
-        const ttag = el("text", { class: "node__title", x: 0, y: 72 });
+        const ttag = el("text", { class: "node__title", x: 0, y: 76 });
         ttag.textContent = "TARGET";
         g.appendChild(ttag);
       } else if (isStart) {
-        const ttag = el("text", { class: "node__title", x: 0, y: 72 });
+        const ttag = el("text", { class: "node__title", x: 0, y: 76 });
         ttag.textContent = "YOU";
         g.appendChild(ttag);
       }
@@ -864,6 +1010,12 @@
   }
 
   const pieceFor = (isStart, isTarget) => (isTarget ? "♚" : "♟");
+
+  function compactGraphLabel(label, max) {
+    const value = String(label || "");
+    if (value.length <= max) return value;
+    return `${value.slice(0, Math.max(1, max - 3))}...`;
+  }
 
   // ---------- animations ----------
   async function animateGraph(svg, traveller, spark) {
@@ -887,8 +1039,9 @@
     });
     nodes.forEach((node) => {
       node.style.opacity = 0;
-      node.style.transform = node.getAttribute("transform") + " scale(0.52)";
-      node.style.transformOrigin = "center";
+      node.style.removeProperty("transform");
+      node.style.removeProperty("transform-box");
+      node.style.removeProperty("transform-origin");
       node.style.transition = "none";
     });
     [traveller, spark].forEach((marker) => {
@@ -905,7 +1058,7 @@
       });
       nodes.forEach((node) => {
         node.style.opacity = 1;
-        node.style.transform = node.getAttribute("transform");
+        node.style.removeProperty("transform");
       });
       return;
     }
@@ -927,9 +1080,9 @@
   function revealNode(node, delay = 0) {
     return new Promise((resolve) => {
       setTimeout(() => {
-        node.style.transition = "opacity .35s ease, transform .45s cubic-bezier(.34,1.56,.64,1)";
+        node.style.removeProperty("transform");
+        node.style.transition = "opacity .35s ease";
         node.style.opacity = 1;
-        node.style.transform = node.getAttribute("transform");
         setTimeout(resolve, 350);
       }, delay);
     });
@@ -1264,6 +1417,7 @@
       showStatus("error", "those are the same player — pick two different ones.");
       return;
     }
+    const analyticsBase = { start, target, depth, range };
 
     // remember the username for next time
     localStorage.setItem(LS_KEY, start);
@@ -1283,6 +1437,12 @@
       };
       renderChain(renderedChain);
       submitLeaderboardChain(start, target, renderedChain);
+      recordSearchEvent("saved", {
+        ...analyticsBase,
+        length: renderedChain.length,
+        steps: Math.max(0, renderedChain.path.length - 1),
+        path: renderedChain.path,
+      });
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
       return;
     }
@@ -1348,10 +1508,12 @@
       ]);
       if (!startMeta) {
         showStatus("error", `couldn't find "${esc(start)}" on chess.com — check the spelling?`);
+        recordSearchEvent("not_found", analyticsBase);
         return;
       }
       if (!targetMeta) {
         showStatus("error", `couldn't find "${esc(target)}" on chess.com — check the spelling?`);
+        recordSearchEvent("not_found", analyticsBase);
         return;
       }
       state.players = state.players || {};
@@ -1373,6 +1535,7 @@
             target, display: targetMeta.name || target,
             found: false, length: null, path: [], hops: [],
           });
+          recordSearchEvent("timeout", analyticsBase);
           return;
         }
       }
@@ -1390,6 +1553,12 @@
         setActiveChip(target);
         renderChain(bridged);
         submitLeaderboardChain(start, target, bridged);
+        recordSearchEvent("found", {
+          ...analyticsBase,
+          length: bridged.length,
+          steps: Math.max(0, bridged.path.length - 1),
+          path: bridged.path,
+        });
         document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
         return;
       }
@@ -1403,6 +1572,7 @@
           target, display: targetMeta.name || target,
           found: false, length: null, path: [], hops: [],
         });
+        recordSearchEvent("not_found", analyticsBase);
         return;
       }
 
@@ -1421,6 +1591,7 @@
           target, display: targetMeta.name || target,
           found: false, length: null, path: [], hops: [],
         });
+        recordSearchEvent("not_found", analyticsBase);
         return;
       }
 
@@ -1443,10 +1614,17 @@
       };
       renderChain(renderedChain);
       submitLeaderboardChain(start, target, renderedChain);
+      recordSearchEvent("found", {
+        ...analyticsBase,
+        length: renderedChain.length,
+        steps: Math.max(0, renderedChain.path.length - 1),
+        path: renderedChain.path,
+      });
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
     } catch (e) {
       console.error(e);
       showStatus("error", `something went wrong: ${esc(e.message)}`);
+      recordSearchEvent("error", analyticsBase);
     } finally {
       btn.disabled = false;
       const est = await cache.estimate();
@@ -1589,6 +1767,10 @@
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !$("#settings-modal").hidden) closeSettings();
   });
+  $("#owner-form")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    loadOwnerAnalytics();
+  });
 
   // persist username typed in settings
   $("#setting-username").addEventListener("change", (e) => {
@@ -1644,41 +1826,48 @@
     runSearch($("#search-start").value, $("#search-target").value, depth, $("#search-range").value);
   });
 
-  $("#search-start").addEventListener("focus", (e) => {
-    state.suggest.focused = true;
-    scheduleUsernameSuggest(e.target.value);
-  });
+  function wireSuggestInput(selector, field) {
+    const input = $(selector);
+    if (!input) return;
+    input.addEventListener("focus", (e) => {
+      scheduleUsernameSuggest(e.target.value, field);
+    });
+    input.addEventListener("input", (e) => {
+      scheduleUsernameSuggest(e.target.value, field);
+    });
+    input.addEventListener("keydown", (e) => {
+      const config = suggestConfig(field);
+      if ($(config.box)?.hidden || state.suggest.field !== field) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        moveUsernameSuggest(1);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        moveUsernameSuggest(-1);
+      } else if (e.key === "Enter" && state.suggest.activeIndex >= 0) {
+        e.preventDefault();
+        selectUsernameSuggestion(state.suggest.items[state.suggest.activeIndex]?.username, field);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        hideUsernameSuggest();
+      }
+    });
+  }
 
-  $("#search-start").addEventListener("input", (e) => {
-    state.suggest.focused = true;
-    scheduleUsernameSuggest(e.target.value);
-  });
+  wireSuggestInput("#search-start", "start");
+  wireSuggestInput("#search-target", "target");
 
-  $("#search-start").addEventListener("keydown", (e) => {
-    if ($("#username-suggest")?.hidden) return;
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      moveUsernameSuggest(1);
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      moveUsernameSuggest(-1);
-    } else if (e.key === "Enter" && state.suggest.activeIndex >= 0) {
-      e.preventDefault();
-      selectUsernameSuggestion(state.suggest.items[state.suggest.activeIndex]?.username);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      hideUsernameSuggest();
-    }
-  });
-
-  $("#username-suggest")?.addEventListener("mousedown", (event) => {
-    event.preventDefault();
-  });
-
-  $("#username-suggest")?.addEventListener("click", (event) => {
-    const row = event.target.closest("[data-username], [data-exact]");
-    if (!row) return;
-    selectUsernameSuggestion(row.dataset.username || row.dataset.exact);
+  ["#username-suggest", "#target-suggest"].forEach((selector) => {
+    const box = $(selector);
+    const field = selector === "#target-suggest" ? "target" : "start";
+    box?.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+    });
+    box?.addEventListener("click", (event) => {
+      const row = event.target.closest("[data-username], [data-exact]");
+      if (!row) return;
+      selectUsernameSuggestion(row.dataset.username || row.dataset.exact, field);
+    });
   });
 
   $(".quick-targets")?.addEventListener("click", (event) => {
@@ -1722,7 +1911,7 @@
   });
 
   document.addEventListener("click", (event) => {
-    if (!event.target.closest(".search__field--username")) {
+    if (!event.target.closest(".search__field--username, .search__field--target")) {
       state.suggest.focused = false;
       hideUsernameSuggest();
     }

@@ -1,8 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark light" />
   <title>Chess Connections | Trace real Chess.com win chains</title>
   <meta name="description" content="Search two Chess.com players and trace the chain of live-game wins that connects them." />
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
@@ -10,10 +11,23 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
   <script>
-    document.documentElement.dataset.theme =
-      localStorage.getItem("chess-connections:theme") || "dark";
+    try {
+      const themeKey = "chess-connections:theme";
+      const darkDefaultKey = "chess-connections:dark-default:v1";
+      if (!localStorage.getItem(darkDefaultKey) && localStorage.getItem(themeKey) !== "dark") {
+        localStorage.setItem(themeKey, "dark");
+        localStorage.setItem(darkDefaultKey, "1");
+      }
+      document.documentElement.dataset.theme =
+        localStorage.getItem(themeKey) || "dark";
+    } catch {
+      document.documentElement.dataset.theme = "dark";
+    }
   </script>
-  <link rel="stylesheet" href="styles.css?v=speed-share-20260626" />
+  <style>
+    html, body { background: #0d100e; color: #f6efe2; }
+  </style>
+  <link rel="stylesheet" href="styles.css?v=dark-default-20260627" />
 </head>
 <body>
   <div class="site-shell">
@@ -237,10 +251,10 @@
 
   <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
 
-  <script src="config.js?v=speed-share-20260626"></script>
-  <script src="cache.js?v=speed-share-20260626"></script>
-  <script src="engine.js?v=speed-share-20260626"></script>
-  <script src="leaderboard.js?v=speed-share-20260626"></script>
-  <script src="app.js?v=speed-share-20260626"></script>
+  <script src="config.js?v=dark-default-20260627"></script>
+  <script src="cache.js?v=dark-default-20260627"></script>
+  <script src="engine.js?v=dark-default-20260627"></script>
+  <script src="leaderboard.js?v=dark-default-20260627"></script>
+  <script src="app.js?v=dark-default-20260627"></script>
 </body>
 </html>

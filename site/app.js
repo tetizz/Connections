@@ -1687,7 +1687,7 @@
       if (!background) showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
       if (["found", "not_found", "timeout", "failed"].includes(job.status)) return job;
-      await new Promise((resolve) => setTimeout(resolve, attempt < 8 ? 900 : 1500));
+      await new Promise((resolve) => setTimeout(resolve, attempt < 10 ? 650 : 1200));
     }
     return {
       id,

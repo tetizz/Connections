@@ -27,16 +27,14 @@ const MAX_ANALYTICS_EVENTS_PER_WINDOW = 80;
 const ANALYTICS_EVENTS_KEY = "analytics:events";
 const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
 const SEARCH_MAX_DEPTH = 5;
-const SEARCH_MAX_EXPANSIONS = 120;
-const SEARCH_FRONTIER_LIMIT = 80;
-const SEARCH_CHUNK_EXPANSIONS = 36;
-const SEARCH_START_EXPANSIONS = 10;
-const SEARCH_START_TIME_MS = 2800;
-const SEARCH_CHUNK_TIME_MS = 6500;
-const SEARCH_BACKGROUND_TIME_MS = 24000;
-const SEARCH_LEASE_MS = 12000;
-const SEARCH_VISITED_LIMIT = 8000;
-const SEARCH_NEXT_FRONTIER_LIMIT = 1600;
+const SEARCH_MAX_EXPANSIONS = 260;
+const SEARCH_FRONTIER_LIMIT = 200;
+const SEARCH_CHUNK_EXPANSIONS = 72;
+const SEARCH_CHUNK_TIME_MS = 8500;
+const SEARCH_BACKGROUND_TIME_MS = 26000;
+const SEARCH_LEASE_MS = 15000;
+const SEARCH_VISITED_LIMIT = 12000;
+const SEARCH_NEXT_FRONTIER_LIMIT = 3000;
 const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const SHARE_ID_LENGTH = 8;
@@ -350,14 +348,15 @@ async function handleSearchStart(request, env, ctx) {
   });
   await writeSearchJob(env, job);
 
-  const initialJob = cachedPair
-    ? job
-    : await runSearchJobChunk(env, job.id, {
-        expansionBudget: SEARCH_START_EXPANSIONS,
-        timeBudgetMs: SEARCH_START_TIME_MS,
-      }) || job;
+  ctx?.waitUntil(runSearchJob(env, job).catch((error) => {
+    console.warn(JSON.stringify({
+      event: "search_background_error",
+      id,
+      message: error?.message || String(error),
+    }));
+  }));
 
-  return json({ ok: true, job: publicSearchJob(initialJob) }, initialJob.status === "found" ? 200 : 202, "no-store");
+  return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
 }
 
 async function handleSearchJob(url, env) {

@@ -553,7 +553,7 @@
     url.searchParams.set(SHORT_CHAIN_PARAM, id);
     url.searchParams.delete(CHAIN_PARAM);
     url.searchParams.delete(LEGACY_SHARE_PARAM);
-    url.searchParams.set("v", "chain");
+    url.searchParams.delete("v");
     return url.toString();
   }
 

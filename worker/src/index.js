@@ -45,6 +45,8 @@ const WARM_STATUS_KEY = "warm:leaderboard-targets";
 const WARM_INTERVAL_SECONDS = 6 * 60 * 60;
 const WARM_PLAYER_LIMIT = 36;
 const WARM_ROUTE_LIMIT = 500;
+const WARM_VERIFY_ROUTE_LIMIT = 4;
+const WARM_VERIFY_TIME_MS = 14000;
 const FAST_LANE_FRAGMENT_LIMIT = 200;
 const COMMON_WARM_TARGETS = ["magnuscarlsen", "hikaru", "danielnaroditsky", "fabianocaruana", "gothamchess"];
 const RATE_LIMIT_COOLDOWN_SECONDS = 90;
@@ -976,7 +978,7 @@ async function tryLeaderboardRouteHint(env, job, stats) {
   return null;
 }
 
-async function verifyPathHops(env, path, archiveLimit, stats = null) {
+async function verifyPathHops(env, path, archiveLimit, stats = null, options = {}) {
   const cleanPath = Array.isArray(path) ? path.map(cleanUsername).filter(Boolean).slice(0, 12) : [];
   if (cleanPath.length < 2 || new Set(cleanPath).size !== cleanPath.length) return null;
   const limit = Math.min(Number.isFinite(archiveLimit) ? archiveLimit : 12, 12);
@@ -987,13 +989,28 @@ async function verifyPathHops(env, path, archiveLimit, stats = null) {
       if (cachedHop) return cachedHop;
       const games = await readOrFetchGames(env, { username: from, archiveLimit: limit }, stats);
       const urls = edgesFromGames(from, games).beatenByMe.get(to);
-      if (!urls?.length) return null;
-      return (await enrichHopsFromGames([{ from, to, url: urls[0] }], games))[0] || null;
+      if (urls?.length) return (await enrichHopsFromGames([{ from, to, url: urls[0] }], games))[0] || null;
+      if (options.allowDeep) return findDeepHop(env, from, to, stats);
+      return null;
     } catch {
       return null;
     }
   }), 3);
   return hops.every(Boolean) ? cleanHopList(hops) : null;
+}
+
+async function findDeepHop(env, from, to, stats = null) {
+  for (const username of [from, to]) {
+    try {
+      const games = await readOrFetchGames(env, { username, archiveLimit: Infinity }, stats);
+      const urls = edgesFromGames(from, games).beatenByMe.get(to);
+      if (urls?.length) return (await enrichHopsFromGames([{ from, to, url: urls[0] }], games))[0] || null;
+    } catch {
+      // Keep deep verification opportunistic. A missing/rate-limited archive
+      // should not break the search or scheduled warmer.
+    }
+  }
+  return null;
 }
 
 async function findCachedHop(env, from, to) {
@@ -1143,9 +1160,9 @@ function archiveLimitForRange(range) {
 
 async function handleWarm(url, env, ctx) {
   const force = url.searchParams.get("force") === "1";
-  const status = await env.GAMES_CACHE.get(WARM_STATUS_KEY, { type: "json", cacheTtl: 60 });
+  const status = await env.GAMES_CACHE.get(WARM_STATUS_KEY, { type: "json" });
   const age = Date.now() - (Number.isFinite(status?.updatedAt) ? status.updatedAt : 0);
-  if (!force && status && age < WARM_INTERVAL_SECONDS * 1000) {
+  if (!force && status?.status === "ready" && age < WARM_INTERVAL_SECONDS * 1000) {
     return json({ ok: true, status: publicWarmStatus(status), skipped: true }, 200, "no-store");
   }
 
@@ -1305,6 +1322,39 @@ async function warmFastLaneFragments(env) {
       fragments += Math.max(0, shaped.chain.path.length - 1);
     }
   }), 3);
+  const unverifiedLeaderboardEntries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || [])
+    .filter((entry) => cleanHopList(entry.hops).length !== entry.path.length - 1)
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, WARM_VERIFY_ROUTE_LIMIT);
+  const verifyDeadline = Date.now() + WARM_VERIFY_TIME_MS;
+  for (const entry of unverifiedLeaderboardEntries) {
+    if (Date.now() >= verifyDeadline) break;
+    const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+    const hops = await verifyPathHops(env, entry.path, 12, stats, { allowDeep: true });
+    if (hops?.length !== entry.path.length - 1) continue;
+    const shaped = searchJobShape({
+      id: `warm-verified-${entry.pathKey}`.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80),
+      start: entry.start,
+      target: entry.target,
+      range: "auto",
+      status: "found",
+      chain: {
+        target: entry.target,
+        display: entry.target,
+        found: true,
+        length: entry.steps,
+        path: entry.path,
+        hops,
+      },
+      players: {},
+      stats,
+    });
+    if (shaped?.chain?.found) {
+      await writePairChain(env, shaped);
+      await writeFastLaneFragments(env, shaped);
+      fragments += Math.max(0, shaped.chain.path.length - 1);
+    }
+  }
   return fragments;
 }
 

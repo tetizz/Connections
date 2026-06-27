@@ -442,6 +442,11 @@ async function runSearchJobChunk(env, id, options = {}) {
       const fastLane = await tryFastLaneConnection(env, job, stats);
       search.fastLaneChecked = true;
       if (fastLane?.chain) {
+        const cachedChain = job.chain?.found ? job.chain : null;
+        const fastLaneIsShorter = !cachedChain || chainStepCount(fastLane.chain) < chainStepCount(cachedChain);
+        if (!fastLaneIsShorter) {
+          await progress("Saved route is still shorter than warmed routes. Searching wider graph.", { search });
+        } else {
         const players = {};
         await runThrottled(fastLane.chain.path.map((username) => async () => {
           const profile = await readOrFetchProfile(env, username);
@@ -471,6 +476,7 @@ async function runSearchJobChunk(env, id, options = {}) {
           durationMs: Date.now() - startedAt,
         });
         return readSearchJob(env, id);
+        }
       }
       await progress("Fast lanes checked. Searching wider graph.", { search });
     }
@@ -1420,51 +1426,6 @@ async function handleSubmit(request, env) {
 
   const entries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
   const key = `${start}|${target}`;
-  const duplicatePath = entries.find((entry) => entry.pathKey === pathKey);
-  if (duplicatePath) {
-    if (hops.length === normalizedPath.length - 1 && cleanHopList(duplicatePath.hops).length !== hops.length) {
-      duplicatePath.hops = hops;
-      duplicatePath.ts = Date.now();
-      await env.GAMES_CACHE.put("leaderboard:entries", JSON.stringify(entries));
-      const submitJob = searchJobShape({
-        id: `submit-${pathKey}`.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80),
-        start,
-        target,
-        range: "auto",
-        status: "found",
-        chain: {
-          target,
-          display: target,
-          found: true,
-          length: steps,
-          path: normalizedPath,
-          hops,
-        },
-        players: {},
-        stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
-      });
-      if (submitJob?.chain?.found) {
-        await writePairChain(env, submitJob);
-        await writeFastLaneFragments(env, submitJob);
-      }
-    }
-    return json({
-      ok: true,
-      deduped: true,
-      reason: "same-chain",
-      entry: duplicatePath,
-    }, 200, "no-store");
-  }
-
-  const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
-  if (submitWindow.count >= MAX_SUBMITS_PER_WINDOW) {
-    return json({
-      error: "too many submissions, wait a moment",
-      retryAfter: Math.max(1, SUBMIT_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
-    }, 429);
-  }
-
-  const existingIndex = entries.findIndex((entry) => `${entry.start}|${entry.target}` === key);
   const entry = {
     start,
     target,
@@ -1476,53 +1437,96 @@ async function handleSubmit(request, env) {
     pathKey,
     ts: Date.now(),
   };
+  const samePairEntries = entries.filter((item) => `${item.start}|${item.target}` === key);
+  const bestSamePair = samePairEntries.sort(comparePairRoutes)[0] || null;
 
-  if (existingIndex >= 0) {
-    if (length > entries[existingIndex].length ||
-        (length === entries[existingIndex].length && steps >= entries[existingIndex].steps)) {
-      entries[existingIndex] = entry;
-    } else {
-      return json({ ok: true, deduped: true, message: "already have a chain with more connections" }, 200, "no-store");
+  if (bestSamePair && !isBetterPairRoute(entry, bestSamePair)) {
+    if (entry.pathKey === bestSamePair.pathKey &&
+        hops.length === normalizedPath.length - 1 &&
+        cleanHopList(bestSamePair.hops).length !== hops.length) {
+      const nextEntries = entries.map((item) => item.pathKey === bestSamePair.pathKey
+        ? { ...item, hops, ts: Date.now() }
+        : item);
+      await env.GAMES_CACHE.put("leaderboard:entries", JSON.stringify(nextEntries));
+      await cacheSubmittedRoute(env, start, target, normalizedPath, hops, steps, pathKey);
+      return json({
+        ok: true,
+        deduped: true,
+        reason: "same-chain-proof-updated",
+        entry: { ...bestSamePair, hops },
+      }, 200, "no-store");
     }
-  } else {
-    entries.push(entry);
+    return json({
+      ok: true,
+      deduped: true,
+      reason: "existing-route-is-shorter",
+      entry: bestSamePair,
+    }, 200, "no-store");
   }
 
-  entries.sort((a, b) => b.length - a.length || b.steps - a.steps || b.ts - a.ts);
-  if (entries.length > MAX_LEADERBOARD_ENTRIES) entries.length = MAX_LEADERBOARD_ENTRIES;
+  const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
+  if (submitWindow.count >= MAX_SUBMITS_PER_WINDOW) {
+    return json({
+      error: "too many submissions, wait a moment",
+      retryAfter: Math.max(1, SUBMIT_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
+    }, 429);
+  }
 
-  await env.GAMES_CACHE.put("leaderboard:entries", JSON.stringify(entries));
+  const replaced = samePairEntries.length;
+  const nextEntries = entries.filter((item) => `${item.start}|${item.target}` !== key);
+  nextEntries.push(entry);
+
+  nextEntries.sort((a, b) => b.length - a.length || b.steps - a.steps || b.ts - a.ts);
+  if (nextEntries.length > MAX_LEADERBOARD_ENTRIES) nextEntries.length = MAX_LEADERBOARD_ENTRIES;
+
+  await env.GAMES_CACHE.put("leaderboard:entries", JSON.stringify(nextEntries));
   await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
     startedAt: submitWindow.startedAt,
     count: submitWindow.count + 1,
   }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
 
-  if (hops.length === normalizedPath.length - 1) {
-    const chain = {
-      target,
-      display: target,
-      found: true,
-      length: steps,
-      path: normalizedPath,
-      hops,
-    };
-    const submitJob = searchJobShape({
-      id: `submit-${pathKey}`.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80),
-      start,
-      target,
-      range: "auto",
-      status: "found",
-      chain,
-      players: {},
-      stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
-    });
-    if (submitJob?.chain?.found) {
-      await writePairChain(env, submitJob);
-      await writeFastLaneFragments(env, submitJob);
-    }
-  }
+  await cacheSubmittedRoute(env, start, target, normalizedPath, hops, steps, pathKey);
 
-  return json({ ok: true, entry }, 200, "no-store");
+  return json({ ok: true, entry, replaced }, 200, "no-store");
+}
+
+function comparePairRoutes(a, b) {
+  if (a.steps !== b.steps) return a.steps - b.steps;
+  const aProofs = cleanHopList(a.hops).length;
+  const bProofs = cleanHopList(b.hops).length;
+  if (aProofs !== bProofs) return bProofs - aProofs;
+  return b.ts - a.ts;
+}
+
+function isBetterPairRoute(candidate, current) {
+  if (!current) return true;
+  return comparePairRoutes(candidate, current) < 0;
+}
+
+async function cacheSubmittedRoute(env, start, target, path, hops, steps, pathKey) {
+  if (cleanHopList(hops).length !== path.length - 1) return;
+  const chain = {
+    target,
+    display: target,
+    found: true,
+    length: steps,
+    path,
+    hops,
+  };
+  const submitJob = searchJobShape({
+    id: `submit-${pathKey}`.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80),
+    start,
+    target,
+    range: "auto",
+    status: "found",
+    chain,
+    players: {},
+    stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+  });
+  if (submitJob?.chain?.found) {
+    await writePairChain(env, submitJob);
+    await writeFastLaneFragments(env, submitJob);
+  }
 }
 
 async function handleAnalyticsEvent(request, env) {
@@ -2669,7 +2673,15 @@ function normalizeEntries(entries) {
       unique.set(entry.pathKey, entry);
     }
   }
-  return [...unique.values()];
+  const uniquePairs = new Map();
+  for (const entry of unique.values()) {
+    const pairKey = `${entry.start}|${entry.target}`;
+    const current = uniquePairs.get(pairKey);
+    if (!current || isBetterPairRoute(entry, current)) {
+      uniquePairs.set(pairKey, entry);
+    }
+  }
+  return [...uniquePairs.values()];
 }
 
 function isBetterStoredEntry(candidate, current) {
@@ -2735,21 +2747,11 @@ function leaderboardForCategory(category, chains, events) {
 }
 
 function fastestLeaderboard(events) {
-  return events
+  const rows = events
     .filter((event) => ["found", "saved"].includes(event.outcome) && Number.isFinite(event.durationMs) && event.durationMs > 0)
-    .map((event) => ({
-      category: "fastest",
-      username: event.start,
-      target: event.target,
-      count: event.durationMs,
-      durationMs: event.durationMs,
-      steps: event.steps,
-      length: event.length,
-      path: event.path,
-      latestTs: event.ts,
-      quality: event.quality,
-      examples: [{ start: event.start, target: event.target, steps: event.steps }],
-    }))
+    .map((event) => eventLeaderboardRow(event, "fastest"))
+    .filter(Boolean);
+  return dedupeLeaderboardRowsByPair(rows)
     .sort((a, b) => a.durationMs - b.durationMs || (a.steps || 99) - (b.steps || 99) || b.latestTs - a.latestTs);
 }
 
@@ -2800,18 +2802,8 @@ function searchedLeaderboard(events) {
 function recentDiscoveriesLeaderboard(chains, events) {
   const eventRows = events
     .filter((event) => ["found", "saved"].includes(event.outcome) && Array.isArray(event.path) && event.path.length >= 2)
-    .map((event) => ({
-      category: "recent",
-      username: event.start,
-      target: event.target,
-      count: event.length ?? Math.max(0, event.path.length - 2),
-      steps: event.steps,
-      length: event.length,
-      path: event.path,
-      latestTs: event.ts,
-      quality: event.quality,
-      examples: [{ start: event.start, target: event.target, steps: event.steps }],
-    }));
+    .map((event) => eventLeaderboardRow(event, "recent"))
+    .filter(Boolean);
   const chainRows = chains.map((chain) => ({
     category: "recent",
     username: chain.start,
@@ -2823,7 +2815,53 @@ function recentDiscoveriesLeaderboard(chains, events) {
     latestTs: chain.ts,
     examples: [{ start: chain.start, target: chain.target, steps: chain.steps }],
   }));
-  return [...eventRows, ...chainRows].sort((a, b) => b.latestTs - a.latestTs);
+  return dedupeLeaderboardRowsByPair([...eventRows, ...chainRows]).sort((a, b) => b.latestTs - a.latestTs);
+}
+
+function eventLeaderboardRow(event, category) {
+  const start = cleanUsername(event.start);
+  const target = cleanUsername(event.target);
+  const path = normalizePath(start, target, Array.isArray(event.path)
+    ? event.path.slice(0, 12).map(cleanUsername).filter(Boolean)
+    : []);
+  if (!start || !target || start === target || path.length < 2) return null;
+  const steps = Math.max(0, path.length - 1);
+  const length = connectionCount(path, parseInt(event.length, 10));
+  return {
+    category,
+    username: start,
+    target,
+    count: category === "fastest" ? event.durationMs : length,
+    durationMs: event.durationMs,
+    steps,
+    length,
+    path,
+    latestTs: Number.isFinite(event.ts) ? event.ts : Date.now(),
+    quality: event.quality,
+    examples: [{ start, target, steps }],
+  };
+}
+
+function dedupeLeaderboardRowsByPair(rows) {
+  const pairs = new Map();
+  for (const row of rows) {
+    const key = `${row.username}|${row.target}`;
+    const current = pairs.get(key);
+    if (!current || isBetterLeaderboardRow(row, current)) pairs.set(key, row);
+  }
+  return [...pairs.values()];
+}
+
+function isBetterLeaderboardRow(candidate, current) {
+  if (candidate.steps !== current.steps) return candidate.steps < current.steps;
+  const candidateProofs = cleanHopList(candidate.hops).length;
+  const currentProofs = cleanHopList(current.hops).length;
+  if (candidateProofs !== currentProofs) return candidateProofs > currentProofs;
+  if (Number.isFinite(candidate.durationMs) && Number.isFinite(current.durationMs) &&
+      candidate.durationMs !== current.durationMs) {
+    return candidate.durationMs < current.durationMs;
+  }
+  return candidate.latestTs > current.latestTs;
 }
 
 async function putGamesCache(kv, kvKey, parsed, games) {

@@ -997,10 +997,11 @@ async function verifyPathHops(env, path, archiveLimit, stats = null) {
 }
 
 async function findCachedHop(env, from, to) {
-  const listed = await env.GAMES_CACHE.list({ prefix: `games:${from}:`, limit: 20 });
-  const keys = (listed.keys || [])
-    .map((key) => key.name)
-    .filter(Boolean)
+  const [fromKeys, toKeys] = await Promise.all([
+    listGameCacheKeys(env, from),
+    listGameCacheKeys(env, to),
+  ]);
+  const keys = [...new Set([...fromKeys, ...toKeys])]
     .sort((a, b) => cacheRangePriority(a) - cacheRangePriority(b));
   for (const key of keys) {
     const record = await env.GAMES_CACHE.get(key, { type: "json", cacheTtl: 60 });
@@ -1011,6 +1012,11 @@ async function findCachedHop(env, from, to) {
     }
   }
   return null;
+}
+
+async function listGameCacheKeys(env, username) {
+  const listed = await env.GAMES_CACHE.list({ prefix: `games:${username}:`, limit: 20 });
+  return (listed.keys || []).map((key) => key.name).filter(Boolean);
 }
 
 function cacheRangePriority(key) {

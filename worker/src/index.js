@@ -445,7 +445,18 @@ async function runSearchJobChunk(env, id, options = {}) {
         const cachedChain = job.chain?.found ? job.chain : null;
         const fastLaneIsShorter = !cachedChain || chainStepCount(fastLane.chain) < chainStepCount(cachedChain);
         if (!fastLaneIsShorter) {
-          await progress("Saved route is still shorter than warmed routes. Searching wider graph.", { search });
+          await completeSearchJob(env, job, {
+            status: "found",
+            outcome: "found",
+            progress: "Saved connection is still the best route found.",
+            chain: cachedChain,
+            players: job.players || {},
+            stats,
+            search,
+            processingUntil: 0,
+            durationMs: Date.now() - startedAt,
+          });
+          return readSearchJob(env, id);
         } else {
         const players = {};
         await runThrottled(fastLane.chain.path.map((username) => async () => {
@@ -477,6 +488,20 @@ async function runSearchJobChunk(env, id, options = {}) {
         });
         return readSearchJob(env, id);
         }
+      }
+      if (job.chain?.found) {
+        await completeSearchJob(env, job, {
+          status: "found",
+          outcome: "found",
+          progress: "Saved connection is still the best route found.",
+          chain: job.chain,
+          players: job.players || {},
+          stats,
+          search,
+          processingUntil: 0,
+          durationMs: Date.now() - startedAt,
+        });
+        return readSearchJob(env, id);
       }
       await progress("Fast lanes checked. Searching wider graph.", { search });
     }
@@ -875,12 +900,15 @@ async function tryFastLaneConnection(env, job, stats) {
   }
 
   const fragments = await readFastLaneFragments(env, job.target, job.range);
+  const savedStepLimit = job.chain?.found ? chainStepCount(job.chain) : Number.POSITIVE_INFINITY;
   let best = null;
   for (const fragment of fragments) {
     const connector = fragment.path?.[0];
     if (!connector || connector === job.start || connector === job.target) continue;
     const urls = edges.beatenByMe.get(connector);
     if (!urls?.length) continue;
+    const candidateSteps = fragment.path.length;
+    if (candidateSteps >= savedStepLimit) continue;
     const firstHop = (await enrichHopsFromGames([
       { from: job.start, to: connector, url: urls[0] },
     ], startGames))[0];
@@ -955,6 +983,8 @@ async function verifyPathHops(env, path, archiveLimit, stats = null) {
   const hops = await runThrottled(cleanPath.slice(0, -1).map((from, index) => async () => {
     const to = cleanPath[index + 1];
     try {
+      const cachedHop = await findCachedHop(env, from, to);
+      if (cachedHop) return cachedHop;
       const games = await readOrFetchGames(env, { username: from, archiveLimit: limit }, stats);
       const urls = edgesFromGames(from, games).beatenByMe.get(to);
       if (!urls?.length) return null;
@@ -964,6 +994,31 @@ async function verifyPathHops(env, path, archiveLimit, stats = null) {
     }
   }), 3);
   return hops.every(Boolean) ? cleanHopList(hops) : null;
+}
+
+async function findCachedHop(env, from, to) {
+  const listed = await env.GAMES_CACHE.list({ prefix: `games:${from}:`, limit: 20 });
+  const keys = (listed.keys || [])
+    .map((key) => key.name)
+    .filter(Boolean)
+    .sort((a, b) => cacheRangePriority(a) - cacheRangePriority(b));
+  for (const key of keys) {
+    const record = await env.GAMES_CACHE.get(key, { type: "json", cacheTtl: 60 });
+    const games = Array.isArray(record?.games) ? record.games : [];
+    const urls = edgesFromGames(from, games).beatenByMe.get(to);
+    if (urls?.length) {
+      return (await enrichHopsFromGames([{ from, to, url: urls[0] }], games))[0] || null;
+    }
+  }
+  return null;
+}
+
+function cacheRangePriority(key) {
+  if (key.endsWith(":recent:12")) return 0;
+  if (key.endsWith(":recent:6")) return 1;
+  if (key.endsWith(":all")) return 2;
+  if (key.endsWith(":recent:2")) return 3;
+  return 4;
 }
 
 async function enrichHopsFromCache(env, hops, archiveLimit, stats = null) {

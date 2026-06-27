@@ -544,7 +544,7 @@
     if (chain?.quality) return chain.quality;
     if (!chain?.found || !Array.isArray(chain.hops)) return null;
     const proofs = chain.hops.filter((hop) => hop?.url).length;
-    const dated = chain.hops.filter((hop) => Number.isFinite(hop?.endTime)).length;
+    const dated = chain.hops.filter((hop) => isValidProofTime(hop?.endTime)).length;
     const steps = Math.max(0, (chain.path || []).length - 1);
     let score = 100 - Math.max(0, steps - 1) * 7;
     if (dated < proofs) score -= 6;
@@ -925,7 +925,7 @@
 
   function submitLeaderboardChain(start, target, chain) {
     if (!window.Leaderboard || !chain?.found || !Array.isArray(chain.path)) return;
-    window.Leaderboard.submit(start, target, connectionCount(chain.path), chain.path)
+    window.Leaderboard.submit(start, target, connectionCount(chain.path), chain.path, chain.hops || [])
       .then(() => window.Leaderboard && window.Leaderboard.load());
   }
 
@@ -1526,12 +1526,13 @@
         (lt ? `<span class="card__title-tag">${esc(lt)}</span>` : "") +
         `<span class="loser">${esc(nameOf(hop.to))}</span>`;
       body.appendChild(line);
-      const sub = document.createElement("div");
-      sub.className = "card__sub";
       const details = proofDetails(hop, i, chain.hops.length);
-      sub.innerHTML = details.map(esc).join(" · ");
-      body.appendChild(sub);
-
+      if (details.length) {
+        const sub = document.createElement("div");
+        sub.className = "card__sub";
+        sub.innerHTML = details.map(esc).join(" · ");
+        body.appendChild(sub);
+      }
       const proof = document.createElement("a");
       proof.className = "card__proof";
       proof.href = hop.url;
@@ -1563,9 +1564,9 @@
   }
 
   function proofDetails(hop, index, total) {
-    const details = [`link ${index + 1} of ${total}`];
+    const details = [`proof ${index + 1} of ${total}`];
     if (hop.timeClass) details.push(hop.timeClass);
-    if (Number.isFinite(hop.endTime)) details.push(proofDate(hop.endTime));
+    if (isValidProofTime(hop.endTime)) details.push(proofDate(hop.endTime));
     if (hop.color) details.push(`${hop.color} win`);
     if (hop.opening) details.push(compactGraphLabel(String(hop.opening).replace(/^https?:\/\/www\.chess\.com\/openings\//, ""), 42));
     return details;
@@ -1575,6 +1576,10 @@
     const date = new Date(seconds * 1000);
     if (!Number.isFinite(date.getTime())) return "";
     return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  }
+
+  function isValidProofTime(seconds) {
+    return Number.isFinite(seconds) && seconds >= 1167609600;
   }
 
   function avatarEl(username) {
@@ -1845,7 +1850,7 @@
         ${rows.map((game) => {
           const result = String(game.result || "game").replace(/_/g, " ");
           const tone = result === "win" ? " is-win" : result === "loss" ? " is-loss" : "";
-          const when = Number.isFinite(game.endTime) ? timeAgo(game.endTime * 1000) : "";
+          const when = isValidProofTime(game.endTime) ? timeAgo(game.endTime * 1000) : "";
           const label = result === "win" ? "Beat" : result === "loss" ? "Lost to" : "Drew";
           const url = String(game.url || "");
           const body = `

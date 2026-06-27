@@ -14,13 +14,13 @@ window.Leaderboard = (() => {
   let tabsWired = false;
 
   /** Auto-submit a found chain. Fire-and-forget; never blocks the UI. */
-  async function submit(start, target, length, path) {
+  async function submit(start, target, length, path, hops = []) {
     try {
       await fetch(WORKER_URL + "/submit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         keepalive: true,
-        body: JSON.stringify({ start, target, length, path }),
+        body: JSON.stringify({ start, target, length, path, hops }),
       });
     } catch (e) {
       // worker not deployed yet, or offline — fail silently

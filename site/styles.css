@@ -2228,7 +2228,7 @@ html[data-theme="dark"] .card__avatar-fallback {
   margin: 12px 0;
 }
 
-.profile-popover__meta span {
+.profile-popover__meta > span {
   min-height: 24px;
   display: inline-flex;
   align-items: center;
@@ -2243,13 +2243,16 @@ html[data-theme="dark"] .card__avatar-fallback {
 }
 
 .profile-popover__flag {
+  flex: 0 0 auto;
   display: inline-grid;
   place-items: center;
-  width: 20px;
-  height: 15px;
+  width: 24px;
+  height: 18px;
   overflow: hidden;
   border-radius: 3px;
   background: rgba(255, 253, 248, .08);
+  border: 0;
+  padding: 0;
   box-shadow: 0 2px 7px rgba(0, 0, 0, .22);
 }
 

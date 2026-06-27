@@ -19,6 +19,7 @@
   const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v1";
   const INTRO_COMPLETE_KEY = "chess-connections:intro-complete:v1";
   const CHAIN_PARAM = "chain";
+  const SHORT_CHAIN_PARAM = "c";
   const LEGACY_SHARE_PARAM = "share";
   const DEFAULT_TARGET = "magnuscarlsen";
   const AUTO_SEARCH_DEPTH = 5;
@@ -533,20 +534,34 @@
       return;
     }
     btn.hidden = false;
-    btn.dataset.shareUrl = buildShareUrl(chain);
+    btn.dataset.shareUrl = buildLongShareUrl(chain);
     btn.classList.remove("is-copied");
     btn.lastChild.textContent = " Copy link";
   }
 
-  function buildShareUrl(chain) {
+  function buildLongShareUrl(chain) {
     const url = new URL(location.href);
     url.searchParams.set(CHAIN_PARAM, encodeSharePayload(chain));
+    url.searchParams.delete(SHORT_CHAIN_PARAM);
+    url.searchParams.delete(LEGACY_SHARE_PARAM);
+    url.searchParams.set("v", "chain");
+    return url.toString();
+  }
+
+  function buildShortShareUrl(id) {
+    const url = new URL(location.href);
+    url.searchParams.set(SHORT_CHAIN_PARAM, id);
+    url.searchParams.delete(CHAIN_PARAM);
     url.searchParams.delete(LEGACY_SHARE_PARAM);
     url.searchParams.set("v", "chain");
     return url.toString();
   }
 
   function encodeSharePayload(chain) {
+    return base64UrlEncode(JSON.stringify(sharePayload(chain)));
+  }
+
+  function sharePayload(chain) {
     const players = {};
     for (const username of chain.path || []) {
       const key = String(username || "").toLowerCase();
@@ -557,13 +572,14 @@
       v: 1,
       target: chain.target,
       display: chain.display || nameOf(chain.target),
+      found: true,
       length: chain.length,
       path: chain.path,
       hops: chain.hops,
       players,
       ts: Date.now(),
     };
-    return base64UrlEncode(JSON.stringify(payload));
+    return payload;
   }
 
   function decodeSharePayload(value) {
@@ -592,9 +608,16 @@
     }
   }
 
-  function loadSharedChainFromUrl() {
+  async function loadSharedChainFromUrl() {
     const params = new URL(location.href).searchParams;
-    const shared = decodeSharePayload(params.get(CHAIN_PARAM) || params.get(LEGACY_SHARE_PARAM));
+    let shared = null;
+    const shortId = params.get(SHORT_CHAIN_PARAM);
+    if (shortId) {
+      shared = await fetchShortSharedChain(shortId);
+    }
+    if (!shared) {
+      shared = decodeSharePayload(params.get(CHAIN_PARAM) || params.get(LEGACY_SHARE_PARAM));
+    }
     if (!shared) return false;
     state.players = state.players || {};
     for (const [username, profile] of Object.entries(shared.players || {})) {
@@ -609,6 +632,45 @@
     renderChain(shared);
     showStatus("done", `loaded a shared chain to ${shared.display || shared.target}.`);
     return true;
+  }
+
+  async function fetchShortSharedChain(id) {
+    const remoteBase = workerBase();
+    if (!remoteBase || !id) return null;
+    try {
+      const res = await fetch(`${remoteBase}/share?id=${encodeURIComponent(id)}`, {
+        headers: { "Accept": "application/json" },
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return decodeShareObject(data.share);
+    } catch {
+      return null;
+    }
+  }
+
+  function decodeShareObject(parsed) {
+    if (!parsed || typeof parsed !== "object") return null;
+    const path = Array.isArray(parsed.path)
+      ? parsed.path.map((u) => String(u || "").trim().toLowerCase()).filter(Boolean).slice(0, 12)
+      : [];
+    const hops = Array.isArray(parsed.hops)
+      ? parsed.hops.slice(0, 11).map((hop, index) => ({
+          from: String(hop?.from || path[index] || "").trim().toLowerCase(),
+          to: String(hop?.to || path[index + 1] || "").trim().toLowerCase(),
+          url: String(hop?.url || ""),
+        })).filter((hop) => hop.from && hop.to)
+      : [];
+    if (path.length < 2 || hops.length !== path.length - 1) return null;
+    return {
+      target: String(parsed.target || path[path.length - 1]).trim().toLowerCase(),
+      display: String(parsed.display || parsed.target || path[path.length - 1]),
+      found: true,
+      length: Number.isFinite(parsed.length) ? parsed.length : hops.length,
+      path,
+      hops,
+      players: parsed.players && typeof parsed.players === "object" ? parsed.players : {},
+    };
   }
 
   function base64UrlEncode(value) {
@@ -628,8 +690,17 @@
 
   async function copyShareLink() {
     const btn = $("#copy-share");
-    const url = btn?.dataset.shareUrl;
+    let url = btn?.dataset.shareUrl;
     if (!btn || !url) return;
+    const chain = state.currentChain;
+    btn.disabled = true;
+    btn.lastChild.textContent = " Creating link";
+    try {
+      url = await createShortShareUrl(chain) || url;
+      btn.dataset.shareUrl = url;
+    } finally {
+      btn.disabled = false;
+    }
     try {
       await navigator.clipboard.writeText(url);
     } catch {
@@ -649,6 +720,23 @@
       btn.classList.remove("is-copied");
       btn.lastChild.textContent = " Copy link";
     }, 1600);
+  }
+
+  async function createShortShareUrl(chain) {
+    const remoteBase = workerBase();
+    if (!remoteBase || !chain?.found) return "";
+    try {
+      const res = await fetch(`${remoteBase}/share`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify(sharePayload(chain)),
+      });
+      if (!res.ok) return "";
+      const data = await res.json();
+      return data.id ? buildShortShareUrl(data.id) : "";
+    } catch {
+      return "";
+    }
   }
 
   function submitLeaderboardChain(start, target, chain) {
@@ -1511,6 +1599,11 @@
       let showedInstantChain = false;
       let instantChainKey = "";
       if (job.chain?.found) {
+        if (["found", "not_found", "timeout", "failed"].includes(job.status)) {
+          clearActiveJob(job.id);
+          await applyServerChain(job, analyticsBase);
+          return true;
+        }
         showedInstantChain = true;
         instantChainKey = chainKey(job.chain.path || []);
         await applyServerChain(job, analyticsBase, {
@@ -2352,8 +2445,8 @@
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
     if (!introComplete()) openIntroGate();
     warmSharedCaches();
-    loadShowcase().then(() => {
-      const sharedLoaded = loadSharedChainFromUrl();
+    loadShowcase().then(async () => {
+      const sharedLoaded = await loadSharedChainFromUrl();
       loadLeaderboardTargets();
       if (!sharedLoaded) resumeActiveSearchJob();
     });

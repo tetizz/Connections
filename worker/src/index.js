@@ -5,6 +5,7 @@
  * - POST /search/start starts a resumable server-side chain search job.
  * - GET /search/job?id=... returns job progress or the final chain.
  * - POST /search/warm prefetches top Chess.com targets into shared storage.
+ * - POST /share stores a short shareable result; GET /share?id=... reads it.
  * - POST /submit stores found chains for the global leaderboard.
  * - GET /leaderboard ranks middle players by how often they connect chains.
  * - GET /suggest?query=name returns cached username suggestions.
@@ -28,13 +29,17 @@ const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
 const SEARCH_MAX_DEPTH = 5;
 const SEARCH_MAX_EXPANSIONS = 120;
 const SEARCH_FRONTIER_LIMIT = 80;
-const SEARCH_CHUNK_EXPANSIONS = 24;
+const SEARCH_CHUNK_EXPANSIONS = 36;
+const SEARCH_START_EXPANSIONS = 10;
+const SEARCH_START_TIME_MS = 2800;
 const SEARCH_CHUNK_TIME_MS = 6500;
 const SEARCH_BACKGROUND_TIME_MS = 24000;
 const SEARCH_LEASE_MS = 12000;
 const SEARCH_VISITED_LIMIT = 8000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 1600;
 const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
+const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
+const SHARE_ID_LENGTH = 14;
 const SEARCH_JOB_TTL_SECONDS = 2 * 60 * 60;
 const SEARCH_WINDOW_SECONDS = 60;
 const MAX_SEARCH_JOBS_PER_WINDOW = 16;
@@ -90,6 +95,14 @@ export default {
 
     if (url.pathname === "/search/warm" && (request.method === "GET" || request.method === "POST")) {
       return handleWarm(url, env, ctx);
+    }
+
+    if (url.pathname === "/share" && request.method === "POST") {
+      return handleShareCreate(request, env);
+    }
+
+    if (url.pathname === "/share" && request.method === "GET") {
+      return handleShareRead(url, env);
     }
 
     if (url.pathname === "/submit" && request.method === "POST") {
@@ -337,7 +350,14 @@ async function handleSearchStart(request, env, ctx) {
   });
   await writeSearchJob(env, job);
 
-  return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
+  const initialJob = cachedPair
+    ? job
+    : await runSearchJobChunk(env, job.id, {
+        expansionBudget: SEARCH_START_EXPANSIONS,
+        timeBudgetMs: SEARCH_START_TIME_MS,
+      }) || job;
+
+  return json({ ok: true, job: publicSearchJob(initialJob) }, initialJob.status === "found" ? 200 : 202, "no-store");
 }
 
 async function handleSearchJob(url, env) {
@@ -934,6 +954,126 @@ function publicWarmStatus(status) {
     warmed: Number.isFinite(status?.warmed) ? status.warmed : 0,
     errors: Number.isFinite(status?.errors) ? status.errors : 0,
   };
+}
+
+async function handleShareCreate(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "bad json" }, 400);
+  }
+
+  const share = shareRecordShape(body);
+  if (!share) return json({ error: "invalid share" }, 400, "no-store");
+  const id = await shareIdForRecord(share);
+  const record = {
+    ...share,
+    id,
+    createdAt: Date.now(),
+  };
+  await env.GAMES_CACHE.put(`share:${id}`, JSON.stringify(record), {
+    expirationTtl: SHARE_TTL_SECONDS,
+    metadata: {
+      type: "share",
+      start: share.start,
+      target: share.target,
+    },
+  });
+  return json({ ok: true, id, share: publicShareRecord(record) }, 200, "no-store");
+}
+
+async function handleShareRead(url, env) {
+  const id = cleanShareId(url.searchParams.get("id") || url.searchParams.get("c"));
+  if (!id) return json({ error: "missing id" }, 400, "no-store");
+  const record = shareRecordShape(await env.GAMES_CACHE.get(`share:${id}`, { type: "json", cacheTtl: 60 }));
+  if (!record) return json({ error: "share not found" }, 404, "no-store");
+  return json({ ok: true, id, share: publicShareRecord({ ...record, id }) }, 200, "public, max-age=60");
+}
+
+function shareRecordShape(value) {
+  if (!value || typeof value !== "object") return null;
+  const rawChain = value.chain && typeof value.chain === "object"
+    ? value.chain
+    : value;
+  const target = cleanUsername(rawChain.target || value.target);
+  const chain = chainShape(rawChain, target);
+  if (!chain?.found || !target || !Array.isArray(chain.path) || chain.path.length < 2) return null;
+  const start = cleanUsername(value.start || chain.path[0]);
+  const normalizedPath = normalizePath(start, target, chain.path);
+  if (normalizedPath.length < 2 || normalizedPath[0] !== start || normalizedPath[normalizedPath.length - 1] !== target) {
+    return null;
+  }
+  const hops = chain.hops.length === normalizedPath.length - 1
+    ? chain.hops
+    : [];
+  if (hops.length !== normalizedPath.length - 1) return null;
+  return {
+    v: 1,
+    start,
+    target,
+    chain: {
+      ...chain,
+      target,
+      length: Math.max(0, normalizedPath.length - 1),
+      path: normalizedPath,
+      hops,
+    },
+    players: cleanSharePlayers(value.players || rawChain.players),
+    ts: Number.isFinite(value.ts) ? value.ts : Date.now(),
+  };
+}
+
+function cleanSharePlayers(value) {
+  const players = {};
+  if (!value || typeof value !== "object") return players;
+  for (const [rawUsername, rawProfile] of Object.entries(value)) {
+    const username = cleanUsername(rawUsername);
+    if (!username || !rawProfile || typeof rawProfile !== "object") continue;
+    players[username] = {
+      username,
+      avatar: cleanHttpUrl(rawProfile.avatar),
+      title: String(rawProfile.title || "").slice(0, 12),
+      name: String(rawProfile.name || "").slice(0, 80),
+      url: cleanHttpUrl(rawProfile.url),
+      country: cleanCountry(countryFromProfile(rawProfile.country)),
+      followers: cleanNonNegativeNumber(rawProfile.followers, 100000000),
+      joined: cleanNonNegativeNumber(rawProfile.joined, 4102444800),
+      lastOnline: cleanNonNegativeNumber(rawProfile.lastOnline || rawProfile.last_online, 4102444800),
+      status: String(rawProfile.status || "").slice(0, 24),
+      location: String(rawProfile.location || "").slice(0, 80),
+      fide: cleanNonNegativeNumber(rawProfile.fide, 4000),
+    };
+  }
+  return players;
+}
+
+function publicShareRecord(record) {
+  const shaped = shareRecordShape(record);
+  if (!shaped) return null;
+  return {
+    v: 1,
+    id: cleanShareId(record?.id),
+    target: shaped.target,
+    display: shaped.chain.display,
+    length: shaped.chain.length,
+    path: shaped.chain.path,
+    hops: shaped.chain.hops,
+    players: shaped.players,
+    ts: shaped.ts,
+  };
+}
+
+async function shareIdForRecord(record) {
+  const canonical = JSON.stringify({
+    start: record.start,
+    target: record.target,
+    path: record.chain.path,
+    hops: record.chain.hops.map((hop) => ({ from: hop.from, to: hop.to, url: hop.url })),
+  });
+  const bytes = new TextEncoder().encode(canonical);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return base64UrlBytes(new Uint8Array(digest)).slice(0, SHARE_ID_LENGTH);
 }
 
 async function handleSubmit(request, env) {
@@ -1544,6 +1684,27 @@ function cleanCountry(value) {
 function cleanUrl(value) {
   const text = String(value || "").trim();
   return /^https:\/\/www\.chess\.com\/game\//i.test(text) ? text.slice(0, 240) : "";
+}
+
+function cleanHttpUrl(value) {
+  const text = String(value || "").trim();
+  return /^https?:\/\//i.test(text) ? text.slice(0, 300) : "";
+}
+
+function cleanShareId(value) {
+  const clean = String(value || "").trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32);
+  return clean.length >= 8 ? clean : "";
+}
+
+function countryFromProfile(value) {
+  const text = String(value || "");
+  return text.includes("/") ? text.split("/").pop() : text;
+}
+
+function base64UrlBytes(bytes) {
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function deviceLabel(value) {

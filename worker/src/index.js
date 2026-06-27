@@ -2090,7 +2090,13 @@ function parseGameCacheKey(key) {
 }
 
 async function fetchGames({ username, archiveLimit }) {
-  const archiveData = await fetchJSON(`${CHESS_API}${username}/games/archives`);
+  let archiveData;
+  try {
+    archiveData = await fetchJSON(`${CHESS_API}${username}/games/archives`);
+  } catch (error) {
+    if (isMissingArchivesError(error)) return [];
+    throw error;
+  }
   const archives = Array.isArray(archiveData.archives) ? archiveData.archives : [];
   const selectedArchives = Number.isFinite(archiveLimit)
     ? archives.slice(-archiveLimit)
@@ -2703,6 +2709,12 @@ function clampRetryAfter(seconds) {
 
 function isRateLimitError(error) {
   return error instanceof UpstreamHTTPError && error.status === 429;
+}
+
+function isMissingArchivesError(error) {
+  return error instanceof UpstreamHTTPError &&
+    (error.status === 404 || error.status === 410) &&
+    /\/games\/archives$/i.test(error.url || "");
 }
 
 function delay(ms) {

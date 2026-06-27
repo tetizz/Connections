@@ -81,15 +81,7 @@
                    aria-expanded="false" />
             <div class="username-suggest target-suggest" id="target-suggest" role="listbox" aria-label="Target suggestions" hidden></div>
           </div>
-          <div class="search__field search__field--range">
-            <label for="search-range">Range</label>
-            <select id="search-range">
-              <option value="instant" selected>Instant bridge</option>
-              <option value="6">Recent fast</option>
-              <option value="12">Last year</option>
-              <option value="all">Full slow</option>
-            </select>
-          </div>
+          <input id="search-range" type="hidden" value="auto" />
           <button class="search__btn" type="submit">
             <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
               <path d="M5 12h11.4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -100,6 +92,20 @@
         </form>
 
         <div class="search__status" id="search-status" hidden></div>
+        <div class="search-queue" id="search-queue" hidden>
+          <div class="search-queue__head">
+            <span>Live search queue</span>
+            <strong id="queue-state">Queued</strong>
+          </div>
+          <div class="search-queue__grid">
+            <span><small>Job</small><b id="queue-job">—</b></span>
+            <span><small>Checked</small><b id="queue-checked">0</b></span>
+            <span><small>Requests</small><b id="queue-requests">0</b></span>
+            <span><small>Reused</small><b id="queue-cached">0</b></span>
+            <span><small>Elapsed</small><b id="queue-elapsed">0s</b></span>
+          </div>
+          <p id="queue-message">Waiting for the backend job to start.</p>
+        </div>
         <div class="search__log" id="search-log" hidden></div>
         <div class="cache-info" id="cache-info" hidden></div>
 
@@ -125,6 +131,10 @@
             <span class="graph-length" id="chain-length">—</span>
             <span class="graph-length-label">recorded wins</span>
           </div>
+          <div class="quality-badge" id="quality-badge" hidden>
+            <span>Quality</span>
+            <strong>—</strong>
+          </div>
           <button class="replay-btn" id="replay" type="button" title="Replay animation">
             <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
               <path d="M5 12a7 7 0 1 0 2.05-4.95L5 9.1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
@@ -139,11 +149,20 @@
             </svg>
             Copy link
           </button>
+          <button class="share-btn share-btn--image" id="save-share-image" type="button" title="Save result image" hidden>
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <path d="M5 5h14v14H5z" fill="none" stroke="currentColor" stroke-width="1.8"/>
+              <path d="m8 15 2.5-3 2 2.2 1.3-1.4L17 16H7z" fill="currentColor"/>
+              <circle cx="15.7" cy="8.3" r="1.4" fill="currentColor"/>
+            </svg>
+            Save image
+          </button>
         </div>
         <div class="graph-wrap">
           <svg id="graph" viewBox="0 0 1040 420" preserveAspectRatio="xMidYMid meet" aria-label="Connection graph"></svg>
         </div>
         <p class="graph-hint" id="graph-hint"></p>
+        <aside class="graph-explorer" id="graph-explorer" hidden aria-live="polite"></aside>
       </section>
 
       <section class="cards-section" aria-labelledby="ledger-heading">
@@ -173,6 +192,13 @@
             <h2 id="lb-heading">Top connectors</h2>
             <p class="lb-sub">People with the most connections. Middle players only.</p>
           </div>
+        </div>
+        <div class="leaderboard-tabs" id="leaderboard-tabs" role="tablist" aria-label="Leaderboard categories">
+          <button class="leaderboard-tab is-active" type="button" data-category="connectors">Top connectors</button>
+          <button class="leaderboard-tab" type="button" data-category="fastest">Fastest chains</button>
+          <button class="leaderboard-tab" type="button" data-category="top_targets">Top targets</button>
+          <button class="leaderboard-tab" type="button" data-category="searched">Most searched</button>
+          <button class="leaderboard-tab" type="button" data-category="recent">Recent</button>
         </div>
         <div id="leaderboard-list"></div>
       </section>
@@ -240,6 +266,14 @@
             </select>
             <input id="owner-filter-username" type="text" placeholder="filter username"
                    spellcheck="false" autocapitalize="none" autocomplete="off" />
+            <input id="owner-filter-target" type="text" placeholder="filter target"
+                   spellcheck="false" autocapitalize="none" autocomplete="off" />
+            <select id="owner-filter-range" aria-label="Filter owner debug by time range">
+              <option value="">All time</option>
+              <option value="24h">Last 24h</option>
+              <option value="7d">Last 7d</option>
+              <option value="30d">Last 30d</option>
+            </select>
             <button class="setting__btn" id="owner-filter-apply" type="button">Apply</button>
           </div>
           <span class="setting__hint" id="owner-status" hidden></span>
@@ -251,10 +285,10 @@
 
   <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
 
-  <script src="config.js?v=search-speed-20260627"></script>
-  <script src="cache.js?v=search-speed-20260627"></script>
-  <script src="engine.js?v=search-speed-20260627"></script>
-  <script src="leaderboard.js?v=search-speed-20260627"></script>
-  <script src="app.js?v=search-speed-20260627"></script>
+  <script src="config.js?v=feature-expansion-20260627"></script>
+  <script src="cache.js?v=feature-expansion-20260627"></script>
+  <script src="engine.js?v=feature-expansion-20260627"></script>
+  <script src="leaderboard.js?v=feature-expansion-20260627"></script>
+  <script src="app.js?v=feature-expansion-20260627"></script>
 </body>
 </html>

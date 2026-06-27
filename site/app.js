@@ -67,6 +67,7 @@
       seq: 0,
     },
     ownerCode: "",
+    queueTimer: null,
   };
 
   // ---------- small utils ----------
@@ -520,20 +521,56 @@
     state.currentChain = chain;
     $("#target-name").textContent = chain.display || chain.target;
     $("#chain-length").textContent = chain.found ? chain.length : "—";
+    renderQualityBadge(chain);
     renderGraph(chain);
     renderCards(chain);
     updateShareButton(chain);
   }
 
+  function renderQualityBadge(chain) {
+    const badge = $("#quality-badge");
+    if (!badge) return;
+    const quality = qualityFromChain(chain);
+    if (!chain?.found || !quality) {
+      badge.hidden = true;
+      return;
+    }
+    badge.hidden = false;
+    badge.querySelector("strong").textContent = `${quality.label} · ${quality.score}`;
+    badge.title = `${quality.proofs || 0} proof game${quality.proofs === 1 ? "" : "s"}${Number.isFinite(quality.ageDays) ? ` · newest proof ${quality.ageDays}d old` : ""}`;
+  }
+
+  function qualityFromChain(chain) {
+    if (chain?.quality) return chain.quality;
+    if (!chain?.found || !Array.isArray(chain.hops)) return null;
+    const proofs = chain.hops.filter((hop) => hop?.url).length;
+    const dated = chain.hops.filter((hop) => Number.isFinite(hop?.endTime)).length;
+    const steps = Math.max(0, (chain.path || []).length - 1);
+    let score = 100 - Math.max(0, steps - 1) * 7;
+    if (dated < proofs) score -= 6;
+    if (proofs < steps) score -= 18;
+    score = Math.max(0, Math.min(100, Math.round(score)));
+    return {
+      score,
+      label: score >= 86 ? "Excellent" : score >= 72 ? "Strong" : score >= 56 ? "Good" : "Needs fresher proof",
+      proofs,
+      ageDays: null,
+      source: "browser",
+    };
+  }
+
   function updateShareButton(chain) {
     const btn = $("#copy-share");
+    const imageBtn = $("#save-share-image");
     if (!btn) return;
     if (!chain?.found || !Array.isArray(chain.path) || !chain.path.length) {
       btn.hidden = true;
+      if (imageBtn) imageBtn.hidden = true;
       delete btn.dataset.shareUrl;
       return;
     }
     btn.hidden = false;
+    if (imageBtn) imageBtn.hidden = false;
     btn.dataset.shareUrl = buildLongShareUrl(chain);
     btn.classList.remove("is-copied");
     btn.lastChild.textContent = " Copy link";
@@ -576,6 +613,7 @@
       length: chain.length,
       path: chain.path,
       hops: chain.hops,
+      quality: qualityFromChain(chain),
       players,
       ts: Date.now(),
     };
@@ -601,6 +639,7 @@
         length: Number.isFinite(parsed.length) ? parsed.length : hops.length,
         path,
         hops,
+        quality: parsed.quality || null,
         players: parsed.players && typeof parsed.players === "object" ? parsed.players : {},
       };
     } catch {
@@ -669,6 +708,7 @@
       length: Number.isFinite(parsed.length) ? parsed.length : hops.length,
       path,
       hops,
+      quality: parsed.quality || null,
       players: parsed.players && typeof parsed.players === "object" ? parsed.players : {},
     };
   }
@@ -720,6 +760,150 @@
       btn.classList.remove("is-copied");
       btn.lastChild.textContent = " Copy link";
     }, 1600);
+  }
+
+  async function saveShareImage() {
+    const chain = state.currentChain;
+    if (!chain?.found || !Array.isArray(chain.path)) return;
+    const btn = $("#save-share-image");
+    if (btn) {
+      btn.disabled = true;
+      btn.lastChild.textContent = " Saving";
+    }
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1400;
+      canvas.height = 760;
+      const ctx = canvas.getContext("2d");
+      drawShareBackground(ctx, canvas);
+      const quality = qualityFromChain(chain);
+      ctx.fillStyle = "#f6efe2";
+      ctx.font = "800 56px Inter, system-ui, sans-serif";
+      ctx.fillText("Chess Connections", 80, 98);
+      ctx.font = "600 28px Inter, system-ui, sans-serif";
+      ctx.fillStyle = "rgba(246,239,226,.72)";
+      ctx.fillText(`${nameOf(chain.path[0])} to ${nameOf(chain.path[chain.path.length - 1])}`, 82, 142);
+      drawSharePill(ctx, `${chain.hops.length} proof game${chain.hops.length === 1 ? "" : "s"}`, 82, 182);
+      drawSharePill(ctx, `${quality.label} ${quality.score}`, 330, 182);
+      await drawShareChain(ctx, chain);
+      ctx.fillStyle = "rgba(246,239,226,.56)";
+      ctx.font = "600 22px Inter, system-ui, sans-serif";
+      ctx.fillText("Every link is a real Chess.com live win.", 82, 690);
+      const url = canvas.toDataURL("image/png");
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `connections-${chain.path[0]}-${chain.path[chain.path.length - 1]}.png`;
+      a.click();
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.lastChild.textContent = " Save image";
+      }
+    }
+  }
+
+  function drawShareBackground(ctx, canvas) {
+    const gradient = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+    gradient.addColorStop(0, "#151a15");
+    gradient.addColorStop(0.55, "#080b09");
+    gradient.addColorStop(1, "#1d211a");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "rgba(240,201,119,.18)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(34, 34, canvas.width - 68, canvas.height - 68);
+    ctx.fillStyle = "rgba(201,155,75,.10)";
+    ctx.beginPath();
+    ctx.arc(1130, 110, 260, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawSharePill(ctx, text, x, y) {
+    ctx.font = "800 20px Inter, system-ui, sans-serif";
+    const width = Math.ceil(ctx.measureText(text).width + 34);
+    roundRect(ctx, x, y - 28, width, 44, 22);
+    ctx.fillStyle = "rgba(240,201,119,.18)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(240,201,119,.36)";
+    ctx.stroke();
+    ctx.fillStyle = "#f0c977";
+    ctx.fillText(text, x + 17, y);
+  }
+
+  async function drawShareChain(ctx, chain) {
+    const nodes = chain.path;
+    const startX = 110;
+    const endX = 1290;
+    const y = 410;
+    const step = nodes.length > 1 ? (endX - startX) / (nodes.length - 1) : 0;
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = "rgba(240,201,119,.52)";
+    ctx.beginPath();
+    nodes.forEach((_, index) => {
+      const x = startX + step * index;
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    for (let i = 0; i < nodes.length; i++) {
+      const username = nodes[i];
+      const x = startX + step * i;
+      await drawShareNode(ctx, username, x, y);
+    }
+  }
+
+  async function drawShareNode(ctx, username, x, y) {
+    ctx.save();
+    ctx.fillStyle = "#0d100e";
+    ctx.strokeStyle = "#f0c977";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(x, y, 48, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    const img = await loadDrawableImage(avatarOf(username));
+    if (img) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(x, y, 42, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.drawImage(img, x - 42, y - 42, 84, 84);
+      ctx.restore();
+    } else {
+      ctx.fillStyle = "#f0c977";
+      ctx.font = "900 38px Inter, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText((nameOf(username)[0] || "?").toUpperCase(), x, y + 1);
+    }
+    ctx.fillStyle = "#f6efe2";
+    ctx.font = "800 20px Inter, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(compactGraphLabel(nameOf(username), 14), x, y + 82);
+    ctx.restore();
+  }
+
+  function loadDrawableImage(src) {
+    return new Promise((resolve) => {
+      if (!src) return resolve(null);
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.referrerPolicy = "no-referrer";
+      img.onload = () => resolve(img);
+      img.onerror = () => resolve(null);
+      img.src = src;
+      setTimeout(() => resolve(null), 1800);
+    });
+  }
+
+  function roundRect(ctx, x, y, width, height, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.arcTo(x + width, y, x + width, y + height, radius);
+    ctx.arcTo(x + width, y + height, x, y + height, radius);
+    ctx.arcTo(x, y + height, x, y, radius);
+    ctx.arcTo(x, y, x + width, y, radius);
+    ctx.closePath();
   }
 
   async function createShortShareUrl(chain) {
@@ -777,6 +961,8 @@
       durationMs: Number.isFinite(detail.durationMs) ? detail.durationMs : null,
       requests: Number.isFinite(detail.requests) ? detail.requests : null,
       cached: Number.isFinite(detail.cached) ? detail.cached : null,
+      error: detail.error || "",
+      quality: detail.quality || null,
     };
     fetch(`${remoteBase}/analytics/event`, {
       method: "POST",
@@ -811,8 +997,13 @@
       url.searchParams.set("limit", OWNER_ANALYTICS_LIMIT);
       const outcome = String($("#owner-filter-outcome")?.value || "").trim();
       const username = String($("#owner-filter-username")?.value || "").trim();
+      const target = cleanUsernameInput($("#owner-filter-target")?.value || "");
+      const range = String($("#owner-filter-range")?.value || "").trim();
       if (outcome) url.searchParams.set("outcome", outcome);
       if (username) url.searchParams.set("username", username);
+      if (target) url.searchParams.set("target", target);
+      const from = ownerRangeStart(range);
+      if (from) url.searchParams.set("from", from);
       const res = await fetch(url.toString(), {
         headers: {
           "Accept": "application/json",
@@ -868,7 +1059,12 @@
     const duration = Number.isFinite(event.durationMs) ? `${(event.durationMs / 1000).toFixed(event.durationMs < 10000 ? 1 : 0)}s` : "";
     const requests = Number.isFinite(event.requests) ? `${event.requests} requests` : "";
     const cached = Number.isFinite(event.cached) ? `${event.cached} reused` : "";
-    const stats = [duration, requests, cached].filter(Boolean).join(" · ");
+    const cacheRate = Number.isFinite(event.requests) || Number.isFinite(event.cached)
+      ? `${cacheHitRate(event)} cache hit`
+      : "";
+    const quality = event.quality?.label ? `${event.quality.label} ${event.quality.score}` : "";
+    const stats = [duration, requests, cached, cacheRate, quality].filter(Boolean).join(" · ");
+    const error = event.error ? `<div class="owner-event__chain">${esc(event.error)}</div>` : "";
     return `
       <div class="owner-event">
         <div class="owner-event__top">
@@ -880,8 +1076,25 @@
           <span>${esc(place)}</span>
         </div>
         ${path}
+        ${error}
       </div>
     `;
+  }
+
+  function ownerRangeStart(range) {
+    const now = Date.now();
+    if (range === "24h") return now - 24 * 60 * 60 * 1000;
+    if (range === "7d") return now - 7 * 24 * 60 * 60 * 1000;
+    if (range === "30d") return now - 30 * 24 * 60 * 60 * 1000;
+    return null;
+  }
+
+  function cacheHitRate(event) {
+    const requests = Number(event.requests || 0);
+    const cached = Number(event.cached || 0);
+    const total = requests + cached;
+    if (!total) return "0%";
+    return `${Math.round((cached / total) * 100)}%`;
   }
 
   function statusText(value) {
@@ -925,6 +1138,16 @@
   }
 
   function parseSearchMode(range) {
+    if (range === "auto") {
+      return {
+        key: "auto",
+        archiveLimit: 6,
+        bridgeLimit: 2,
+        label: "automatic search",
+        crawlLabel: "automatic recent search",
+        instantOnly: false,
+      };
+    }
     if (range === "instant") {
       return {
         key: "instant",
@@ -1305,7 +1528,8 @@
       body.appendChild(line);
       const sub = document.createElement("div");
       sub.className = "card__sub";
-      sub.textContent = `link ${i + 1} of ${chain.hops.length}`;
+      const details = proofDetails(hop, i, chain.hops.length);
+      sub.innerHTML = details.map(esc).join(" · ");
       body.appendChild(sub);
 
       const proof = document.createElement("a");
@@ -1331,6 +1555,26 @@
       });
     }, { threshold: 0.15 });
     wrap.querySelectorAll(".card").forEach((c) => io.observe(c));
+    requestAnimationFrame(() => {
+      wrap.querySelectorAll(".card").forEach((card, index) => {
+        setTimeout(() => card.classList.add("in"), index * 80);
+      });
+    });
+  }
+
+  function proofDetails(hop, index, total) {
+    const details = [`link ${index + 1} of ${total}`];
+    if (hop.timeClass) details.push(hop.timeClass);
+    if (Number.isFinite(hop.endTime)) details.push(proofDate(hop.endTime));
+    if (hop.color) details.push(`${hop.color} win`);
+    if (hop.opening) details.push(compactGraphLabel(String(hop.opening).replace(/^https?:\/\/www\.chess\.com\/openings\//, ""), 42));
+    return details;
+  }
+
+  function proofDate(seconds) {
+    const date = new Date(seconds * 1000);
+    if (!Number.isFinite(date.getTime())) return "";
+    return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   }
 
   function avatarEl(username) {
@@ -1362,6 +1606,68 @@
     fb.dataset.profileTrigger = "";
     fb.tabIndex = 0;
     return fb;
+  }
+
+  async function openGraphExplorer(username) {
+    const key = cleanUsernameInput(username);
+    const panel = $("#graph-explorer");
+    if (!panel || !key || !state.currentChain?.found) return;
+    const profile = await fetchProfile(key).catch(() => state.players?.[key] || { username: key });
+    const neighbors = chainNeighbors(key);
+    const avatar = profile?.avatar
+      ? `<img src="${esc(profile.avatar)}" alt="${esc(nameOf(key))} profile photo" referrerpolicy="no-referrer">`
+      : esc((nameOf(key)[0] || "?").toUpperCase());
+    panel.hidden = false;
+    panel.innerHTML = `
+      <div class="graph-explorer__head">
+        <button class="graph-explorer__avatar" type="button" data-profile-trigger data-profile-user="${esc(key)}">${avatar}</button>
+        <div>
+          <h3>${esc(nameOf(key))}</h3>
+          <p>${esc(explorerProfileLine(profile, neighbors.length))}</p>
+        </div>
+        <button class="graph-explorer__close" type="button" data-explorer-close aria-label="Close explorer">Close</button>
+      </div>
+      <div class="graph-explorer__list">
+        ${neighbors.length ? neighbors.map(explorerNeighborRow).join("") : `<div class="graph-explorer__row"><strong>No proof neighbors in this chain.</strong><small>Try a longer route.</small></div>`}
+      </div>
+    `;
+  }
+
+  function chainNeighbors(username) {
+    const hops = state.currentChain?.hops || [];
+    return hops
+      .filter((hop) => hop.from === username || hop.to === username)
+      .map((hop) => {
+        const other = hop.from === username ? hop.to : hop.from;
+        return {
+          other,
+          direction: hop.from === username ? "beat" : "lost to",
+          hop,
+        };
+      });
+  }
+
+  function explorerNeighborRow(item) {
+    const details = proofDetails(item.hop, 0, 1).slice(1).join(" · ");
+    return `
+      <div class="graph-explorer__row">
+        <button type="button" data-profile-trigger data-profile-user="${esc(item.other)}">
+          <strong>${esc(item.direction)} ${esc(nameOf(item.other))}</strong>
+          <small>${esc(details || "proof game")}</small>
+        </button>
+        <a class="card__proof" href="${esc(item.hop.url)}" target="_blank" rel="noopener">Open game</a>
+      </div>
+    `;
+  }
+
+  function explorerProfileLine(profile, neighborCount) {
+    const parts = [];
+    if (profile?.title) parts.push(profile.title);
+    if (profile?.stats?.rapid?.rating) parts.push(`Rapid ${Number(profile.stats.rapid.rating).toLocaleString()}`);
+    if (profile?.stats?.blitz?.rating) parts.push(`Blitz ${Number(profile.stats.blitz.rating).toLocaleString()}`);
+    if (profile?.stats?.bullet?.rating) parts.push(`Bullet ${Number(profile.stats.bullet.rating).toLocaleString()}`);
+    parts.push(`${neighborCount} proof neighbor${neighborCount === 1 ? "" : "s"}`);
+    return parts.join(" · ");
   }
 
   async function fetchProfile(username) {
@@ -1596,11 +1902,13 @@
       const job = data.job;
       if (!job?.id) throw new Error("job start failed");
       saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId });
+      renderSearchQueue(job);
       let showedInstantChain = false;
       let instantChainKey = "";
       if (job.chain?.found) {
         if (["found", "not_found", "timeout", "failed"].includes(job.status)) {
           clearActiveJob(job.id);
+          finishSearchQueue(job);
           await applyServerChain(job, analyticsBase);
           return true;
         }
@@ -1620,6 +1928,7 @@
           .then(async (finished) => {
             clearActiveJob(job.id);
             if (state.activeSearchId !== analyticsBase.searchId) return;
+            finishSearchQueue(finished);
             if (finished?.chain?.found) {
               const finalChainKey = chainKey(finished.chain.path || []);
               await applyServerChain(finished, analyticsBase, {
@@ -1638,6 +1947,7 @@
       }
       const finished = await pollServerSearchJob(job.id, { analyticsBase, logLine });
       clearActiveJob(job.id);
+      finishSearchQueue(finished);
       if (finished?.chain?.found) {
         const finalChainKey = chainKey(finished.chain.path || []);
         await applyServerChain(finished, analyticsBase, {
@@ -1661,6 +1971,7 @@
           durationMs: finished?.durationMs,
           requests: finished?.stats?.requests,
           cached: finished?.stats?.cached,
+          error: finished?.error || finished?.progress || "",
         });
       }
       return true;
@@ -1703,12 +2014,60 @@
     const status = $("#search-status");
     if (!status || !job) return;
     const stats = job.stats || {};
+    renderSearchQueue(job);
     status.hidden = false;
     status.className = "search__status is-working";
     status.innerHTML =
       `<span class="spinner"></span>${esc(job.progress || "searching...")}` +
       `<span class="counters">checked <b>${Number(stats.expanded || 0)}</b> players · ` +
       `${Number(stats.requests || 0)} requests · ${Number(stats.cached || 0)} reused</span>`;
+  }
+
+  function renderSearchQueue(job, resumed = false) {
+    const panel = $("#search-queue");
+    if (!panel || !job) return;
+    const stats = job.stats || {};
+    const created = Number(job.createdAt || Date.now());
+    panel.hidden = false;
+    panel.classList.remove("is-complete");
+    $("#queue-state").textContent = resumed ? "Resumed" : statusText(job.status || "running");
+    $("#queue-job").textContent = compactJobId(job.id);
+    $("#queue-checked").textContent = Number(stats.expanded || 0).toLocaleString();
+    $("#queue-requests").textContent = Number(stats.requests || 0).toLocaleString();
+    $("#queue-cached").textContent = Number(stats.cached || 0).toLocaleString();
+    $("#queue-elapsed").textContent = elapsedText(created);
+    $("#queue-message").textContent = job.progress || "Search is running.";
+    clearInterval(state.queueTimer);
+    if (["queued", "running"].includes(job.status)) {
+      state.queueTimer = setInterval(() => {
+        const elapsed = $("#queue-elapsed");
+        if (elapsed) elapsed.textContent = elapsedText(created);
+      }, 1000);
+    }
+  }
+
+  function finishSearchQueue(job) {
+    const panel = $("#search-queue");
+    if (!panel) return;
+    clearInterval(state.queueTimer);
+    state.queueTimer = null;
+    if (job) {
+      renderSearchQueue(job);
+      $("#queue-state").textContent = statusText(job.status || "done");
+      $("#queue-message").textContent = job.progress || "Search complete.";
+      panel.classList.add("is-complete");
+    }
+  }
+
+  function compactJobId(id) {
+    const text = String(id || "");
+    return text.length > 16 ? `${text.slice(0, 8)}…${text.slice(-5)}` : text || "—";
+  }
+
+  function elapsedText(startMs) {
+    const seconds = Math.max(0, Math.round((Date.now() - startMs) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
   }
 
   async function applyServerChain(job, analyticsBase, options = {}) {
@@ -1754,6 +2113,7 @@
       durationMs: job.durationMs,
       requests: job.stats?.requests,
       cached: job.stats?.cached,
+      quality: qualityFromChain(chain),
     });
     if (scroll) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
   }
@@ -1789,6 +2149,13 @@
     $("#search-start").value = record.start || $("#search-start").value;
     $("#search-target").value = record.target || $("#search-target").value;
     showStatus("working", "resuming search...");
+    renderSearchQueue({
+      id: record.id,
+      status: "running",
+      progress: "Resuming saved backend job.",
+      createdAt: record.ts,
+      stats: { expanded: 0, requests: 0, cached: 0 },
+    }, true);
     try {
       const job = await pollServerSearchJob(record.id, {
         analyticsBase: {
@@ -1800,6 +2167,7 @@
         },
       });
       clearActiveJob(record.id);
+      finishSearchQueue(job);
       if (job?.chain?.found) {
         await applyServerChain(job, {
           searchId: record.searchId || record.id,
@@ -2314,6 +2682,12 @@
     if (svg.querySelector(".node") && traveller) animateGraph(svg, traveller, spark);
   });
   $("#copy-share")?.addEventListener("click", copyShareLink);
+  $("#save-share-image")?.addEventListener("click", saveShareImage);
+  $("#graph")?.addEventListener("click", (event) => {
+    const node = event.target.closest(".node[data-profile-user]");
+    if (!node) return;
+    openGraphExplorer(node.dataset.profileUser);
+  });
 
   $("#search-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -2410,6 +2784,11 @@
       state.suggest.focused = false;
       hideUsernameSuggest();
     }
+    if (event.target.closest("[data-explorer-close]")) {
+      const panel = $("#graph-explorer");
+      if (panel) panel.hidden = true;
+      return;
+    }
     const target = event.target.closest("[data-profile-trigger][data-profile-user]");
     if (target) {
       hideUsernameSuggest();
@@ -2433,15 +2812,9 @@
     const saved = localStorage.getItem(LS_KEY);
     if (saved) $("#search-start").value = saved;
     localStorage.removeItem(LEGACY_DEPTH_KEY);
-    const migratedRange = localStorage.getItem(LS_RANGE_MIGRATION_KEY);
-    const savedRange = migratedRange ? localStorage.getItem(LS_RANGE_KEY) : "instant";
-    if (savedRange && $("#search-range").querySelector(`option[value="${savedRange}"]`)) {
-      $("#search-range").value = savedRange;
-    }
-    if (!migratedRange) {
-      localStorage.setItem(LS_RANGE_KEY, "instant");
-      localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
-    }
+    localStorage.setItem(LS_RANGE_KEY, "auto");
+    localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
+    $("#search-range").value = "auto";
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
     if (!introComplete()) openIntroGate();
     warmSharedCaches();

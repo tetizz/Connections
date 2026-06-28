@@ -307,6 +307,12 @@ async function handleSearchStart(request, env, ctx) {
 
   const storedPair = await readPairChain(env, start, target, range);
   const exactFastLanePair = storedPair ? null : await readExactFastLanePair(env, start, target, range);
+  const analyticsPair = storedPair || exactFastLanePair
+    ? null
+    : await readExactAnalyticsPair(env, start, target, range);
+  const cachedFastLanePair = storedPair || exactFastLanePair || analyticsPair
+    ? null
+    : await readCachedFastLanePair(env, start, target, range);
   const requestPair = pairChainShape({
     start,
     target,
@@ -316,7 +322,7 @@ async function handleSearchStart(request, env, ctx) {
     savedAt: Date.now(),
     checkedAt: null,
   }, start, target, range);
-  const cachedPair = storedPair || exactFastLanePair || requestPair;
+  const cachedPair = storedPair || exactFastLanePair || analyticsPair || cachedFastLanePair || requestPair;
   if (!storedPair && exactFastLanePair) {
     await writePairChain(env, {
       id,
@@ -327,6 +333,58 @@ async function handleSearchStart(request, env, ctx) {
       chain: exactFastLanePair.chain,
       players: exactFastLanePair.players || {},
       stats: { fetched: 0, requests: 0, cached: 1, expanded: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
+  if (!storedPair && !exactFastLanePair && cachedFastLanePair) {
+    await writePairChain(env, {
+      id,
+      start,
+      target,
+      range,
+      status: "found",
+      chain: cachedFastLanePair.chain,
+      players: cachedFastLanePair.players || {},
+      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    await writeFastLaneFragments(env, {
+      id,
+      start,
+      target,
+      range,
+      status: "found",
+      chain: cachedFastLanePair.chain,
+      players: cachedFastLanePair.players || {},
+      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
+  if (!storedPair && !exactFastLanePair && analyticsPair) {
+    await writePairChain(env, {
+      id,
+      start,
+      target,
+      range,
+      status: "found",
+      chain: analyticsPair.chain,
+      players: analyticsPair.players || {},
+      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    await writeFastLaneFragments(env, {
+      id,
+      start,
+      target,
+      range,
+      status: "found",
+      chain: analyticsPair.chain,
+      players: analyticsPair.players || {},
+      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -1037,6 +1095,20 @@ async function verifyPathHops(env, path, archiveLimit, stats = null, options = {
   return hops.every(Boolean) ? cleanHopList(hops) : null;
 }
 
+async function verifyPathHopsFromCache(env, path) {
+  const cleanPath = Array.isArray(path) ? path.map(cleanUsername).filter(Boolean).slice(0, 12) : [];
+  if (cleanPath.length < 2 || new Set(cleanPath).size !== cleanPath.length) return null;
+  const hops = await runThrottled(cleanPath.slice(0, -1).map((from, index) => async () => {
+    const to = cleanPath[index + 1];
+    try {
+      return await findCachedHop(env, from, to);
+    } catch {
+      return null;
+    }
+  }), 3);
+  return hops.every(Boolean) ? cleanHopList(hops) : null;
+}
+
 async function findDeepHop(env, from, to, stats = null) {
   for (const username of [from, to]) {
     try {
@@ -1179,6 +1251,16 @@ async function readOrFetchGames(env, parsed, stats = null) {
     }
     throw error;
   }
+}
+
+async function readCachedGames(env, parsed, stats = null) {
+  const key = cacheKeyFromParsed(parsed);
+  const kvKey = `games:${key}`;
+  const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
+  const cachedGames = Array.isArray(cached?.games) ? cached.games : null;
+  if (!cachedGames) return null;
+  if (stats) stats.cached = Number(stats.cached || 0) + 1;
+  return cachedGames;
 }
 
 function cacheKeyFromParsed(parsed) {
@@ -1914,6 +1996,120 @@ async function readExactFastLanePair(env, start, target, range) {
     savedAt: exact.savedAt || Date.now(),
     checkedAt: Date.now(),
   }, cleanStart, cleanTarget, range);
+}
+
+async function readExactAnalyticsPair(env, start, target, range) {
+  const cleanStart = cleanUsername(start);
+  const cleanTarget = cleanUsername(target);
+  if (!cleanStart || !cleanTarget || cleanStart === cleanTarget) return null;
+  const events = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
+  const candidates = events
+    .filter((event) =>
+      ["found", "saved"].includes(event.outcome) &&
+      event.start === cleanStart &&
+      event.target === cleanTarget &&
+      Array.isArray(event.path) &&
+      event.path.length >= 2)
+    .sort((a, b) => (a.path.length - b.path.length) || b.ts - a.ts)
+    .slice(0, 3);
+  for (const event of candidates) {
+    const path = normalizePath(cleanStart, cleanTarget, event.path);
+    const hops = await verifyPathHopsFromCache(env, path);
+    if (hops?.length !== path.length - 1) continue;
+    const chain = {
+      target: cleanTarget,
+      display: cleanTarget,
+      found: true,
+      length: Math.max(0, path.length - 1),
+      path,
+      hops,
+      quality: event.quality || routeQuality({ path, hops }, { cached: 2, requests: 0, expanded: 0 }, "saved"),
+    };
+    return pairChainShape({
+      start: cleanStart,
+      target: cleanTarget,
+      range,
+      chain,
+      players: {},
+      savedAt: event.ts || Date.now(),
+      checkedAt: Date.now(),
+    }, cleanStart, cleanTarget, range);
+  }
+  return null;
+}
+
+async function readCachedFastLanePair(env, start, target, range) {
+  const cleanStart = cleanUsername(start);
+  const cleanTarget = cleanUsername(target);
+  if (!cleanStart || !cleanTarget || cleanStart === cleanTarget) return null;
+  const archiveLimit = Math.min(6, archiveLimitForRange(range) || 6);
+  const stats = { cached: 0, requests: 0, expanded: 0 };
+  const startGames = await readCachedGames(env, { username: cleanStart, archiveLimit }, stats);
+  if (!startGames) return null;
+  const edges = edgesFromGames(cleanStart, startGames);
+  const directUrls = edges.beatenByMe.get(cleanTarget);
+  if (directUrls?.length) {
+    const hops = await enrichHopsFromGames([
+      { from: cleanStart, to: cleanTarget, url: directUrls[0] },
+    ], startGames);
+    return cachedFastLanePairShape({
+      start: cleanStart,
+      target: cleanTarget,
+      range,
+      source: "direct-cached-win",
+      path: [cleanStart, cleanTarget],
+      hops,
+      savedAt: Date.now(),
+    });
+  }
+
+  const fragments = await readFastLaneFragments(env, cleanTarget, range);
+  let best = null;
+  for (const fragment of fragments) {
+    const connector = fragment.path?.[0];
+    if (!connector || connector === cleanStart || connector === cleanTarget) continue;
+    const urls = edges.beatenByMe.get(connector);
+    if (!urls?.length) continue;
+    const firstHop = (await enrichHopsFromGames([
+      { from: cleanStart, to: connector, url: urls[0] },
+    ], startGames))[0];
+    const tailHops = cleanHopList(fragment.hops);
+    const path = [cleanStart, ...fragment.path];
+    const hops = [firstHop, ...tailHops];
+    if (new Set(path).size !== path.length || hops.length !== path.length - 1) continue;
+    const candidate = {
+      start: cleanStart,
+      target: cleanTarget,
+      range,
+      source: "cached-fast-lane",
+      path,
+      hops,
+      savedAt: Math.max(Number(fragment.savedAt) || 0, Date.now()),
+    };
+    if (!best || candidate.path.length < best.path.length) best = candidate;
+  }
+  return best ? cachedFastLanePairShape(best) : null;
+}
+
+function cachedFastLanePairShape({ start, target, range, source, path, hops, savedAt }) {
+  const chain = {
+    target,
+    display: target,
+    found: true,
+    length: Math.max(0, path.length - 1),
+    path,
+    hops: cleanHopList(hops),
+    quality: routeQuality({ path, hops }, { cached: 2, requests: 0, expanded: 0 }, source),
+  };
+  return pairChainShape({
+    start,
+    target,
+    range,
+    chain,
+    players: {},
+    savedAt: savedAt || Date.now(),
+    checkedAt: Date.now(),
+  }, start, target, range);
 }
 
 async function readFastLaneFragmentsForKey(env, key) {

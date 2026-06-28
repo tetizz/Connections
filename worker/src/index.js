@@ -36,6 +36,10 @@ const SEARCH_BACKGROUND_TIME_MS = 26000;
 const SEARCH_LEASE_MS = 15000;
 const SEARCH_VISITED_LIMIT = 12000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 3000;
+const CACHED_SHORTER_CHECK_REQUESTS = 0;
+const CACHED_SHORTER_CHECK_EXPANSIONS = 12;
+const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 12;
+const CACHED_SHORTER_CHECK_TIME_MS = 2500;
 const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const SHARE_ID_LENGTH = 8;
@@ -307,17 +311,6 @@ async function handleSearchStart(request, env, ctx) {
     return json({ ok: true, job: publicSearchJob(existing), reused: true }, 200, "no-store");
   }
 
-  const storedPair = await readPairChain(env, start, target, range);
-  const exactFastLanePair = storedPair ? null : await readExactFastLanePair(env, start, target, range);
-  const analyticsPair = storedPair || exactFastLanePair
-    ? null
-    : await readExactAnalyticsPair(env, start, target, range);
-  const startLanePair = storedPair || exactFastLanePair || analyticsPair
-    ? null
-    : await readStartLanePair(env, start, target, range);
-  const cachedFastLanePair = storedPair || exactFastLanePair || analyticsPair || startLanePair
-    ? null
-    : await readCachedFastLanePair(env, start, target, range);
   const requestPair = pairChainShape({
     start,
     target,
@@ -327,113 +320,53 @@ async function handleSearchStart(request, env, ctx) {
     savedAt: Date.now(),
     checkedAt: null,
   }, start, target, range);
+
+  const storedPair = await readPairChain(env, start, target, range);
+  let exactFastLanePair = null;
+  let analyticsPair = null;
+  let startLanePair = null;
+  let cachedFastLanePair = null;
+  if (!storedPair) {
+    const [
+      exactFastLanePairResult,
+      analyticsPairResult,
+      startLanePairResult,
+      cachedFastLanePairResult,
+    ] = await Promise.allSettled([
+      readExactFastLanePair(env, start, target, range),
+      readExactAnalyticsPair(env, start, target, range),
+      readStartLanePair(env, start, target, range),
+      readCachedFastLanePair(env, start, target, range),
+    ]);
+    exactFastLanePair = settledValue(exactFastLanePairResult);
+    analyticsPair = exactFastLanePair ? null : settledValue(analyticsPairResult);
+    startLanePair = exactFastLanePair || analyticsPair ? null : settledValue(startLanePairResult);
+    cachedFastLanePair = exactFastLanePair || analyticsPair || startLanePair
+      ? null
+      : settledValue(cachedFastLanePairResult);
+  }
   const cachedPair = storedPair || exactFastLanePair || analyticsPair || startLanePair || cachedFastLanePair || requestPair;
-  if (!storedPair && exactFastLanePair) {
-    await writePairChain(env, {
-      id,
+  const promoteCachedPair = promoteStartupCachedPairs(env, {
+    id,
+    start,
+    target,
+    range,
+    storedPair,
+    exactFastLanePair,
+    analyticsPair,
+    startLanePair,
+    cachedFastLanePair,
+    requestPair,
+  }).catch((error) => {
+    console.warn(JSON.stringify({
+      event: "startup_pair_promotion_failed",
       start,
       target,
-      range,
-      status: "found",
-      chain: exactFastLanePair.chain,
-      players: exactFastLanePair.players || {},
-      stats: { fetched: 0, requests: 0, cached: 1, expanded: 0 },
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-  }
-  if (!storedPair && !exactFastLanePair && !analyticsPair && startLanePair) {
-    await writePairChain(env, {
-      id,
-      start,
-      target,
-      range,
-      status: "found",
-      chain: startLanePair.chain,
-      players: startLanePair.players || {},
-      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-    await writeFastLaneFragments(env, {
-      id,
-      start,
-      target,
-      range,
-      status: "found",
-      chain: startLanePair.chain,
-      players: startLanePair.players || {},
-      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-  }
-  if (!storedPair && !exactFastLanePair && !analyticsPair && !startLanePair && cachedFastLanePair) {
-    await writePairChain(env, {
-      id,
-      start,
-      target,
-      range,
-      status: "found",
-      chain: cachedFastLanePair.chain,
-      players: cachedFastLanePair.players || {},
-      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-    await writeFastLaneFragments(env, {
-      id,
-      start,
-      target,
-      range,
-      status: "found",
-      chain: cachedFastLanePair.chain,
-      players: cachedFastLanePair.players || {},
-      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-  }
-  if (!storedPair && !exactFastLanePair && analyticsPair) {
-    await writePairChain(env, {
-      id,
-      start,
-      target,
-      range,
-      status: "found",
-      chain: analyticsPair.chain,
-      players: analyticsPair.players || {},
-      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-    await writeFastLaneFragments(env, {
-      id,
-      start,
-      target,
-      range,
-      status: "found",
-      chain: analyticsPair.chain,
-      players: analyticsPair.players || {},
-      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-  }
-  if (!storedPair && requestPair) {
-    await writePairChain(env, {
-      id,
-      start,
-      target,
-      range,
-      status: "found",
-      chain: requestPair.chain,
-      players: requestPair.players || {},
-      stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-  }
+      message: error?.message || String(error),
+    }));
+  });
+  if (ctx?.waitUntil) ctx.waitUntil(promoteCachedPair);
+  else await promoteCachedPair;
   if (!cachedPair) {
     const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
     if (submitWindow.count >= MAX_SEARCH_JOBS_PER_WINDOW) {
@@ -467,7 +400,7 @@ async function handleSearchStart(request, env, ctx) {
     updatedAt: Date.now(),
   });
   await writeSearchJob(env, job);
-  if (ctx?.waitUntil) {
+  if (ctx?.waitUntil && !cachedPair) {
     ctx.waitUntil(runSearchJob(env, job).catch((error) => {
       console.warn(JSON.stringify({
         event: "search_start_background_failed",
@@ -482,15 +415,58 @@ async function handleSearchStart(request, env, ctx) {
   return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
 }
 
+function settledValue(result) {
+  return result?.status === "fulfilled" ? result.value : null;
+}
+
+async function promoteStartupCachedPairs(env, pairs) {
+  const { id, start, target, range, storedPair, exactFastLanePair, analyticsPair, startLanePair, cachedFastLanePair, requestPair } = pairs;
+  if (storedPair) return;
+  if (exactFastLanePair) {
+    await writeStartupPair(env, { id, start, target, range, pair: exactFastLanePair, cached: 1 });
+  }
+  if (!exactFastLanePair && !analyticsPair && startLanePair) {
+    await writeStartupPair(env, { id, start, target, range, pair: startLanePair, cached: 2, fragments: true });
+  }
+  if (!exactFastLanePair && !analyticsPair && !startLanePair && cachedFastLanePair) {
+    await writeStartupPair(env, { id, start, target, range, pair: cachedFastLanePair, cached: 2, fragments: true });
+  }
+  if (!exactFastLanePair && analyticsPair) {
+    await writeStartupPair(env, { id, start, target, range, pair: analyticsPair, cached: 2, fragments: true });
+  }
+  if (requestPair) {
+    await writeStartupPair(env, { id, start, target, range, pair: requestPair, cached: 0 });
+  }
+}
+
+async function writeStartupPair(env, { id, start, target, range, pair, cached = 0, fragments = false }) {
+  if (!pair?.chain?.found) return;
+  const job = {
+    id,
+    start,
+    target,
+    range,
+    status: "found",
+    chain: pair.chain,
+    players: pair.players || {},
+    stats: { fetched: 0, requests: 0, cached, expanded: 0 },
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  await writePairChain(env, job);
+  if (fragments) await writeFastLaneFragments(env, job);
+}
+
 async function handleSearchJob(url, env) {
   const id = cleanAnalyticsId(url.searchParams.get("id"));
   if (!id) return json({ error: "missing id" }, 400, "no-store");
   let job = await readSearchJob(env, id);
   if (!job) return json({ error: "job not found" }, 404, "no-store");
   if (isActiveSearchStatus(job.status) && Date.now() >= Number(job.processingUntil || 0)) {
+    const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
     job = await runSearchJobChunk(env, id, {
-      expansionBudget: SEARCH_CHUNK_EXPANSIONS,
-      timeBudgetMs: SEARCH_CHUNK_TIME_MS,
+      expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
+      timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
     }) || await readSearchJob(env, id) || job;
   }
   return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
@@ -562,18 +538,20 @@ async function runSearchJobChunk(env, id, options = {}) {
         const cachedChain = job.chain?.found ? job.chain : null;
         const fastLaneIsShorter = !cachedChain || chainStepCount(fastLane.chain) < chainStepCount(cachedChain);
         if (!fastLaneIsShorter) {
-          await completeSearchJob(env, job, {
-            status: "found",
-            outcome: "found",
-            progress: "Saved connection is still the best route found.",
-            chain: cachedChain,
-            players: job.players || {},
-            stats,
-            search,
-            processingUntil: 0,
-            durationMs: Date.now() - startedAt,
-          });
-          return readSearchJob(env, id);
+          if (!shouldRunShorterBfs(job)) {
+            await completeSearchJob(env, job, {
+              status: "found",
+              outcome: "found",
+              progress: "Saved connection is still the best route found.",
+              chain: cachedChain,
+              players: job.players || {},
+              stats,
+              search,
+              processingUntil: 0,
+              durationMs: Date.now() - startedAt,
+            });
+            return readSearchJob(env, id);
+          }
         } else {
         const players = {};
         await runThrottled(fastLane.chain.path.map((username) => async () => {
@@ -607,6 +585,34 @@ async function runSearchJobChunk(env, id, options = {}) {
         }
       }
       if (job.chain?.found) {
+        if (!shouldRunShorterBfs(job)) {
+          await completeSearchJob(env, job, {
+            status: "found",
+            outcome: "found",
+            progress: "Saved connection is still the best route found.",
+            chain: job.chain,
+            players: job.players || {},
+            stats,
+            search,
+            processingUntil: 0,
+            durationMs: Date.now() - startedAt,
+          });
+          return readSearchJob(env, id);
+        }
+        await progress("Saved route loaded. Searching wider graph for a shorter route.", { search });
+      } else {
+        await progress("Fast lanes checked. Searching wider graph.", { search });
+      }
+    }
+
+    const result = await advanceServerSearch(env, job, search, stats, progress, {
+      expansionBudget,
+      timeBudgetMs,
+      chunkStartedAt,
+    });
+
+    if (result?.status === "running") {
+      if (job.chain?.found && job.refreshCached && Number(stats.expanded || 0) >= CACHED_SHORTER_CHECK_EXPANSIONS) {
         await completeSearchJob(env, job, {
           status: "found",
           outcome: "found",
@@ -620,16 +626,6 @@ async function runSearchJobChunk(env, id, options = {}) {
         });
         return readSearchJob(env, id);
       }
-      await progress("Fast lanes checked. Searching wider graph.", { search });
-    }
-
-    const result = await advanceServerSearch(env, job, search, stats, progress, {
-      expansionBudget,
-      timeBudgetMs,
-      chunkStartedAt,
-    });
-
-    if (result?.status === "running") {
       return updateSearchJob(env, id, {
         status: "running",
         progress: result.progress,
@@ -724,6 +720,12 @@ async function runSearchJobChunk(env, id, options = {}) {
   }
 }
 
+function shouldRunShorterBfs(job) {
+  if (!job?.refreshCached || !job.chain?.found) return false;
+  const savedSteps = chainStepCount(job.chain);
+  return Number.isFinite(savedSteps) && savedSteps > 2;
+}
+
 async function advanceServerSearch(env, job, search, stats, progress, options = {}) {
   const archiveLimit = archiveLimitForRange(job.range);
   const expansionBudget = Math.max(1, Number(options.expansionBudget) || SEARCH_CHUNK_EXPANSIONS);
@@ -746,11 +748,17 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
   const getEdges = async (username) => {
     const key = username.toLowerCase();
     if (edgesCache.has(key)) return edgesCache.get(key);
-    const games = await readOrFetchGames(env, {
-      username: key,
-      archiveLimit,
-      forceFresh: freshUsers.has(key) || (job.refreshCached && (key === job.start || key === job.target)),
-    }, stats);
+    const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
+    const mayRefreshKnownRoute = cachedShorterCheck &&
+      Number(stats.requests || 0) < CACHED_SHORTER_CHECK_REQUESTS &&
+      (freshUsers.has(key) || key === job.start || key === job.target);
+    const games = cachedShorterCheck && !mayRefreshKnownRoute
+      ? (await readCachedGames(env, { username: key, archiveLimit }, stats) || [])
+      : await readOrFetchGames(env, {
+          username: key,
+          archiveLimit,
+          forceFresh: mayRefreshKnownRoute,
+        }, stats);
     const edges = edgesFromGames(key, games);
     edgesCache.set(key, edges);
     return edges;
@@ -1032,10 +1040,15 @@ async function tryFastLaneConnection(env, job, stats) {
     };
   }
 
-  const startGames = await readOrFetchGames(env, {
-    username: job.start,
-    archiveLimit: Math.min(6, archiveLimitForRange(job.range) || 6),
-  }, stats);
+  const startGames = job.chain?.found
+    ? (await readCachedGames(env, {
+        username: job.start,
+        archiveLimit: Math.min(6, archiveLimitForRange(job.range) || 6),
+      }, stats) || [])
+    : await readOrFetchGames(env, {
+        username: job.start,
+        archiveLimit: Math.min(6, archiveLimitForRange(job.range) || 6),
+      }, stats);
   const edges = edgesFromGames(job.start, startGames);
   const directUrls = edges.beatenByMe.get(job.target);
   if (directUrls?.length) {
@@ -2053,10 +2066,10 @@ async function writeFastLaneFragments(env, job) {
 async function readFastLaneFragments(env, target, range) {
   const cleanTarget = cleanUsername(target);
   const ranges = [...new Set([cleanRange(range) || "auto", "auto", "6", "instant"])];
-  const fragments = [];
-  for (const candidateRange of ranges) {
-    fragments.push(...await readFastLaneFragmentsForKey(env, fastLaneKey(cleanTarget, candidateRange)));
-  }
+  const fragmentsByRange = await Promise.all(ranges.map((candidateRange) =>
+    readFastLaneFragmentsForKey(env, fastLaneKey(cleanTarget, candidateRange)).catch(() => [])
+  ));
+  const fragments = fragmentsByRange.flat();
   const unique = new Map();
   for (const fragment of fragments) {
     if (!fragment || fragment.target !== cleanTarget) continue;
@@ -2112,10 +2125,10 @@ async function writeStartLaneFragments(env, job) {
 async function readStartLaneFragments(env, start, range) {
   const cleanStart = cleanUsername(start);
   const ranges = [...new Set([cleanRange(range) || "auto", "auto", "6", "instant"])];
-  const fragments = [];
-  for (const candidateRange of ranges) {
-    fragments.push(...await readStartLaneFragmentsForKey(env, startLaneKey(cleanStart, candidateRange)));
-  }
+  const fragmentsByRange = await Promise.all(ranges.map((candidateRange) =>
+    readStartLaneFragmentsForKey(env, startLaneKey(cleanStart, candidateRange)).catch(() => [])
+  ));
+  const fragments = fragmentsByRange.flat();
   const unique = new Map();
   for (const fragment of fragments) {
     if (!fragment || fragment.path?.[0] !== cleanStart) continue;
@@ -2695,6 +2708,7 @@ function searchJobAnalyticsEvent(job) {
     path: Array.isArray(shaped.chain?.path) ? shaped.chain.path : [],
     hops: cleanHopList(shaped.chain?.hops),
     durationMs: shaped.durationMs,
+    expanded: shaped.stats.expanded,
     requests: shaped.stats.requests,
     cached: shaped.stats.cached,
     error: shaped.error,
@@ -2751,6 +2765,7 @@ function analyticsEventShape(body, request) {
     hops: hops.length === path.length - 1 ? hops : [],
     jobId: cleanAnalyticsId(body?.jobId || body?.searchId || body?.id),
     durationMs: cleanNonNegativeNumber(body?.durationMs, 10 * 60 * 1000),
+    expanded: cleanNonNegativeNumber(body?.expanded, 100000),
     requests: cleanNonNegativeNumber(body?.requests, 100000),
     cached: cleanNonNegativeNumber(body?.cached, 100000),
     error: String(body?.error || "").slice(0, 240),
@@ -2787,6 +2802,7 @@ function normalizeAnalyticsEvents(events) {
         hops: hops.length === normalizedPath.length - 1 ? hops : [],
         jobId: cleanAnalyticsId(event.jobId) || "",
         durationMs: cleanNonNegativeNumber(event.durationMs, 10 * 60 * 1000),
+        expanded: cleanNonNegativeNumber(event.expanded, 100000),
         requests: cleanNonNegativeNumber(event.requests, 100000),
         cached: cleanNonNegativeNumber(event.cached, 100000),
         error: String(event.error || "").slice(0, 240),

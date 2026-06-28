@@ -948,6 +948,7 @@
       path: Array.isArray(detail.path) ? detail.path : [],
       hops: Array.isArray(detail.hops) ? detail.hops : [],
       durationMs: Number.isFinite(detail.durationMs) ? detail.durationMs : null,
+      expanded: Number.isFinite(detail.expanded) ? detail.expanded : null,
       requests: Number.isFinite(detail.requests) ? detail.requests : null,
       cached: Number.isFinite(detail.cached) ? detail.cached : null,
       error: detail.error || "",
@@ -980,7 +981,7 @@
 
     btn.disabled = true;
     status.hidden = false;
-    status.textContent = "Loading recent searches...";
+    status.textContent = "Loading owner debug settings...";
     try {
       const url = new URL(`${remoteBase}/analytics`);
       url.searchParams.set("limit", OWNER_ANALYTICS_LIMIT);
@@ -1009,7 +1010,7 @@
       if (filters) filters.hidden = false;
       status.hidden = false;
       const total = Number(data.total || 0);
-      status.textContent = `${plainNumber(total)} matching search${total === 1 ? "" : "es"}.`;
+      status.textContent = `${plainNumber(total)} matching event${total === 1 ? "" : "s"}.`;
     } catch (error) {
       wrap.hidden = true;
       if (filters) filters.hidden = true;
@@ -1026,16 +1027,46 @@
     const events = Array.isArray(data?.events) ? data.events : [];
     wrap.hidden = false;
     if (!events.length) {
-      wrap.innerHTML = `<div class="owner-summary"><span>No matching searches.</span></div>`;
+      wrap.innerHTML = `
+        <div class="owner-empty">
+          <strong>No matching events.</strong>
+          <span>Change the filters or run a search, then refresh this panel.</span>
+        </div>`;
       return;
     }
+    const summary = ownerSummary(events);
     wrap.innerHTML = `
       <div class="owner-summary">
-        <span>Last ${events.length} matching searches</span>
-        <span>${esc(new Date(data.generatedAt || Date.now()).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</span>
+        <div>
+          <span>Owner timeline</span>
+          <strong>${plainNumber(events.length)} matching event${events.length === 1 ? "" : "s"}</strong>
+        </div>
+        <span>Updated ${esc(new Date(data.generatedAt || Date.now()).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</span>
+      </div>
+      <div class="owner-metrics">
+        <span><strong>${plainNumber(summary.found)}</strong> found</span>
+        <span><strong>${plainNumber(summary.problem)}</strong> issues</span>
+        <span><strong>${summary.avgDuration}</strong> avg</span>
+        <span><strong>${summary.cacheRate}</strong> cache</span>
       </div>
       ${events.map(ownerEventRow).join("")}
     `;
+  }
+
+  function ownerSummary(events) {
+    const found = events.filter((event) => ["found", "saved"].includes(event.outcome)).length;
+    const problem = events.filter((event) => ["not_found", "timeout", "error", "failed"].includes(event.outcome)).length;
+    const durations = events.map((event) => Number(event.durationMs)).filter((value) => Number.isFinite(value) && value > 0);
+    const avgMs = durations.length ? durations.reduce((sum, value) => sum + value, 0) / durations.length : 0;
+    const requests = events.reduce((sum, event) => sum + Number(event.requests || 0), 0);
+    const cached = events.reduce((sum, event) => sum + Number(event.cached || 0), 0);
+    const cacheTotal = requests + cached;
+    return {
+      found,
+      problem,
+      avgDuration: avgMs ? `${(avgMs / 1000).toFixed(avgMs < 10000 ? 1 : 0)}s` : "0s",
+      cacheRate: cacheTotal ? `${Math.round((cached / cacheTotal) * 100)}%` : "0%",
+    };
   }
 
   function ownerEventRow(event) {
@@ -1043,16 +1074,17 @@
     const path = Array.isArray(event.path) && event.path.length > 1
       ? `<div class="owner-event__chain">${esc(event.path.join(" -> "))}</div>`
       : "";
-    const range = event.range ? String(event.range).replace(/_/g, " ") : "range n/a";
+    const range = event.range ? String(event.range).replace(/_/g, " ") : "auto";
     const place = [event.country, event.device].filter(Boolean).join(" · ") || "visitor";
     const when = Number.isFinite(event.ts) ? timeAgo(event.ts) : "just now";
     const duration = Number.isFinite(event.durationMs) ? `${(event.durationMs / 1000).toFixed(event.durationMs < 10000 ? 1 : 0)}s` : "";
+    const checked = Number.isFinite(event.expanded) ? `${event.expanded} checked` : "";
     const requests = Number.isFinite(event.requests) ? `${event.requests} requests` : "";
     const cached = Number.isFinite(event.cached) ? `${event.cached} reused` : "";
     const cacheRate = Number.isFinite(event.requests) || Number.isFinite(event.cached)
       ? `${cacheHitRate(event)} cache hit`
       : "";
-    const stats = [duration, requests, cached, cacheRate].filter(Boolean).join(" · ");
+    const stats = [duration, checked, requests, cached, cacheRate].filter(Boolean);
     const error = event.error ? `<div class="owner-event__chain">${esc(event.error)}</div>` : "";
     return `
       <div class="owner-event">
@@ -1061,9 +1093,10 @@
           <span class="owner-event__status is-${esc(outcome)}">${esc(statusText(event.outcome))}</span>
         </div>
         <div class="owner-event__meta">
-          <span>${esc(when)} · ${esc(range)}${stats ? ` · ${esc(stats)}` : ""}</span>
+          <span>${esc(when)} · ${esc(range)}</span>
           <span>${esc(place)}</span>
         </div>
+        ${stats.length ? `<div class="owner-event__stats">${stats.map((item) => `<span>${esc(item)}</span>`).join("")}</div>` : ""}
         ${path}
         ${error}
       </div>
@@ -1963,6 +1996,7 @@
           ...analyticsBase,
           jobId: finished?.id,
           durationMs: finished?.durationMs,
+          expanded: finished?.stats?.expanded,
           requests: finished?.stats?.requests,
           cached: finished?.stats?.cached,
           error: finished?.error || finished?.progress || "",
@@ -2106,6 +2140,7 @@
       path: chain.path || [],
       hops: chain.hops || [],
       durationMs: job.durationMs,
+      expanded: job.stats?.expanded,
       requests: job.stats?.requests,
       cached: job.stats?.cached,
       quality: qualityFromChain(chain),
@@ -2633,6 +2668,13 @@
     loadOwnerAnalytics();
   });
   $("#owner-filter-apply")?.addEventListener("click", () => {
+    loadOwnerAnalytics();
+  });
+  $("#owner-filter-reset")?.addEventListener("click", () => {
+    ["#owner-filter-outcome", "#owner-filter-username", "#owner-filter-target", "#owner-filter-range"].forEach((selector) => {
+      const field = $(selector);
+      if (field) field.value = "";
+    });
     loadOwnerAnalytics();
   });
 

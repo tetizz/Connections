@@ -31,6 +31,7 @@ const SEARCH_MAX_EXPANSIONS = 260;
 const SEARCH_FRONTIER_LIMIT = 200;
 const SEARCH_CHUNK_EXPANSIONS = 72;
 const SEARCH_CHUNK_TIME_MS = 8500;
+const SEARCH_EXPANSION_CONCURRENCY = 10;
 const SEARCH_BACKGROUND_TIME_MS = 26000;
 const SEARCH_LEASE_MS = 15000;
 const SEARCH_VISITED_LIMIT = 12000;
@@ -48,6 +49,7 @@ const WARM_ROUTE_LIMIT = 500;
 const WARM_VERIFY_ROUTE_LIMIT = 4;
 const WARM_VERIFY_TIME_MS = 14000;
 const FAST_LANE_FRAGMENT_LIMIT = 200;
+const START_LANE_FRAGMENT_LIMIT = 300;
 const COMMON_WARM_TARGETS = ["magnuscarlsen", "hikaru", "danielnaroditsky", "fabianocaruana", "gothamchess"];
 const RATE_LIMIT_COOLDOWN_SECONDS = 90;
 const FETCH_RETRIES = 2;
@@ -310,7 +312,10 @@ async function handleSearchStart(request, env, ctx) {
   const analyticsPair = storedPair || exactFastLanePair
     ? null
     : await readExactAnalyticsPair(env, start, target, range);
-  const cachedFastLanePair = storedPair || exactFastLanePair || analyticsPair
+  const startLanePair = storedPair || exactFastLanePair || analyticsPair
+    ? null
+    : await readStartLanePair(env, start, target, range);
+  const cachedFastLanePair = storedPair || exactFastLanePair || analyticsPair || startLanePair
     ? null
     : await readCachedFastLanePair(env, start, target, range);
   const requestPair = pairChainShape({
@@ -322,7 +327,7 @@ async function handleSearchStart(request, env, ctx) {
     savedAt: Date.now(),
     checkedAt: null,
   }, start, target, range);
-  const cachedPair = storedPair || exactFastLanePair || analyticsPair || cachedFastLanePair || requestPair;
+  const cachedPair = storedPair || exactFastLanePair || analyticsPair || startLanePair || cachedFastLanePair || requestPair;
   if (!storedPair && exactFastLanePair) {
     await writePairChain(env, {
       id,
@@ -337,7 +342,33 @@ async function handleSearchStart(request, env, ctx) {
       updatedAt: Date.now(),
     });
   }
-  if (!storedPair && !exactFastLanePair && cachedFastLanePair) {
+  if (!storedPair && !exactFastLanePair && !analyticsPair && startLanePair) {
+    await writePairChain(env, {
+      id,
+      start,
+      target,
+      range,
+      status: "found",
+      chain: startLanePair.chain,
+      players: startLanePair.players || {},
+      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    await writeFastLaneFragments(env, {
+      id,
+      start,
+      target,
+      range,
+      status: "found",
+      chain: startLanePair.chain,
+      players: startLanePair.players || {},
+      stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
+  if (!storedPair && !exactFastLanePair && !analyticsPair && !startLanePair && cachedFastLanePair) {
     await writePairChain(env, {
       id,
       start,
@@ -773,36 +804,55 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
       continue;
     }
 
-    const node = search.activeFrontier[search.activeCursor++];
-    if (!node) continue;
-    stats.expanded++;
-    processed++;
+    const remainingBudget = Math.min(
+      expansionBudget - processed,
+      SEARCH_MAX_EXPANSIONS - stats.expanded,
+      search.activeFrontier.length - search.activeCursor,
+    );
+    const batchSize = Math.max(1, Math.min(SEARCH_EXPANSION_CONCURRENCY, remainingBudget));
+    const batch = search.activeFrontier.slice(search.activeCursor, search.activeCursor + batchSize).filter(Boolean);
+    search.activeCursor += batch.length;
+    if (!batch.length) continue;
+    stats.expanded += batch.length;
+    processed += batch.length;
 
-    const edges = await getEdges(node);
-    if (search.activeSide === "forward") {
-      for (const [opponent, urls] of edges.beatenByMe) {
-        if (forwardVisited.has(opponent)) continue;
-        if (backwardVisited.has(opponent)) {
-          forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
-          meeting = opponent;
-          break;
-        }
-        if (forwardVisited.size < SEARCH_VISITED_LIMIT && search.activeNextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) {
-          forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
-          search.activeNextFrontier.push(opponent);
-        }
+    const edgeBatch = await runThrottled(batch.map((node) => async () => {
+      try {
+        return { node, edges: await getEdges(node) };
+      } catch {
+        return { node, edges: { beatenByMe: new Map(), beatMe: new Map() } };
       }
-    } else {
-      for (const [opponent, urls] of edges.beatMe) {
-        if (backwardVisited.has(opponent)) continue;
-        if (forwardVisited.has(opponent)) {
-          backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
-          meeting = opponent;
-          break;
+    }), SEARCH_EXPANSION_CONCURRENCY);
+
+    for (const item of edgeBatch) {
+      if (meeting || !item?.node || !item.edges) break;
+      const node = item.node;
+      const edges = item.edges;
+      if (search.activeSide === "forward") {
+        for (const [opponent, urls] of edges.beatenByMe) {
+          if (forwardVisited.has(opponent)) continue;
+          if (backwardVisited.has(opponent)) {
+            forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
+            meeting = opponent;
+            break;
+          }
+          if (forwardVisited.size < SEARCH_VISITED_LIMIT && search.activeNextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) {
+            forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
+            search.activeNextFrontier.push(opponent);
+          }
         }
-        if (backwardVisited.size < SEARCH_VISITED_LIMIT && search.activeNextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) {
-          backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
-          search.activeNextFrontier.push(opponent);
+      } else {
+        for (const [opponent, urls] of edges.beatMe) {
+          if (backwardVisited.has(opponent)) continue;
+          if (forwardVisited.has(opponent)) {
+            backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
+            meeting = opponent;
+            break;
+          }
+          if (backwardVisited.size < SEARCH_VISITED_LIMIT && search.activeNextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) {
+            backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
+            search.activeNextFrontier.push(opponent);
+          }
         }
       }
     }
@@ -814,7 +864,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
 
     if (search.activeCursor >= search.activeFrontier.length) {
       await finishLayer();
-    } else if (processed % 6 === 0) {
+    } else if (processed % 20 === 0) {
       syncSearch();
       await progress(`Step ${search.depth + 1}: checking ${search.activeFrontier.length} players`, { depth: search.depth });
     }
@@ -1825,14 +1875,15 @@ async function handleAnalytics(url, request, env) {
 
 async function saveAnalyticsEvent(env, event) {
   if (!event) return;
+  const shapedEvent = normalizeAnalyticsEvents([event])[0] || event;
   const events = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
-  const existingIndex = events.findIndex((item) => item.id === event.id);
+  const existingIndex = events.findIndex((item) => item.id === shapedEvent.id);
   if (existingIndex >= 0) {
     const existing = events[existingIndex];
     events.splice(existingIndex, 1);
-    events.unshift({ ...existing, ...event, firstTs: existing.firstTs || existing.ts || event.ts });
+    events.unshift({ ...existing, ...shapedEvent, firstTs: existing.firstTs || existing.ts || shapedEvent.ts });
   } else {
-    events.unshift(event);
+    events.unshift(shapedEvent);
   }
   if (events.length > MAX_ANALYTICS_EVENTS) events.length = MAX_ANALYTICS_EVENTS;
 
@@ -1840,6 +1891,17 @@ async function saveAnalyticsEvent(env, event) {
     expirationTtl: KV_RETENTION_SECONDS,
     metadata: { type: "analytics" },
   });
+  if (["found", "saved"].includes(shapedEvent.outcome) && shapedEvent.path.length >= 2 && shapedEvent.hops.length === shapedEvent.path.length - 1) {
+    await cacheSubmittedRoute(
+      env,
+      shapedEvent.start,
+      shapedEvent.target,
+      shapedEvent.path,
+      shapedEvent.hops,
+      shapedEvent.path.length - 1,
+      chainKey(shapedEvent.path),
+    );
+  }
 }
 
 async function readSearchJob(env, id) {
@@ -1944,6 +2006,7 @@ async function writeFastLaneFragments(env, job) {
       metadata: { type: "fast-lane", target: shaped.target, range },
     });
   }
+  await writeStartLaneFragments(env, shaped);
 }
 
 async function readFastLaneFragments(env, target, range) {
@@ -1963,6 +2026,70 @@ async function readFastLaneFragments(env, target, range) {
     }
   }
   return [...unique.values()].sort((a, b) => a.length - b.length || b.savedAt - a.savedAt).slice(0, FAST_LANE_FRAGMENT_LIMIT);
+}
+
+async function writeStartLaneFragments(env, job) {
+  const shaped = searchJobShape(job);
+  if (!shaped?.chain?.found || !Array.isArray(shaped.chain.path) || shaped.chain.path.length < 2) return;
+  const ranges = [...new Set([shaped.range, "auto"].filter(Boolean))];
+  const fullHops = cleanHopList(shaped.chain.hops);
+  for (const range of ranges) {
+    const key = startLaneKey(shaped.start, range);
+    const existing = await readStartLaneFragmentsForKey(env, key);
+    const next = new Map(existing.map((fragment) => [fragment.target, fragment]));
+    for (let i = 1; i < shaped.chain.path.length; i++) {
+      const path = shaped.chain.path.slice(0, i + 1);
+      const hops = fullHops.slice(0, i);
+      if (path.length < 2 || hops.length !== path.length - 1) continue;
+      const target = path[path.length - 1];
+      const fragment = {
+        target,
+        range,
+        path,
+        hops,
+        length: Math.max(0, path.length - 1),
+        quality: shaped.chain.quality || routeQuality({ path, hops }, shaped.stats, "start-lane"),
+        savedAt: Date.now(),
+      };
+      const current = next.get(target);
+      if (!current || fragment.length < current.length || fragment.savedAt > current.savedAt) {
+        next.set(target, fragment);
+      }
+    }
+    const fragments = [...next.values()]
+      .map(fastLaneFragmentShape)
+      .filter(Boolean)
+      .sort((a, b) => a.length - b.length || b.savedAt - a.savedAt)
+      .slice(0, START_LANE_FRAGMENT_LIMIT);
+    await env.GAMES_CACHE.put(key, JSON.stringify({ start: shaped.start, range, fragments, updatedAt: Date.now() }), {
+      expirationTtl: PAIR_CHAIN_TTL_SECONDS,
+      metadata: { type: "start-lane", start: shaped.start, range },
+    });
+  }
+}
+
+async function readStartLaneFragments(env, start, range) {
+  const cleanStart = cleanUsername(start);
+  const ranges = [...new Set([cleanRange(range) || "auto", "auto", "6", "instant"])];
+  const fragments = [];
+  for (const candidateRange of ranges) {
+    fragments.push(...await readStartLaneFragmentsForKey(env, startLaneKey(cleanStart, candidateRange)));
+  }
+  const unique = new Map();
+  for (const fragment of fragments) {
+    if (!fragment || fragment.path?.[0] !== cleanStart) continue;
+    const current = unique.get(fragment.target);
+    if (!current || fragment.length < current.length || fragment.savedAt > current.savedAt) {
+      unique.set(fragment.target, fragment);
+    }
+  }
+  return [...unique.values()].sort((a, b) => a.length - b.length || b.savedAt - a.savedAt).slice(0, START_LANE_FRAGMENT_LIMIT);
+}
+
+async function readStartLaneFragmentsForKey(env, key) {
+  const record = await env.GAMES_CACHE.get(key, { type: "json", cacheTtl: 60 });
+  const fragments = Array.isArray(record?.fragments) ? record.fragments : [];
+  return fragments.map(fastLaneFragmentShape).filter(Boolean);
 }
 
 async function readExactFastLanePair(env, start, target, range) {
@@ -2014,7 +2141,10 @@ async function readExactAnalyticsPair(env, start, target, range) {
     .slice(0, 3);
   for (const event of candidates) {
     const path = normalizePath(cleanStart, cleanTarget, event.path);
-    const hops = await verifyPathHopsFromCache(env, path);
+    const storedHops = cleanHopList(event.hops);
+    const hops = storedHops.length === path.length - 1
+      ? storedHops
+      : await verifyPathHopsFromCache(env, path);
     if (hops?.length !== path.length - 1) continue;
     const chain = {
       target: cleanTarget,
@@ -2036,6 +2166,74 @@ async function readExactAnalyticsPair(env, start, target, range) {
     }, cleanStart, cleanTarget, range);
   }
   return null;
+}
+
+async function readStartLanePair(env, start, target, range) {
+  const cleanStart = cleanUsername(start);
+  const cleanTarget = cleanUsername(target);
+  if (!cleanStart || !cleanTarget || cleanStart === cleanTarget) return null;
+  const prefixes = await readStartLaneFragments(env, cleanStart, range);
+  const exact = prefixes
+    .filter((fragment) => fragment.target === cleanTarget && fragment.path[fragment.path.length - 1] === cleanTarget)
+    .sort((a, b) => a.length - b.length || b.savedAt - a.savedAt)[0];
+  if (exact) {
+    return startLanePairShape({
+      start: cleanStart,
+      target: cleanTarget,
+      range,
+      path: exact.path,
+      hops: exact.hops,
+      source: "start-lane",
+      savedAt: exact.savedAt,
+    });
+  }
+
+  const suffixes = await readFastLaneFragments(env, cleanTarget, range);
+  let best = null;
+  for (const prefix of prefixes) {
+    const hub = prefix.target;
+    if (!hub || hub === cleanStart || hub === cleanTarget) continue;
+    for (const suffix of suffixes) {
+      if (suffix.path?.[0] !== hub) continue;
+      const path = [...prefix.path, ...suffix.path.slice(1)];
+      if (new Set(path).size !== path.length || path[0] !== cleanStart || path[path.length - 1] !== cleanTarget) continue;
+      const hops = [...cleanHopList(prefix.hops), ...cleanHopList(suffix.hops)];
+      if (hops.length !== path.length - 1) continue;
+      const candidate = {
+        start: cleanStart,
+        target: cleanTarget,
+        range,
+        path,
+        hops,
+        source: "start-lane-bridge",
+        savedAt: Math.max(Number(prefix.savedAt) || 0, Number(suffix.savedAt) || 0, Date.now()),
+      };
+      if (!best || candidate.path.length < best.path.length) best = candidate;
+    }
+  }
+  return best ? startLanePairShape(best) : null;
+}
+
+function startLanePairShape({ start, target, range, path, hops, source, savedAt }) {
+  const cleanHops = cleanHopList(hops);
+  const chain = {
+    target,
+    display: target,
+    found: true,
+    length: Math.max(0, path.length - 1),
+    path,
+    hops: cleanHops,
+    quality: routeQuality({ path, hops: cleanHops }, { cached: 2, requests: 0, expanded: 0 }, source),
+  };
+  return pairChainShape({
+    start,
+    target,
+    range,
+    chain,
+    players: {},
+    savedAt: savedAt || Date.now(),
+    checkedAt: Date.now(),
+  }, start, target, range);
 }
 
 async function readCachedFastLanePair(env, start, target, range) {
@@ -2120,6 +2318,10 @@ async function readFastLaneFragmentsForKey(env, key) {
 
 function fastLaneKey(target, range) {
   return `fastlane:${cleanRange(range) || "auto"}:${cleanUsername(target)}`;
+}
+
+function startLaneKey(start, range) {
+  return `startlane:${cleanRange(range) || "auto"}:${cleanUsername(start)}`;
 }
 
 function fastLaneFragmentShape(value) {
@@ -2450,6 +2652,7 @@ function searchJobAnalyticsEvent(job) {
       ? shaped.chain.path.length - 1
       : null,
     path: Array.isArray(shaped.chain?.path) ? shaped.chain.path : [],
+    hops: cleanHopList(shaped.chain?.hops),
     durationMs: shaped.durationMs,
     requests: shaped.stats.requests,
     cached: shaped.stats.cached,
@@ -2491,6 +2694,7 @@ function analyticsEventShape(body, request) {
     : Number.isFinite(rawLength)
       ? Math.max(0, Math.min(10, rawLength))
       : null;
+  const hops = cleanHopList(body?.hops);
 
   return {
     id,
@@ -2503,6 +2707,7 @@ function analyticsEventShape(body, request) {
     length,
     steps,
     path,
+    hops: hops.length === path.length - 1 ? hops : [],
     jobId: cleanAnalyticsId(body?.jobId || body?.searchId || body?.id),
     durationMs: cleanNonNegativeNumber(body?.durationMs, 10 * 60 * 1000),
     requests: cleanNonNegativeNumber(body?.requests, 100000),
@@ -2525,6 +2730,7 @@ function normalizeAnalyticsEvents(events) {
         ? event.path.slice(0, 12).map(cleanUsername).filter(Boolean)
         : [];
       const normalizedPath = path.length >= 2 ? normalizePath(start, target, path) : [];
+      const hops = cleanHopList(event.hops);
       return {
         id: cleanAnalyticsId(event.id) || crypto.randomUUID(),
         ts: Number.isFinite(event.ts) ? event.ts : Date.now(),
@@ -2537,6 +2743,7 @@ function normalizeAnalyticsEvents(events) {
         length: Number.isFinite(event.length) ? Math.max(0, Math.min(10, event.length)) : null,
         steps: Number.isFinite(event.steps) ? Math.max(0, Math.min(12, event.steps)) : null,
         path: normalizedPath,
+        hops: hops.length === normalizedPath.length - 1 ? hops : [],
         jobId: cleanAnalyticsId(event.jobId) || "",
         durationMs: cleanNonNegativeNumber(event.durationMs, 10 * 60 * 1000),
         requests: cleanNonNegativeNumber(event.requests, 100000),

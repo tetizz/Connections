@@ -46,8 +46,8 @@ const WARM_STATUS_KEY = "warm:leaderboard-targets";
 const WARM_INTERVAL_SECONDS = 6 * 60 * 60;
 const WARM_PLAYER_LIMIT = 36;
 const WARM_ROUTE_LIMIT = 500;
-const WARM_VERIFY_ROUTE_LIMIT = 4;
-const WARM_VERIFY_TIME_MS = 14000;
+const WARM_VERIFY_ROUTE_LIMIT = 12;
+const WARM_VERIFY_TIME_MS = 22000;
 const FAST_LANE_FRAGMENT_LIMIT = 200;
 const START_LANE_FRAGMENT_LIMIT = 300;
 const COMMON_WARM_TARGETS = ["magnuscarlsen", "hikaru", "danielnaroditsky", "fabianocaruana", "gothamchess"];
@@ -1492,12 +1492,9 @@ async function warmFastLaneFragments(env) {
       fragments += Math.max(0, shaped.chain.path.length - 1);
     }
   }), 3);
-  const unverifiedLeaderboardEntries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || [])
-    .filter((entry) => cleanHopList(entry.hops).length !== entry.path.length - 1)
-    .sort((a, b) => b.ts - a.ts)
-    .slice(0, WARM_VERIFY_ROUTE_LIMIT);
+  const unverifiedRoutes = await warmVerificationRoutes(env);
   const verifyDeadline = Date.now() + WARM_VERIFY_TIME_MS;
-  for (const entry of unverifiedLeaderboardEntries) {
+  for (const entry of unverifiedRoutes) {
     if (Date.now() >= verifyDeadline) break;
     const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
     const hops = await verifyPathHops(env, entry.path, 12, stats, { allowDeep: true });
@@ -1526,6 +1523,50 @@ async function warmFastLaneFragments(env) {
     }
   }
   return fragments;
+}
+
+async function warmVerificationRoutes(env) {
+  const leaderboardRoutes = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || [])
+    .filter((entry) => cleanHopList(entry.hops).length !== entry.path.length - 1)
+    .map((entry) => ({
+      source: "leaderboard",
+      start: entry.start,
+      target: entry.target,
+      path: entry.path,
+      steps: entry.steps,
+      ts: entry.ts,
+      pathKey: entry.pathKey || chainKey(entry.path),
+    }));
+  const analyticsRoutes = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || [])
+    .filter((event) =>
+      ["found", "saved"].includes(event.outcome) &&
+      Array.isArray(event.path) &&
+      event.path.length >= 2 &&
+      cleanHopList(event.hops).length !== event.path.length - 1)
+    .map((event) => {
+      const path = normalizePath(event.start, event.target, event.path);
+      return {
+        source: "analytics",
+        start: event.start,
+        target: event.target,
+        path,
+        steps: Math.max(0, path.length - 1),
+        ts: event.ts,
+        pathKey: chainKey(path),
+      };
+    });
+  const byPair = new Map();
+  for (const route of [...leaderboardRoutes, ...analyticsRoutes]) {
+    if (!route.start || !route.target || !Array.isArray(route.path) || route.path.length < 2) continue;
+    const key = `${route.start}|${route.target}`;
+    const current = byPair.get(key);
+    if (!current || route.steps < current.steps || (route.steps === current.steps && route.ts > current.ts)) {
+      byPair.set(key, route);
+    }
+  }
+  return [...byPair.values()]
+    .sort((a, b) => a.steps - b.steps || b.ts - a.ts)
+    .slice(0, WARM_VERIFY_ROUTE_LIMIT);
 }
 
 async function listKvKeys(env, prefix, max) {

@@ -306,6 +306,7 @@ async function handleSearchStart(request, env, ctx) {
   }
 
   const storedPair = await readPairChain(env, start, target, range);
+  const exactFastLanePair = storedPair ? null : await readExactFastLanePair(env, start, target, range);
   const requestPair = pairChainShape({
     start,
     target,
@@ -315,7 +316,21 @@ async function handleSearchStart(request, env, ctx) {
     savedAt: Date.now(),
     checkedAt: null,
   }, start, target, range);
-  const cachedPair = storedPair || requestPair;
+  const cachedPair = storedPair || exactFastLanePair || requestPair;
+  if (!storedPair && exactFastLanePair) {
+    await writePairChain(env, {
+      id,
+      start,
+      target,
+      range,
+      status: "found",
+      chain: exactFastLanePair.chain,
+      players: exactFastLanePair.players || {},
+      stats: { fetched: 0, requests: 0, cached: 1, expanded: 0 },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
   if (!storedPair && requestPair) {
     await writePairChain(env, {
       id,
@@ -363,6 +378,17 @@ async function handleSearchStart(request, env, ctx) {
     updatedAt: Date.now(),
   });
   await writeSearchJob(env, job);
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(runSearchJob(env, job).catch((error) => {
+      console.warn(JSON.stringify({
+        event: "search_start_background_failed",
+        jobId: job.id,
+        start: job.start,
+        target: job.target,
+        message: error?.message || String(error),
+      }));
+    }));
+  }
 
   return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
 }
@@ -885,6 +911,19 @@ function reconstructServerPath(mid, forwardVisited, backwardVisited) {
 }
 
 async function tryFastLaneConnection(env, job, stats) {
+  const exact = await readExactFastLanePair(env, job.start, job.target, job.range);
+  const savedStepLimit = job.chain?.found ? chainStepCount(job.chain) : Number.POSITIVE_INFINITY;
+  if (exact?.chain?.found && chainStepCount(exact.chain) < savedStepLimit) {
+    stats.cached = Number(stats.cached || 0) + 1;
+    return {
+      source: "exact-fast-lane",
+      chain: {
+        path: exact.chain.path,
+        hops: exact.chain.hops,
+      },
+    };
+  }
+
   const startGames = await readOrFetchGames(env, {
     username: job.start,
     archiveLimit: Math.min(6, archiveLimitForRange(job.range) || 6),
@@ -902,7 +941,6 @@ async function tryFastLaneConnection(env, job, stats) {
   }
 
   const fragments = await readFastLaneFragments(env, job.target, job.range);
-  const savedStepLimit = job.chain?.found ? chainStepCount(job.chain) : Number.POSITIVE_INFINITY;
   let best = null;
   for (const fragment of fragments) {
     const connector = fragment.path?.[0];
@@ -1843,6 +1881,39 @@ async function readFastLaneFragments(env, target, range) {
     }
   }
   return [...unique.values()].sort((a, b) => a.length - b.length || b.savedAt - a.savedAt).slice(0, FAST_LANE_FRAGMENT_LIMIT);
+}
+
+async function readExactFastLanePair(env, start, target, range) {
+  const cleanStart = cleanUsername(start);
+  const cleanTarget = cleanUsername(target);
+  if (!cleanStart || !cleanTarget || cleanStart === cleanTarget) return null;
+  const fragments = await readFastLaneFragments(env, cleanTarget, range);
+  const exact = fragments
+    .filter((fragment) =>
+      fragment?.target === cleanTarget &&
+      fragment.path?.[0] === cleanStart &&
+      fragment.path[fragment.path.length - 1] === cleanTarget &&
+      cleanHopList(fragment.hops).length === fragment.path.length - 1)
+    .sort((a, b) => a.length - b.length || b.savedAt - a.savedAt)[0];
+  if (!exact) return null;
+  const chain = {
+    target: cleanTarget,
+    display: cleanTarget,
+    found: true,
+    length: Math.max(0, exact.path.length - 1),
+    path: exact.path,
+    hops: cleanHopList(exact.hops),
+    quality: exact.quality || routeQuality({ path: exact.path, hops: exact.hops }, { cached: 1, requests: 0, expanded: 0 }, "fast-lane"),
+  };
+  return pairChainShape({
+    start: cleanStart,
+    target: cleanTarget,
+    range,
+    chain,
+    players: {},
+    savedAt: exact.savedAt || Date.now(),
+    checkedAt: Date.now(),
+  }, cleanStart, cleanTarget, range);
 }
 
 async function readFastLaneFragmentsForKey(env, key) {

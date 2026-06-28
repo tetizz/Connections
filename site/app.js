@@ -1949,7 +1949,7 @@
         logLine("loaded saved connection instantly; checking for a shorter route");
         showStatus("done",
           `✓ loaded saved connection — ${esc(start)} connects to ${esc(target)} in ` +
-          `${stepText((job.chain.path || []).length - 1)}. Checking newer games in the background.`);
+          `${stepText((job.chain.path || []).length - 1)}. Checking for a shorter route in the background.`);
         btn.disabled = false;
         pollServerSearchJob(job.id, { analyticsBase, logLine, background: true })
           .then(async (finished) => {
@@ -2121,7 +2121,7 @@
     });
     if (checking) {
       showStatus("working",
-        `loaded saved connection instantly — checking newer games for a shorter route.`);
+        `loaded saved connection instantly — checking for a shorter route.`);
     } else {
       showStatus("done",
         `${job.progress && /saved connection/i.test(job.progress) ? "✓" : "✓ found it"} — ` +

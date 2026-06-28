@@ -351,6 +351,7 @@ h1 {
   font-size: clamp(36px, 5.25vw, 58px);
   line-height: 1.02;
   font-weight: 800;
+  overflow-wrap: anywhere;
 }
 
 .command-center__intro p {
@@ -910,9 +911,10 @@ html[data-theme="dark"] .search-queue {
   color: rgba(246, 239, 226, .72);
   font-size: 12px;
   font-weight: 900;
-  line-height: 1;
+  line-height: 1.15;
   text-transform: uppercase;
   letter-spacing: .1em;
+  overflow-wrap: anywhere;
 }
 
 .quick-targets__head p {
@@ -2206,12 +2208,32 @@ html[data-theme="dark"] .card__avatar-fallback {
 }
 
 .profile-popover__main small {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
   overflow: hidden;
   color: rgba(246, 239, 226, .58);
   font-family: var(--mono);
   font-size: 11px;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.profile-popover__main small > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.profile-popover__identity-flag {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.profile-popover__identity-flag .profile-popover__flag {
+  width: 26px;
+  height: 19px;
+  border-radius: 4px;
 }
 
 .profile-popover__title {
@@ -2440,11 +2462,20 @@ html[data-theme="dark"] .modal {
 }
 
 .modal__close {
-  width: 38px;
-  height: 38px;
-  display: grid;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  display: inline-grid;
   place-items: center;
+  padding: 0;
   border-radius: var(--radius);
+  line-height: 0;
+}
+
+.modal__close svg {
+  display: block;
+  width: 20px;
+  height: 20px;
 }
 
 .modal__body {
@@ -2828,7 +2859,9 @@ html[data-theme="dark"] .setting__btn--gold {
   }
 
   h1 {
-    font-size: 38px;
+    max-width: 100%;
+    font-size: clamp(30px, 10.4vw, 38px);
+    line-height: 1.06;
   }
 
   .command-center__intro p {

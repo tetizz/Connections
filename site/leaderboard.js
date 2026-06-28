@@ -115,6 +115,10 @@ window.Leaderboard = (() => {
   }
 
   function metricForEntry(entry, category) {
+    const plainNumber = (value) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? String(Math.round(number)) : "0";
+    };
     if (category === "fastest") {
       return {
         value: durationLabel(entry.durationMs || entry.count),
@@ -125,7 +129,7 @@ window.Leaderboard = (() => {
     if (category === "top_targets") {
       const unique = Number(entry.uniqueStarts || entry.count || 0);
       return {
-        value: unique.toLocaleString(),
+        value: plainNumber(unique),
         label: "players",
         meta: `${Number(entry.count || 0)} successful connection${Number(entry.count || 0) === 1 ? "" : "s"}`,
       };
@@ -133,21 +137,21 @@ window.Leaderboard = (() => {
     if (category === "searched") {
       const count = Number(entry.count || 0);
       return {
-        value: count.toLocaleString(),
+        value: plainNumber(count),
         label: "searches",
         meta: "starts and targets counted",
       };
     }
     if (category === "recent") {
       return {
-        value: Number(entry.length || entry.count || 0).toLocaleString(),
+        value: plainNumber(entry.length || entry.count || 0),
         label: "middle",
         meta: `${entry.username} → ${entry.target}`,
       };
     }
     const count = Number(entry.count || 0);
     return {
-      value: count.toLocaleString(),
+      value: plainNumber(count),
       label: "chains",
       meta: `${count} chain${count === 1 ? "" : "s"}`,
     };

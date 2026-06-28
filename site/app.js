@@ -84,6 +84,10 @@
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   })[c]);
+  const plainNumber = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? String(Math.round(number)) : "";
+  };
   const connectionCount = (path = []) => Math.max(0, path.length - 2);
   const stepText = (count) => `${count} step${count === 1 ? "" : "s"}`;
 
@@ -186,7 +190,7 @@
     const display = player.display || player.username;
     const title = player.title ? `<span class="quick-player__title">${esc(player.title)}</span>` : "";
     const rank = Number.isFinite(player.rank) ? `<span class="quick-player__rank">#${player.rank}</span>` : "";
-    const score = Number.isFinite(player.score) ? `<span>${Number(player.score).toLocaleString()}</span>` : "";
+    const score = Number.isFinite(player.score) ? `<span>${plainNumber(player.score)}</span>` : "";
     const avatar = player.avatar
       ? `<img class="quick-player__photo" src="${esc(player.avatar)}" alt="${esc(display)} profile photo" width="34" height="34" referrerpolicy="no-referrer" loading="lazy" decoding="async">`
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
@@ -1019,7 +1023,8 @@
       state.ownerCode = code;
       if (filters) filters.hidden = false;
       status.hidden = false;
-      status.textContent = `${Number(data.total || 0).toLocaleString()} matching search${Number(data.total || 0) === 1 ? "" : "es"}.`;
+      const total = Number(data.total || 0);
+      status.textContent = `${plainNumber(total)} matching search${total === 1 ? "" : "es"}.`;
     } catch (error) {
       wrap.hidden = true;
       if (filters) filters.hidden = true;
@@ -1668,9 +1673,9 @@
   function explorerProfileLine(profile, neighborCount) {
     const parts = [];
     if (profile?.title) parts.push(profile.title);
-    if (profile?.stats?.rapid?.rating) parts.push(`Rapid ${Number(profile.stats.rapid.rating).toLocaleString()}`);
-    if (profile?.stats?.blitz?.rating) parts.push(`Blitz ${Number(profile.stats.blitz.rating).toLocaleString()}`);
-    if (profile?.stats?.bullet?.rating) parts.push(`Bullet ${Number(profile.stats.bullet.rating).toLocaleString()}`);
+    if (profile?.stats?.rapid?.rating) parts.push(`Rapid ${plainNumber(profile.stats.rapid.rating)}`);
+    if (profile?.stats?.blitz?.rating) parts.push(`Blitz ${plainNumber(profile.stats.blitz.rating)}`);
+    if (profile?.stats?.bullet?.rating) parts.push(`Bullet ${plainNumber(profile.stats.bullet.rating)}`);
     parts.push(`${neighborCount} proof neighbor${neighborCount === 1 ? "" : "s"}`);
     return parts.join(" · ");
   }
@@ -1734,14 +1739,14 @@
     const joined = profile?.joined ? `<span>Joined ${esc(formatProfileDate(profile.joined))}</span>` : `<span>Joined unavailable</span>`;
     const countryFlag = profile?.country ? flagIcon(profile.country, "profile-popover__flag") : "";
     const country = countryFlag
-      ? `<span class="profile-popover__country" title="${esc(profile.country.toUpperCase())}">${countryFlag}</span>`
+      ? `<span class="profile-popover__identity-flag" title="${esc(profile.country.toUpperCase())}">${countryFlag}</span>`
       : "";
     const followers = Number.isFinite(profile?.followers)
-      ? `<span>${Number(profile.followers).toLocaleString()} followers</span>`
+      ? `<span>${plainNumber(profile.followers)} followers</span>`
       : "";
     const online = profile?.lastOnline ? `<span>Seen ${esc(timeAgo(profile.lastOnline * 1000))}</span>` : "";
     const location = profile?.location ? `<span>${esc(profile.location)}</span>` : "";
-    const fide = Number.isFinite(profile?.fide) ? `<span>FIDE ${Number(profile.fide).toLocaleString()}</span>` : "";
+    const fide = Number.isFinite(profile?.fide) ? `<span>FIDE ${plainNumber(profile.fide)}</span>` : "";
     const status = profile?.status
       ? `<span class="profile-popover__status${String(profile.status).toLowerCase() === "premium" ? " is-premium" : ""}">${esc(profileStatusLabel(profile.status))}</span>`
       : "";
@@ -1754,10 +1759,10 @@
         <span class="profile-popover__avatar">${avatar}</span>
         <span class="profile-popover__main">
           <strong>${title}${esc(display)}</strong>
-          <small>@${esc(handle)}</small>
+          <small><span>@${esc(handle)}</span>${country}</small>
         </span>
       </div>
-      <div class="profile-popover__meta">${country}${followers}${joined}${online}${location}${fide}${status}</div>
+      <div class="profile-popover__meta">${followers}${joined}${online}${location}${fide}${status}</div>
       ${stats}
       ${recentGames}
       <a class="profile-popover__open" href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>
@@ -1828,12 +1833,12 @@
       if (!stat?.rating) {
         return `<div class="profile-stat"><span>${label}</span><strong>--</strong><small>No rating</small></div>`;
       }
-      const games = Number.isFinite(stat.games) ? `${Number(stat.games).toLocaleString()} games` : "rated";
-      const best = Number.isFinite(stat.best) ? `best ${Number(stat.best).toLocaleString()}` : games;
+      const games = Number.isFinite(stat.games) ? `${plainNumber(stat.games)} games` : "rated";
+      const best = Number.isFinite(stat.best) ? `best ${plainNumber(stat.best)}` : games;
       return `
         <div class="profile-stat">
           <span>${label}</span>
-          <strong>${Number(stat.rating).toLocaleString()}</strong>
+          <strong>${plainNumber(stat.rating)}</strong>
           <small>${esc(best)}</small>
         </div>
       `;
@@ -2037,9 +2042,9 @@
     panel.classList.remove("is-complete");
     $("#queue-state").textContent = resumed ? "Resumed" : statusText(job.status || "running");
     $("#queue-job").textContent = compactJobId(job.id);
-    $("#queue-checked").textContent = Number(stats.expanded || 0).toLocaleString();
-    $("#queue-requests").textContent = Number(stats.requests || 0).toLocaleString();
-    $("#queue-cached").textContent = Number(stats.cached || 0).toLocaleString();
+    $("#queue-checked").textContent = plainNumber(stats.expanded || 0);
+    $("#queue-requests").textContent = plainNumber(stats.requests || 0);
+    $("#queue-cached").textContent = plainNumber(stats.cached || 0);
     $("#queue-elapsed").textContent = elapsedText(created);
     $("#queue-message").textContent = job.progress || "Search is running.";
     clearInterval(state.queueTimer);

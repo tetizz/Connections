@@ -1051,7 +1051,7 @@
       if (force) url.searchParams.set("force", "1");
       const res = await fetch(url.toString(), {
         method: force ? "POST" : "GET",
-        headers: { "Accept": "application/json" },
+        headers: { "Accept": "application/json", "X-Owner-Code": state.ownerCode },
       });
       if (!res.ok) throw new Error("Cache status unavailable.");
       const data = await res.json();

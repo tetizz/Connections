@@ -43,8 +43,6 @@ const CACHED_SHORTER_CHECK_TIME_MS = 6000;
 const STARTUP_CACHE_BFS_EXPANSIONS = 96;
 const STARTUP_CACHE_BFS_TIME_MS = 900;
 const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 160;
-const STARTUP_SEARCH_EXPANSIONS = 18;
-const STARTUP_SEARCH_TIME_MS = 3500;
 const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const SHARE_ID_LENGTH = 8;
@@ -103,7 +101,7 @@ export default {
     }
 
     if (url.pathname === "/search/job" && request.method === "GET") {
-      return handleSearchJob(url, env);
+      return handleSearchJob(url, env, ctx);
     }
 
     if (url.pathname === "/search/warm" && (request.method === "GET" || request.method === "POST")) {
@@ -327,47 +325,8 @@ async function handleSearchStart(request, env, ctx) {
   }, start, target, range);
 
   const storedPair = await readPairChain(env, start, target, range);
-  const shouldProbeStartupRoutes = !storedPair;
-  let exactFastLanePair = null;
-  let analyticsPair = null;
-  let startLanePair = null;
-  let cachedFastLanePair = null;
-  let startupCachedBfsPair = null;
-  if (shouldProbeStartupRoutes) {
-    const [
-      exactFastLanePairResult,
-      analyticsPairResult,
-      startLanePairResult,
-      cachedFastLanePairResult,
-    ] = await Promise.allSettled([
-      readExactFastLanePair(env, start, target, range),
-      readExactAnalyticsPair(env, start, target, range),
-      readStartLanePair(env, start, target, range),
-      readCachedFastLanePair(env, start, target, range),
-    ]);
-    exactFastLanePair = settledValue(exactFastLanePairResult);
-    analyticsPair = settledValue(analyticsPairResult);
-    startLanePair = settledValue(startLanePairResult);
-    cachedFastLanePair = settledValue(cachedFastLanePairResult);
-    const bestBeforeCachedBfs = bestPairChain([
-      storedPair,
-      exactFastLanePair,
-      analyticsPair,
-      startLanePair,
-      cachedFastLanePair,
-    ]);
-    const bestBeforeCachedBfsSteps = chainStepCount(bestBeforeCachedBfs?.chain);
-    startupCachedBfsPair = Number.isFinite(bestBeforeCachedBfsSteps) && bestBeforeCachedBfsSteps <= 2
-      ? null
-      : await readCachedBfsPair(env, start, target, range).catch(() => null);
-  }
   const cachedPair = bestPairChain([
     storedPair,
-    exactFastLanePair,
-    analyticsPair,
-    startLanePair,
-    cachedFastLanePair,
-    startupCachedBfsPair,
     requestPair,
   ]);
   const promoteCachedPair = promoteStartupCachedPairs(env, {
@@ -376,11 +335,6 @@ async function handleSearchStart(request, env, ctx) {
     target,
     range,
     storedPair,
-    exactFastLanePair,
-    analyticsPair,
-    startLanePair,
-    cachedFastLanePair,
-    startupCachedBfsPair,
     requestPair,
     cachedPair,
   }).catch((error) => {
@@ -437,29 +391,20 @@ async function handleSearchStart(request, env, ctx) {
       }));
     }));
   } else if (!cachedPair) {
-    const immediateJob = await runSearchJobChunk(env, job.id, {
-      expansionBudget: STARTUP_SEARCH_EXPANSIONS,
-      timeBudgetMs: STARTUP_SEARCH_TIME_MS,
-    }) || await readSearchJob(env, job.id) || job;
-    if (ctx?.waitUntil && isActiveSearchStatus(immediateJob.status)) {
-      ctx.waitUntil(runSearchJob(env, immediateJob).catch((error) => {
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(runSearchJob(env, job).catch((error) => {
         console.warn(JSON.stringify({
           event: "search_start_background_failed",
-          jobId: immediateJob.id,
-          start: immediateJob.start,
-          target: immediateJob.target,
+          jobId: job.id,
+          start: job.start,
+          target: job.target,
           message: error?.message || String(error),
         }));
       }));
     }
-    return json({ ok: true, job: publicSearchJob(immediateJob) }, 202, "no-store");
   }
 
   return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
-}
-
-function settledValue(result) {
-  return result?.status === "fulfilled" ? result.value : null;
 }
 
 function bestPairChain(candidates) {
@@ -531,17 +476,34 @@ async function writeStartupPair(env, { id, start, target, range, pair, cached = 
   if (fragments) await writeFastLaneFragments(env, job);
 }
 
-async function handleSearchJob(url, env) {
+async function handleSearchJob(url, env, ctx) {
   const id = cleanAnalyticsId(url.searchParams.get("id"));
   if (!id) return json({ error: "missing id" }, 400, "no-store");
   let job = await readSearchJob(env, id);
   if (!job) return json({ error: "job not found" }, 404, "no-store");
   if (isActiveSearchStatus(job.status) && Date.now() >= Number(job.processingUntil || 0)) {
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
-    job = await runSearchJobChunk(env, id, {
+    const chunkOptions = {
       expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
       timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
-    }) || await readSearchJob(env, id) || job;
+    };
+    if (ctx?.waitUntil) {
+      const leaseMs = Math.min(SEARCH_LEASE_MS, chunkOptions.timeBudgetMs + 1000);
+      job = await updateSearchJob(env, id, {
+        status: "running",
+        progress: job.progress || "Continuing search.",
+        processingUntil: Date.now() + leaseMs,
+      }) || job;
+      ctx.waitUntil(runSearchJobChunk(env, id, { ...chunkOptions, ignoreLease: true }).catch((error) => {
+        console.warn(JSON.stringify({
+          event: "search_poll_background_failed",
+          jobId: id,
+          message: error?.message || String(error),
+        }));
+      }));
+    } else {
+      job = await runSearchJobChunk(env, id, chunkOptions) || await readSearchJob(env, id) || job;
+    }
   }
   return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
 }
@@ -592,7 +554,7 @@ async function runSearchJobChunk(env, id, options = {}) {
   const timeBudgetMs = Math.max(1000, Math.min(SEARCH_CHUNK_TIME_MS, Number(options.timeBudgetMs) || SEARCH_CHUNK_TIME_MS));
   let job = await readSearchJob(env, id);
   if (!job || !isActiveSearchStatus(job.status)) return job;
-  if (Number(job.processingUntil || 0) > Date.now()) return job;
+  if (!options.ignoreLease && Number(job.processingUntil || 0) > Date.now()) return job;
 
   const startedAt = job.startedAt || Date.now();
   const stats = job.searchInitialized

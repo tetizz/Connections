@@ -336,13 +336,11 @@ async function handleSearchStart(request, env, ctx) {
       analyticsPairResult,
       startLanePairResult,
       cachedFastLanePairResult,
-      startupCachedBfsPairResult,
     ] = await Promise.allSettled([
       readExactFastLanePair(env, start, target, range),
       readExactAnalyticsPair(env, start, target, range),
       readStartLanePair(env, start, target, range),
       readCachedFastLanePair(env, start, target, range),
-      readCachedBfsPair(env, start, target, range),
     ]);
     exactFastLanePair = settledValue(exactFastLanePairResult);
     analyticsPair = exactFastLanePair ? null : settledValue(analyticsPairResult);
@@ -352,7 +350,7 @@ async function handleSearchStart(request, env, ctx) {
       : settledValue(cachedFastLanePairResult);
     startupCachedBfsPair = exactFastLanePair || analyticsPair || startLanePair || cachedFastLanePair
       ? null
-      : settledValue(startupCachedBfsPairResult);
+      : await readCachedBfsPair(env, start, target, range).catch(() => null);
   }
   const cachedPair = storedPair || exactFastLanePair || analyticsPair || startLanePair || cachedFastLanePair || startupCachedBfsPair || requestPair;
   const promoteCachedPair = promoteStartupCachedPairs(env, {

@@ -80,7 +80,6 @@ window.Leaderboard = (() => {
         : "submitted chains";
       const ago = timeAgo(e.latestTs || e.ts);
       const metric = metricForEntry(e, category);
-      const quality = e.quality?.label ? ` · ${e.quality.label}` : "";
       return `
         <button class="lb-row${i < 3 ? " lb-row--top" : ""}" type="button" style="--row-index:${i}"
                 data-profile-trigger data-profile-user="${esc(e.username)}" title="Open ${esc(e.username)} profile">
@@ -88,7 +87,7 @@ window.Leaderboard = (() => {
           ${avatar}
           <div class="lb-main">
             <div class="lb-path">${title}${esc(displayName(profile, e.username))}</div>
-            <div class="lb-meta">${esc(metric.meta)} · ${esc(examples)} · ${ago}${esc(quality)}</div>
+            <div class="lb-meta">${esc(metric.meta)} · ${esc(examples)} · ${ago}</div>
           </div>
           <div class="lb-score">
             <strong>${esc(metric.value)}</strong>
@@ -112,6 +111,10 @@ window.Leaderboard = (() => {
     document.querySelectorAll("[data-category]").forEach((tab) => {
       tab.classList.toggle("is-active", tab.dataset.category === category);
     });
+    const heading = document.getElementById("lb-heading");
+    const sub = document.getElementById("lb-sub");
+    if (heading) heading.textContent = categoryLabel(category);
+    if (sub) sub.textContent = categoryDescription(category);
   }
 
   function metricForEntry(entry, category) {
@@ -165,6 +168,16 @@ window.Leaderboard = (() => {
       searched: "Most searched",
       recent: "Recent discoveries",
     }[category] || "Leaderboard";
+  }
+
+  function categoryDescription(category) {
+    return {
+      connectors: "People with the most completed connections.",
+      fastest: "Completed chains ranked by search time.",
+      top_targets: "Targets reached by the most unique players.",
+      searched: "Players that appear most often in searches.",
+      recent: "Newest completed discoveries.",
+    }[category] || "Latest leaderboard results.";
   }
 
   function durationLabel(ms) {

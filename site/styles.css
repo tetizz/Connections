@@ -1176,8 +1176,7 @@ html[data-theme="dark"] .search-queue {
 
 .quick-more {
   width: 100%;
-  min-height: 38px;
-  margin-top: 8px;
+  min-height: 48px;
   color: var(--brass-2);
   background:
     linear-gradient(135deg, rgba(255, 253, 248, .045), rgba(255, 253, 248, .018)),
@@ -1195,6 +1194,11 @@ html[data-theme="dark"] .search-queue {
   border-color: rgba(240, 201, 119, .46);
   box-shadow: 0 10px 24px rgba(0, 0, 0, .18);
   transform: translateY(-1px);
+}
+
+.quick-more--all {
+  grid-column: 1 / -1;
+  margin-top: 2px;
 }
 
 .graph-section,
@@ -1457,30 +1461,6 @@ html[data-theme="dark"] .leaderboard-avatar {
 .share-btn:hover svg,
 .replay-btn:hover svg {
   transform: rotate(-80deg);
-}
-
-.quality-badge {
-  display: grid;
-  gap: 2px;
-  min-width: 126px;
-  padding: 9px 11px;
-  color: #201408;
-  background: linear-gradient(145deg, #fff0b3, var(--gold) 60%, #9a6b24);
-  border: 1px solid rgba(255, 240, 179, .58);
-  border-radius: var(--radius);
-  box-shadow: 0 12px 30px rgba(201, 155, 75, .18);
-}
-
-.quality-badge span {
-  font-size: 9px;
-  font-weight: 900;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-}
-
-.quality-badge strong {
-  font-size: 13px;
-  line-height: 1.1;
 }
 
 .share-btn--image {
@@ -2834,7 +2814,6 @@ html[data-theme="dark"] .setting__btn--gold {
   }
 
   .graph-metric,
-  .quality-badge,
   .share-btn,
   .replay-btn {
     width: fit-content;

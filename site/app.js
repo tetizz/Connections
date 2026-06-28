@@ -170,7 +170,8 @@
       return;
     }
     const active = ($("#search-target")?.value || DEFAULT_TARGET).trim().toLowerCase();
-    wrap.innerHTML = playableGroups.map((group, groupIndex) => `
+    const hasHiddenTargets = playableGroups.some((group) => group.players.length > 5);
+    wrap.innerHTML = `${playableGroups.map((group, groupIndex) => `
       <section class="quick-group" style="--group-index:${groupIndex}" aria-label="${esc(group.label)} targets">
         <div class="quick-group__title">
           <span class="quick-group__icon quick-group__icon--${esc(group.id)}" aria-hidden="true">${quickIcon(group.icon)}</span>
@@ -180,9 +181,8 @@
         <div class="quick-group__players">
           ${group.players.map((player, index) => quickTargetButton(player, index, active)).join("")}
         </div>
-        ${group.players.length > 5 ? `<button class="quick-more" type="button" data-group="${esc(group.id)}">Show 5 more</button>` : ""}
       </section>
-    `).join("");
+    `).join("")}${hasHiddenTargets ? '<button class="quick-more quick-more--all" type="button" data-show-all-targets>See more</button>' : ""}`;
   }
 
   function quickTargetButton(player, index, active) {
@@ -525,23 +525,9 @@
     state.currentChain = chain;
     $("#target-name").textContent = chain.display || chain.target;
     $("#chain-length").textContent = chain.found ? chain.length : "—";
-    renderQualityBadge(chain);
     renderGraph(chain);
     renderCards(chain);
     updateShareButton(chain);
-  }
-
-  function renderQualityBadge(chain) {
-    const badge = $("#quality-badge");
-    if (!badge) return;
-    const quality = qualityFromChain(chain);
-    if (!chain?.found || !quality) {
-      badge.hidden = true;
-      return;
-    }
-    badge.hidden = false;
-    badge.querySelector("strong").textContent = `${quality.label} · ${quality.score}`;
-    badge.title = `${quality.proofs || 0} proof game${quality.proofs === 1 ? "" : "s"}${Number.isFinite(quality.ageDays) ? ` · newest proof ${quality.ageDays}d old` : ""}`;
   }
 
   function qualityFromChain(chain) {
@@ -780,7 +766,6 @@
       canvas.height = 760;
       const ctx = canvas.getContext("2d");
       drawShareBackground(ctx, canvas);
-      const quality = qualityFromChain(chain);
       ctx.fillStyle = "#f6efe2";
       ctx.font = "800 56px Inter, system-ui, sans-serif";
       ctx.fillText("Chess Connections", 80, 98);
@@ -788,7 +773,6 @@
       ctx.fillStyle = "rgba(246,239,226,.72)";
       ctx.fillText(`${nameOf(chain.path[0])} to ${nameOf(chain.path[chain.path.length - 1])}`, 82, 142);
       drawSharePill(ctx, `${chain.hops.length} proof game${chain.hops.length === 1 ? "" : "s"}`, 82, 182);
-      drawSharePill(ctx, `${quality.label} ${quality.score}`, 330, 182);
       await drawShareChain(ctx, chain);
       ctx.fillStyle = "rgba(246,239,226,.56)";
       ctx.font = "600 22px Inter, system-ui, sans-serif";
@@ -1068,8 +1052,7 @@
     const cacheRate = Number.isFinite(event.requests) || Number.isFinite(event.cached)
       ? `${cacheHitRate(event)} cache hit`
       : "";
-    const quality = event.quality?.label ? `${event.quality.label} ${event.quality.score}` : "";
-    const stats = [duration, requests, cached, cacheRate, quality].filter(Boolean).join(" · ");
+    const stats = [duration, requests, cached, cacheRate].filter(Boolean).join(" · ");
     const error = event.error ? `<div class="owner-event__chain">${esc(event.error)}</div>` : "";
     return `
       <div class="owner-event">
@@ -2761,13 +2744,14 @@
       return;
     }
 
-    const more = event.target.closest(".quick-more[data-group]");
+    const more = event.target.closest("[data-show-all-targets]");
     if (more) {
-      const group = more.closest(".quick-group");
-      group?.querySelectorAll(".quick-player[hidden]").forEach((player) => {
+      event.currentTarget.querySelectorAll(".quick-player[hidden]").forEach((player) => {
         player.hidden = false;
       });
-      group?.classList.add("is-expanded");
+      event.currentTarget.querySelectorAll(".quick-group").forEach((group) => {
+        group.classList.add("is-expanded");
+      });
       more.hidden = true;
       return;
     }

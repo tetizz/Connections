@@ -101,7 +101,7 @@ export default {
     }
 
     if (url.pathname === "/search/job" && request.method === "GET") {
-      return handleSearchJob(url, env, ctx);
+      return handleSearchJob(url, env);
     }
 
     if (url.pathname === "/search/warm" && (request.method === "GET" || request.method === "POST")) {
@@ -390,18 +390,6 @@ async function handleSearchStart(request, env, ctx) {
         message: error?.message || String(error),
       }));
     }));
-  } else if (!cachedPair) {
-    if (ctx?.waitUntil) {
-      ctx.waitUntil(runSearchJob(env, job).catch((error) => {
-        console.warn(JSON.stringify({
-          event: "search_start_background_failed",
-          jobId: job.id,
-          start: job.start,
-          target: job.target,
-          message: error?.message || String(error),
-        }));
-      }));
-    }
   }
 
   return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
@@ -476,34 +464,17 @@ async function writeStartupPair(env, { id, start, target, range, pair, cached = 
   if (fragments) await writeFastLaneFragments(env, job);
 }
 
-async function handleSearchJob(url, env, ctx) {
+async function handleSearchJob(url, env) {
   const id = cleanAnalyticsId(url.searchParams.get("id"));
   if (!id) return json({ error: "missing id" }, 400, "no-store");
   let job = await readSearchJob(env, id);
   if (!job) return json({ error: "job not found" }, 404, "no-store");
   if (isActiveSearchStatus(job.status) && Date.now() >= Number(job.processingUntil || 0)) {
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
-    const chunkOptions = {
+    job = await runSearchJobChunk(env, id, {
       expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
       timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
-    };
-    if (ctx?.waitUntil) {
-      const leaseMs = Math.min(SEARCH_LEASE_MS, chunkOptions.timeBudgetMs + 1000);
-      job = await updateSearchJob(env, id, {
-        status: "running",
-        progress: job.progress || "Continuing search.",
-        processingUntil: Date.now() + leaseMs,
-      }) || job;
-      ctx.waitUntil(runSearchJobChunk(env, id, { ...chunkOptions, ignoreLease: true }).catch((error) => {
-        console.warn(JSON.stringify({
-          event: "search_poll_background_failed",
-          jobId: id,
-          message: error?.message || String(error),
-        }));
-      }));
-    } else {
-      job = await runSearchJobChunk(env, id, chunkOptions) || await readSearchJob(env, id) || job;
-    }
+    }) || await readSearchJob(env, id) || job;
   }
   return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
 }
@@ -554,7 +525,7 @@ async function runSearchJobChunk(env, id, options = {}) {
   const timeBudgetMs = Math.max(1000, Math.min(SEARCH_CHUNK_TIME_MS, Number(options.timeBudgetMs) || SEARCH_CHUNK_TIME_MS));
   let job = await readSearchJob(env, id);
   if (!job || !isActiveSearchStatus(job.status)) return job;
-  if (!options.ignoreLease && Number(job.processingUntil || 0) > Date.now()) return job;
+  if (Number(job.processingUntil || 0) > Date.now()) return job;
 
   const startedAt = job.startedAt || Date.now();
   const stats = job.searchInitialized
@@ -800,13 +771,26 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
   const backwardVisited = visitedObjectToMap(search.backwardVisited);
   const edgesCache = new Map();
   let processed = 0;
-  let meeting = null;
+  let meeting = cleanUsername(search.bestMeeting);
+  let meetingLength = meeting ? cleanNonNegativeNumber(search.bestMeetingLength, SEARCH_MAX_DEPTH * 2 + 2) || Number.POSITIVE_INFINITY : Number.POSITIVE_INFINITY;
 
   const syncSearch = () => {
     search.forwardVisited = visitedMapToObject(forwardVisited);
     search.backwardVisited = visitedMapToObject(backwardVisited);
+    search.bestMeeting = meeting || "";
+    search.bestMeetingLength = Number.isFinite(meetingLength) ? meetingLength : 0;
   };
   const totalVisited = () => forwardVisited.size + backwardVisited.size;
+  const considerMeeting = (candidate) => {
+    const cleanCandidate = cleanUsername(candidate);
+    if (!cleanCandidate) return;
+    const chain = reconstructServerPath(cleanCandidate, forwardVisited, backwardVisited);
+    const steps = chain?.path?.length ? chain.path.length - 1 : Number.POSITIVE_INFINITY;
+    if (steps < meetingLength) {
+      meeting = cleanCandidate;
+      meetingLength = steps;
+    }
+  };
   const freshUsers = job.refreshCached && Array.isArray(job.chain?.path)
     ? new Set(job.chain.path.map(cleanUsername).filter(Boolean))
     : new Set();
@@ -858,6 +842,8 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     search.activeFrontier = [];
     search.activeCursor = 0;
     search.activeNextFrontier = [];
+    meeting = null;
+    meetingLength = Number.POSITIVE_INFINITY;
     search.depth += 1;
     syncSearch();
     await progress(`Checked ${stats.expanded} players, ${totalVisited()} candidates`, { depth: search.depth });
@@ -873,6 +859,10 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     }
 
     if (search.activeCursor >= search.activeFrontier.length) {
+      if (meeting) {
+        syncSearch();
+        return { status: "found", chain: reconstructServerPath(meeting, forwardVisited, backwardVisited) };
+      }
       await finishLayer();
       continue;
     }
@@ -898,7 +888,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     }), SEARCH_EXPANSION_CONCURRENCY);
 
     for (const item of edgeBatch) {
-      if (meeting || !item?.node || !item.edges) break;
+      if (!item?.node || !item.edges) continue;
       const node = item.node;
       const edges = item.edges;
       if (search.activeSide === "forward") {
@@ -906,8 +896,8 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
           if (forwardVisited.has(opponent)) continue;
           if (backwardVisited.has(opponent)) {
             forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
-            meeting = opponent;
-            break;
+            considerMeeting(opponent);
+            continue;
           }
           if (forwardVisited.size < SEARCH_VISITED_LIMIT && search.activeNextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) {
             forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
@@ -919,8 +909,8 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
           if (backwardVisited.has(opponent)) continue;
           if (forwardVisited.has(opponent)) {
             backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
-            meeting = opponent;
-            break;
+            considerMeeting(opponent);
+            continue;
           }
           if (backwardVisited.size < SEARCH_VISITED_LIMIT && search.activeNextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) {
             backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
@@ -930,7 +920,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
       }
     }
 
-    if (meeting) {
+    if (meeting && search.activeCursor >= search.activeFrontier.length) {
       syncSearch();
       return { status: "found", chain: reconstructServerPath(meeting, forwardVisited, backwardVisited) };
     }
@@ -1105,6 +1095,9 @@ async function tryFastLaneConnection(env, job, stats) {
     };
   }
 
+  const cachedRoute = await tryCachedRouteLanes(env, job, stats, savedStepLimit);
+  if (cachedRoute) return cachedRoute;
+
   const startGames = job.chain?.found
     ? (await readCachedGames(env, {
         username: job.start,
@@ -1153,6 +1146,27 @@ async function tryFastLaneConnection(env, job, stats) {
     return { source: "known-route", chain: hinted };
   }
   return best;
+}
+
+async function tryCachedRouteLanes(env, job, stats, savedStepLimit) {
+  const results = await Promise.allSettled([
+    readExactAnalyticsPair(env, job.start, job.target, job.range),
+    readStartLanePair(env, job.start, job.target, job.range),
+    readCachedFastLanePair(env, job.start, job.target, job.range),
+    readCachedBfsPair(env, job.start, job.target, job.range),
+  ]);
+  const best = bestPairChain(results
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => result.value));
+  if (!best?.chain?.found || chainStepCount(best.chain) >= savedStepLimit) return null;
+  stats.cached = Number(stats.cached || 0) + 2;
+  return {
+    source: best.chain.quality?.source || "cached-route",
+    chain: {
+      path: best.chain.path,
+      hops: best.chain.hops,
+    },
+  };
 }
 
 async function tryLeaderboardRouteHint(env, job, stats) {
@@ -2821,6 +2835,8 @@ function initialSearchState(start, target) {
     activeFrontier: [],
     activeCursor: 0,
     activeNextFrontier: [],
+    bestMeeting: "",
+    bestMeetingLength: 0,
   };
 }
 
@@ -2844,6 +2860,8 @@ function searchStateShape(state, start, target) {
     activeFrontier: activeSide ? cleanUsernameList(state.activeFrontier, SEARCH_FRONTIER_LIMIT) : [],
     activeCursor: cleanNonNegativeNumber(state.activeCursor, SEARCH_FRONTIER_LIMIT) || 0,
     activeNextFrontier: activeSide ? cleanUsernameList(state.activeNextFrontier, SEARCH_NEXT_FRONTIER_LIMIT) : [],
+    bestMeeting: activeSide ? cleanUsername(state.bestMeeting) : "",
+    bestMeetingLength: activeSide ? cleanNonNegativeNumber(state.bestMeetingLength, SEARCH_MAX_DEPTH * 2 + 2) || 0 : 0,
   };
 }
 

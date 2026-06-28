@@ -969,6 +969,7 @@
     const wrap = $("#owner-analytics");
     const btn = $("#owner-load");
     const filters = $("#owner-filters");
+    const tools = $("#owner-tools");
     const code = String(codeInput?.value || "").trim();
     if (!remoteBase || !codeInput || !status || !wrap || !btn) return;
     if (!code) {
@@ -976,6 +977,7 @@
       status.textContent = "Enter the owner code first.";
       wrap.hidden = true;
       if (filters) filters.hidden = true;
+      if (tools) tools.hidden = true;
       return;
     }
 
@@ -1008,17 +1010,80 @@
       renderOwnerAnalytics(data);
       state.ownerCode = code;
       if (filters) filters.hidden = false;
+      if (tools) tools.hidden = false;
       status.hidden = false;
       const total = Number(data.total || 0);
       status.textContent = `${plainNumber(total)} matching event${total === 1 ? "" : "s"}.`;
+      loadOwnerWarmStatus(false).catch(() => {});
     } catch (error) {
+      state.ownerCode = "";
       wrap.hidden = true;
       if (filters) filters.hidden = true;
+      if (tools) tools.hidden = true;
       status.hidden = false;
       status.textContent = error.message || "Could not load analytics.";
     } finally {
       btn.disabled = false;
     }
+  }
+
+  async function loadOwnerWarmStatus(force = false) {
+    const remoteBase = workerBase();
+    const panel = $("#owner-tools");
+    const stateEl = $("#owner-warm-state");
+    const metrics = $("#owner-warm-metrics");
+    const runBtn = $("#owner-warm-run");
+    const refreshBtn = $("#owner-warm-refresh");
+    if (!remoteBase || !panel || !stateEl || !metrics || !state.ownerCode) return;
+
+    panel.hidden = false;
+    stateEl.textContent = force ? "Warming" : "Checking";
+    metrics.innerHTML = `
+      <span><strong>...</strong> players</span>
+      <span><strong>...</strong> fragments</span>
+      <span><strong>...</strong> issues</span>
+      <span><strong>...</strong> updated</span>`;
+    if (runBtn) runBtn.disabled = true;
+    if (refreshBtn) refreshBtn.disabled = true;
+
+    try {
+      const url = new URL(`${remoteBase}/search/warm`);
+      if (force) url.searchParams.set("force", "1");
+      const res = await fetch(url.toString(), {
+        method: force ? "POST" : "GET",
+        headers: { "Accept": "application/json" },
+      });
+      if (!res.ok) throw new Error("Cache status unavailable.");
+      const data = await res.json();
+      renderOwnerWarmStatus(data?.status || data || {});
+    } catch (error) {
+      stateEl.textContent = "Unavailable";
+      metrics.innerHTML = `
+        <span class="owner-warm-metric--wide"><strong>Could not load</strong> ${esc(error.message || "Try again.")}</span>`;
+    } finally {
+      if (runBtn) runBtn.disabled = false;
+      if (refreshBtn) refreshBtn.disabled = false;
+    }
+  }
+
+  function renderOwnerWarmStatus(status) {
+    const stateEl = $("#owner-warm-state");
+    const metrics = $("#owner-warm-metrics");
+    if (!stateEl || !metrics) return;
+    const rawState = String(status?.status || "queued").toLowerCase();
+    const label = rawState === "ready"
+      ? "Ready"
+      : rawState === "failed"
+        ? "Needs attention"
+        : rawState === "queued"
+          ? "Queued"
+          : "Warming";
+    stateEl.textContent = label;
+    metrics.innerHTML = `
+      <span><strong>${plainNumber(status?.warmed || 0)}</strong> players</span>
+      <span><strong>${plainNumber(status?.fragments || 0)}</strong> fragments</span>
+      <span><strong>${plainNumber(status?.errors || 0)}</strong> issues</span>
+      <span><strong>${esc(timeAgo(status?.updatedAt) || "unknown")}</strong> updated</span>`;
   }
 
   function renderOwnerAnalytics(data) {
@@ -2630,11 +2695,13 @@
     const ownerStatus = $("#owner-status");
     const ownerAnalytics = $("#owner-analytics");
     const ownerFilters = $("#owner-filters");
+    const ownerTools = $("#owner-tools");
     if (ownerStatus) {
       ownerStatus.hidden = true;
       ownerStatus.textContent = "";
     }
     if (ownerFilters && !state.ownerCode) ownerFilters.hidden = true;
+    if (ownerTools) ownerTools.hidden = !state.ownerCode;
     if (ownerAnalytics) {
       ownerAnalytics.hidden = true;
       ownerAnalytics.innerHTML = "";
@@ -2676,6 +2743,12 @@
       if (field) field.value = "";
     });
     loadOwnerAnalytics();
+  });
+  $("#owner-warm-run")?.addEventListener("click", () => {
+    loadOwnerWarmStatus(true);
+  });
+  $("#owner-warm-refresh")?.addEventListener("click", () => {
+    loadOwnerWarmStatus(false);
   });
 
   // persist username typed in settings

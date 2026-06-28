@@ -37,12 +37,14 @@ const SEARCH_LEASE_MS = 15000;
 const SEARCH_VISITED_LIMIT = 12000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 3000;
 const CACHED_SHORTER_CHECK_REQUESTS = 0;
-const CACHED_SHORTER_CHECK_EXPANSIONS = 8;
-const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 8;
-const CACHED_SHORTER_CHECK_TIME_MS = 2500;
+const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
+const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 48;
+const CACHED_SHORTER_CHECK_TIME_MS = 6000;
 const STARTUP_CACHE_BFS_EXPANSIONS = 96;
 const STARTUP_CACHE_BFS_TIME_MS = 900;
 const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 160;
+const STARTUP_SEARCH_EXPANSIONS = 18;
+const STARTUP_SEARCH_TIME_MS = 3500;
 const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const SHARE_ID_LENGTH = 8;
@@ -325,12 +327,13 @@ async function handleSearchStart(request, env, ctx) {
   }, start, target, range);
 
   const storedPair = await readPairChain(env, start, target, range);
+  const shouldProbeStartupRoutes = !storedPair;
   let exactFastLanePair = null;
   let analyticsPair = null;
   let startLanePair = null;
   let cachedFastLanePair = null;
   let startupCachedBfsPair = null;
-  if (!storedPair) {
+  if (shouldProbeStartupRoutes) {
     const [
       exactFastLanePairResult,
       analyticsPairResult,
@@ -343,16 +346,30 @@ async function handleSearchStart(request, env, ctx) {
       readCachedFastLanePair(env, start, target, range),
     ]);
     exactFastLanePair = settledValue(exactFastLanePairResult);
-    analyticsPair = exactFastLanePair ? null : settledValue(analyticsPairResult);
-    startLanePair = exactFastLanePair || analyticsPair ? null : settledValue(startLanePairResult);
-    cachedFastLanePair = exactFastLanePair || analyticsPair || startLanePair
-      ? null
-      : settledValue(cachedFastLanePairResult);
-    startupCachedBfsPair = exactFastLanePair || analyticsPair || startLanePair || cachedFastLanePair
+    analyticsPair = settledValue(analyticsPairResult);
+    startLanePair = settledValue(startLanePairResult);
+    cachedFastLanePair = settledValue(cachedFastLanePairResult);
+    const bestBeforeCachedBfs = bestPairChain([
+      storedPair,
+      exactFastLanePair,
+      analyticsPair,
+      startLanePair,
+      cachedFastLanePair,
+    ]);
+    const bestBeforeCachedBfsSteps = chainStepCount(bestBeforeCachedBfs?.chain);
+    startupCachedBfsPair = Number.isFinite(bestBeforeCachedBfsSteps) && bestBeforeCachedBfsSteps <= 2
       ? null
       : await readCachedBfsPair(env, start, target, range).catch(() => null);
   }
-  const cachedPair = storedPair || exactFastLanePair || analyticsPair || startLanePair || cachedFastLanePair || startupCachedBfsPair || requestPair;
+  const cachedPair = bestPairChain([
+    storedPair,
+    exactFastLanePair,
+    analyticsPair,
+    startLanePair,
+    cachedFastLanePair,
+    startupCachedBfsPair,
+    requestPair,
+  ]);
   const promoteCachedPair = promoteStartupCachedPairs(env, {
     id,
     start,
@@ -365,6 +382,7 @@ async function handleSearchStart(request, env, ctx) {
     cachedFastLanePair,
     startupCachedBfsPair,
     requestPair,
+    cachedPair,
   }).catch((error) => {
     console.warn(JSON.stringify({
       event: "startup_pair_promotion_failed",
@@ -418,16 +436,23 @@ async function handleSearchStart(request, env, ctx) {
         message: error?.message || String(error),
       }));
     }));
-  } else if (ctx?.waitUntil && !cachedPair) {
-    ctx.waitUntil(runSearchJob(env, job).catch((error) => {
-      console.warn(JSON.stringify({
-        event: "search_start_background_failed",
-        jobId: job.id,
-        start: job.start,
-        target: job.target,
-        message: error?.message || String(error),
+  } else if (!cachedPair) {
+    const immediateJob = await runSearchJobChunk(env, job.id, {
+      expansionBudget: STARTUP_SEARCH_EXPANSIONS,
+      timeBudgetMs: STARTUP_SEARCH_TIME_MS,
+    }) || await readSearchJob(env, job.id) || job;
+    if (ctx?.waitUntil && isActiveSearchStatus(immediateJob.status)) {
+      ctx.waitUntil(runSearchJob(env, immediateJob).catch((error) => {
+        console.warn(JSON.stringify({
+          event: "search_start_background_failed",
+          jobId: immediateJob.id,
+          start: immediateJob.start,
+          target: immediateJob.target,
+          message: error?.message || String(error),
+        }));
       }));
-    }));
+    }
+    return json({ ok: true, job: publicSearchJob(immediateJob) }, 202, "no-store");
   }
 
   return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
@@ -437,6 +462,34 @@ function settledValue(result) {
   return result?.status === "fulfilled" ? result.value : null;
 }
 
+function bestPairChain(candidates) {
+  let best = null;
+  for (const candidate of candidates || []) {
+    if (!candidate?.chain?.found) continue;
+    if (!best || isPairShorterThan(candidate, best) || isPairFresherTie(candidate, best)) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+function isPairShorterThan(candidate, current) {
+  const candidateSteps = chainStepCount(candidate?.chain);
+  const currentSteps = chainStepCount(current?.chain);
+  if (!Number.isFinite(candidateSteps)) return false;
+  if (!Number.isFinite(currentSteps)) return true;
+  return candidateSteps < currentSteps;
+}
+
+function isPairFresherTie(candidate, current) {
+  const candidateSteps = chainStepCount(candidate?.chain);
+  const currentSteps = chainStepCount(current?.chain);
+  if (!Number.isFinite(candidateSteps) || candidateSteps !== currentSteps) return false;
+  const candidateTs = Number(candidate?.checkedAt || candidate?.savedAt || 0);
+  const currentTs = Number(current?.checkedAt || current?.savedAt || 0);
+  return candidateTs > currentTs;
+}
+
 async function promoteStartupCachedPairs(env, pairs) {
   const {
     id,
@@ -444,32 +497,20 @@ async function promoteStartupCachedPairs(env, pairs) {
     target,
     range,
     storedPair,
-    exactFastLanePair,
-    analyticsPair,
-    startLanePair,
-    cachedFastLanePair,
-    startupCachedBfsPair,
     requestPair,
+    cachedPair,
   } = pairs;
-  if (storedPair) return;
-  if (exactFastLanePair) {
-    await writeStartupPair(env, { id, start, target, range, pair: exactFastLanePair, cached: 1 });
-  }
-  if (!exactFastLanePair && !analyticsPair && startLanePair) {
-    await writeStartupPair(env, { id, start, target, range, pair: startLanePair, cached: 2, fragments: true });
-  }
-  if (!exactFastLanePair && !analyticsPair && !startLanePair && cachedFastLanePair) {
-    await writeStartupPair(env, { id, start, target, range, pair: cachedFastLanePair, cached: 2, fragments: true });
-  }
-  if (!exactFastLanePair && !analyticsPair && !startLanePair && !cachedFastLanePair && startupCachedBfsPair) {
-    await writeStartupPair(env, { id, start, target, range, pair: startupCachedBfsPair, cached: 2, fragments: true });
-  }
-  if (!exactFastLanePair && analyticsPair) {
-    await writeStartupPair(env, { id, start, target, range, pair: analyticsPair, cached: 2, fragments: true });
-  }
-  if (requestPair) {
-    await writeStartupPair(env, { id, start, target, range, pair: requestPair, cached: 0 });
-  }
+  if (!cachedPair?.chain?.found) return;
+  if (storedPair?.chain?.found && !isPairShorterThan(cachedPair, storedPair)) return;
+  await writeStartupPair(env, {
+    id,
+    start,
+    target,
+    range,
+    pair: cachedPair,
+    cached: cachedPair === requestPair ? 0 : 2,
+    fragments: cachedPair !== requestPair,
+  });
 }
 
 async function writeStartupPair(env, { id, start, target, range, pair, cached = 0, fragments = false }) {
@@ -1702,7 +1743,52 @@ async function handleShareRead(url, env) {
   if (!id) return json({ error: "missing id" }, 400, "no-store");
   const record = shareRecordShape(await env.GAMES_CACHE.get(`share:${id}`, { type: "json", cacheTtl: 60 }));
   if (!record) return json({ error: "share not found" }, 404, "no-store");
-  return json({ ok: true, id, share: publicShareRecord({ ...record, id }) }, 200, "public, max-age=60");
+  const upgraded = await upgradeShareRecord(env, record).catch(() => record);
+  return json({ ok: true, id, share: publicShareRecord({ ...upgraded, id }) }, 200, "public, max-age=60");
+}
+
+async function upgradeShareRecord(env, record) {
+  const shaped = shareRecordShape(record);
+  if (!shaped?.chain?.found) return record;
+  const currentPair = pairChainShape({
+    start: shaped.start,
+    target: shaped.target,
+    range: "auto",
+    chain: shaped.chain,
+    players: shaped.players,
+    savedAt: shaped.ts,
+    checkedAt: shaped.ts,
+  }, shaped.start, shaped.target, "auto");
+  const savedPair = await readPairChain(env, shaped.start, shaped.target, "auto");
+  const bestBeforeCachedBfs = bestPairChain([currentPair, savedPair]);
+  const bestBeforeSteps = chainStepCount(bestBeforeCachedBfs?.chain);
+  const cachedBfsPair = Number.isFinite(bestBeforeSteps) && bestBeforeSteps <= 2
+    ? null
+    : await readCachedBfsPair(env, shaped.start, shaped.target, "auto").catch(() => null);
+  const best = bestPairChain([currentPair, savedPair, cachedBfsPair]);
+  if (!best?.chain?.found || !isPairShorterThan(best, currentPair)) return record;
+
+  const players = { ...shaped.players, ...(best.players || {}) };
+  await writePairChain(env, {
+    id: cleanAnalyticsId(`share-${shaped.start}-${shaped.target}`) || crypto.randomUUID(),
+    start: shaped.start,
+    target: shaped.target,
+    range: "auto",
+    status: "found",
+    chain: best.chain,
+    players,
+    stats: { fetched: 0, requests: 0, cached: 2, expanded: 0 },
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  return {
+    ...record,
+    start: shaped.start,
+    target: shaped.target,
+    chain: best.chain,
+    players,
+    ts: best.savedAt || shaped.ts,
+  };
 }
 
 function shareRecordShape(value) {

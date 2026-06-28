@@ -492,8 +492,8 @@
     const safeClass = esc(className);
     return `
       <span class="${safeClass}" title="${esc(label)}">
-        <img src="https://flagcdn.com/w20/${esc(code)}.png"
-             srcset="https://flagcdn.com/w40/${esc(code)}.png 2x"
+        <img src="https://flagcdn.com/w40/${esc(code)}.png"
+             srcset="https://flagcdn.com/w80/${esc(code)}.png 2x"
              alt="${esc(label)} flag"
              loading="lazy"
              decoding="async"
@@ -1606,11 +1606,8 @@
       body.className = "card__body";
       const line = document.createElement("div");
       line.className = "card__line";
-      const wt = titleOf(hop.from), lt = titleOf(hop.to);
       line.innerHTML =
-        (wt ? `<span class="card__title-tag">${esc(wt)}</span>` : "") +
         `<span class="winner">${esc(nameOf(hop.from))}</span> beat ` +
-        (lt ? `<span class="card__title-tag">${esc(lt)}</span>` : "") +
         `<span class="loser">${esc(nameOf(hop.to))}</span>`;
       body.appendChild(line);
       const details = proofDetails(hop, i, chain.hops.length);
@@ -1821,7 +1818,7 @@
     const joined = profile?.joined ? `<span>Joined ${esc(formatProfileDate(profile.joined))}</span>` : `<span>Joined unavailable</span>`;
     const countryFlag = profile?.country ? flagIcon(profile.country, "profile-popover__flag") : "";
     const country = countryFlag
-      ? `<span class="profile-popover__identity-flag" title="${esc(profile.country.toUpperCase())}">${countryFlag}</span>`
+      ? `<span class="profile-popover__country" title="${esc(profile.country.toUpperCase())}">${countryFlag}</span>`
       : "";
     const followers = Number.isFinite(profile?.followers)
       ? `<span>${plainNumber(profile.followers)} followers</span>`
@@ -1841,10 +1838,10 @@
         <span class="profile-popover__avatar">${avatar}</span>
         <span class="profile-popover__main">
           <strong>${title}${esc(display)}</strong>
-          <small><span>@${esc(handle)}</span>${country}</small>
+          <small><span>@${esc(handle)}</span></small>
         </span>
       </div>
-      <div class="profile-popover__meta">${followers}${joined}${online}${location}${fide}${status}</div>
+      <div class="profile-popover__meta">${country}${followers}${joined}${online}${location}${fide}${status}</div>
       ${stats}
       ${recentGames}
       <a class="profile-popover__open" href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>

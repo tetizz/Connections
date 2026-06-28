@@ -303,7 +303,7 @@ html[data-theme="dark"] .command-center {
 }
 
 .command-center::before {
-  content: "a b c d e f g h";
+  content: "";
   position: absolute;
   right: -18px;
   top: 24px;
@@ -315,7 +315,7 @@ html[data-theme="dark"] .command-center {
   max-width: 360px;
   pointer-events: none;
   z-index: -1;
-  animation: dataDrift 11s ease-in-out infinite alternate;
+  animation: none;
   text-shadow: 0 0 22px rgba(232, 187, 99, .10);
 }
 
@@ -2216,6 +2216,18 @@ html[data-theme="dark"] .card__avatar-fallback {
   border-radius: 4px;
 }
 
+.profile-popover__country {
+  min-width: 44px;
+  justify-content: center;
+  padding-inline: 7px;
+}
+
+.profile-popover__country .profile-popover__flag {
+  width: 30px;
+  height: 22px;
+  border-radius: 5px;
+}
+
 .profile-popover__title {
   margin-right: 6px;
   color: var(--brass-2);
@@ -2248,10 +2260,10 @@ html[data-theme="dark"] .card__avatar-fallback {
   flex: 0 0 auto;
   display: inline-grid;
   place-items: center;
-  width: 24px;
-  height: 18px;
+  width: 30px;
+  height: 22px;
   overflow: hidden;
-  border-radius: 3px;
+  border-radius: 5px;
   background: rgba(255, 253, 248, .08);
   border: 0;
   padding: 0;
@@ -2447,6 +2459,7 @@ html[data-theme="dark"] .modal {
   height: 40px;
   display: inline-grid;
   place-items: center;
+  align-self: center;
   padding: 0;
   border-radius: var(--radius);
   line-height: 0;
@@ -2456,6 +2469,7 @@ html[data-theme="dark"] .modal {
   display: block;
   width: 20px;
   height: 20px;
+  pointer-events: none;
 }
 
 .modal__body {

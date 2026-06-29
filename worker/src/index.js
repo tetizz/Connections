@@ -45,6 +45,7 @@ const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
 const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 24;
 const CACHED_SHORTER_CHECK_CONCURRENCY = 16;
 const CACHED_SHORTER_CHECK_TIME_MS = 4500;
+const VISIBLE_SHORTER_CHECK_MIN_STEPS = 4;
 const STARTUP_CACHE_BFS_EXPANSIONS = 96;
 const STARTUP_CACHE_BFS_TIME_MS = 900;
 const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 160;
@@ -405,9 +406,15 @@ async function handleSearchStart(request, env, ctx) {
     checkedAt: null,
   }, start, target, range);
 
-  const storedPair = await readPairChain(env, start, target, range);
+  const [storedPair, graphIndexPair, analyticsPair] = await Promise.all([
+    readPairChain(env, start, target, range).catch(() => null),
+    readGraphIndexPair(env, start, target, range).catch(() => null),
+    readExactAnalyticsPair(env, start, target, range).catch(() => null),
+  ]);
   const cachedPair = bestPairChain([
     storedPair,
+    graphIndexPair,
+    analyticsPair,
     requestPair,
   ]);
   const promoteCachedPair = promoteStartupCachedPairs(env, {
@@ -442,7 +449,10 @@ async function handleSearchStart(request, env, ctx) {
     }), { expirationTtl: SEARCH_WINDOW_SECONDS * 2 });
   }
 
-  const shouldRefreshCachedPair = Boolean(cachedPair?.chain?.found && chainStepCount(cachedPair.chain) > 2);
+  const shouldRefreshCachedPair = Boolean(
+    cachedPair?.chain?.found &&
+    chainStepCount(cachedPair.chain) >= VISIBLE_SHORTER_CHECK_MIN_STEPS
+  );
   const job = searchJobShape({
     id,
     start,
@@ -1979,12 +1989,17 @@ async function warmLeaderboardTargets(env) {
 }
 
 function publicWarmStatus(status) {
+  const updatedAt = Number.isFinite(status?.updatedAt) ? status.updatedAt : Date.now();
+  const graphNodes = Number.isFinite(status?.graphNodes) ? status.graphNodes : 0;
+  const staleQueued = String(status?.status || "").toLowerCase() === "queued" &&
+    graphNodes > 0 &&
+    Date.now() - updatedAt > 5 * 60 * 1000;
   return {
-    status: String(status?.status || "queued"),
-    updatedAt: Number.isFinite(status?.updatedAt) ? status.updatedAt : Date.now(),
+    status: staleQueued ? "ready" : String(status?.status || "queued"),
+    updatedAt,
     warmed: Number.isFinite(status?.warmed) ? status.warmed : 0,
     fragments: Number.isFinite(status?.fragments) ? status.fragments : 0,
-    graphNodes: Number.isFinite(status?.graphNodes) ? status.graphNodes : 0,
+    graphNodes,
     errors: Number.isFinite(status?.errors) ? status.errors : 0,
   };
 }

@@ -30,6 +30,7 @@ const GRAPH_INDEX_KEY = "graph:index:v1";
 const GRAPH_INDEX_NODE_LIMIT = 900;
 const GRAPH_INDEX_EDGE_LIMIT = 24;
 const GRAPH_INDEX_WARM_KEY_LIMIT = 900;
+const GRAPH_BRIDGE_CONNECTOR_LIMIT = 120;
 const SEARCH_MAX_DEPTH = 5;
 const SEARCH_MAX_EXPANSIONS = 520;
 const SEARCH_FRONTIER_LIMIT = 200;
@@ -1367,7 +1368,12 @@ async function tryCachedRouteLanes(env, job, stats, savedStepLimit) {
 
 async function tryPrimedGraphIndexPair(env, job, stats, savedStepLimit) {
   const archiveLimit = Math.min(6, archiveLimitForRange(job.range) || 6);
-  const startEdges = await readOrFetchEdges(env, { username: job.start, archiveLimit }, stats).catch(() => null);
+  const startGames = await readOrFetchGames(env, { username: job.start, archiveLimit }, stats).catch(() => null);
+  const startEdges = startGames ? edgesFromGames(job.start, startGames) : null;
+  if (startEdges) {
+    await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed({ username: job.start, archiveLimit }), { username: job.start, archiveLimit }, startEdges)
+      .catch(() => {});
+  }
   if (startEdges && edgeMapSize(startEdges.beatenByMe) === 0) {
     return {
       notFound: true,
@@ -1375,6 +1381,18 @@ async function tryPrimedGraphIndexPair(env, job, stats, savedStepLimit) {
     };
   }
   await readOrFetchEdges(env, { username: job.target, archiveLimit }, stats).catch(() => null);
+  const graphBridge = await tryGraphIndexBridgeFromStart(env, {
+    start: job.start,
+    target: job.target,
+    range: job.range,
+    startEdges,
+    startGames: startGames || [],
+    savedStepLimit,
+  });
+  if (graphBridge) {
+    stats.cached = Number(stats.cached || 0) + 2;
+    return graphBridge;
+  }
   const pair = await readGraphIndexPair(env, job.start, job.target, job.range);
   if (!pair?.chain?.found || chainStepCount(pair.chain) >= savedStepLimit) return null;
   return {
@@ -1384,6 +1402,50 @@ async function tryPrimedGraphIndexPair(env, job, stats, savedStepLimit) {
       hops: pair.chain.hops,
     },
   };
+}
+
+async function tryGraphIndexBridgeFromStart(env, { start, target, range, startEdges, startGames, savedStepLimit }) {
+  const cleanStart = cleanUsername(start);
+  const cleanTarget = cleanUsername(target);
+  if (!cleanStart || !cleanTarget || !startEdges) return null;
+
+  const directUrls = startEdges.beatenByMe.get(cleanTarget);
+  if (directUrls?.length && 1 < savedStepLimit) {
+    const hops = await enrichHopsFromGames([
+      { from: cleanStart, to: cleanTarget, url: directUrls[0] },
+    ], startGames || []);
+    return {
+      source: "direct-recent-win",
+      chain: { path: [cleanStart, cleanTarget], hops },
+    };
+  }
+
+  const graph = graphIndexShape(await env.GAMES_CACHE.get(GRAPH_INDEX_KEY, { type: "json" }));
+  if (!graph.nodes?.[cleanTarget]) return null;
+  let best = null;
+  let scanned = 0;
+  for (const [connector, urls] of startEdges.beatenByMe) {
+    if (scanned++ >= GRAPH_BRIDGE_CONNECTOR_LIMIT) break;
+    if (connector === cleanStart || connector === cleanTarget || !graph.nodes?.[connector]) continue;
+    const tail = graphIndexBfs(graph, connector, cleanTarget);
+    if (!tail?.path?.length) continue;
+    const path = [cleanStart, ...tail.path];
+    if (new Set(path).size !== path.length) continue;
+    const steps = path.length - 1;
+    if (steps >= savedStepLimit) continue;
+    const firstHop = (await enrichHopsFromGames([
+      { from: cleanStart, to: connector, url: urls?.[0] },
+    ], startGames || []))[0];
+    const hops = cleanHopList([firstHop, ...cleanHopList(tail.hops)]);
+    if (hops.length !== steps) continue;
+    const candidate = {
+      source: "graph-bridge",
+      chain: { path, hops },
+    };
+    if (!best || candidate.chain.path.length < best.chain.path.length) best = candidate;
+    if (best && best.chain.path.length <= 3) break;
+  }
+  return best;
 }
 
 function edgeMapSize(map) {

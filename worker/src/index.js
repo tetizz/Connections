@@ -26,6 +26,10 @@ const MAX_ANALYTICS_LIMIT = 50;
 const MAX_ANALYTICS_EVENTS_PER_WINDOW = 80;
 const ANALYTICS_EVENTS_KEY = "analytics:events";
 const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
+const GRAPH_INDEX_KEY = "graph:index:v1";
+const GRAPH_INDEX_NODE_LIMIT = 900;
+const GRAPH_INDEX_EDGE_LIMIT = 24;
+const GRAPH_INDEX_WARM_KEY_LIMIT = 900;
 const SEARCH_MAX_DEPTH = 5;
 const SEARCH_MAX_EXPANSIONS = 520;
 const SEARCH_FRONTIER_LIMIT = 200;
@@ -688,6 +692,19 @@ async function runSearchJobChunk(env, id, options = {}) {
     if (!search.fastLaneChecked) {
       const fastLane = await tryFastLaneConnection(env, job, stats);
       search.fastLaneChecked = true;
+      if (fastLane?.notFound) {
+        await completeSearchJob(env, job, {
+          status: "not_found",
+          outcome: "not_found",
+          progress: fastLane.progress || "No connection found in this search.",
+          stats,
+          search,
+          processingUntil: 0,
+          processingToken: "",
+          durationMs: Date.now() - startedAt,
+        }, ownerToken);
+        return readSearchJob(env, id);
+      }
       if (fastLane?.chain) {
         const cachedChain = job.chain?.found ? job.chain : null;
         const fastLaneIsShorter = !cachedChain || chainStepCount(fastLane.chain) < chainStepCount(cachedChain);
@@ -1229,6 +1246,9 @@ async function tryFastLaneConnection(env, job, stats) {
   const cachedRoute = await tryCachedRouteLanes(env, job, stats, savedStepLimit);
   if (cachedRoute) return cachedRoute;
 
+  const primedGraphRoute = await tryPrimedGraphIndexPair(env, job, stats, savedStepLimit);
+  if (primedGraphRoute) return primedGraphRoute;
+
   const startGames = job.chain?.found
     ? (await readCachedGames(env, {
         username: job.start,
@@ -1284,6 +1304,7 @@ async function tryCachedRouteLanes(env, job, stats, savedStepLimit) {
     readExactAnalyticsPair(env, job.start, job.target, job.range),
     readStartLanePair(env, job.start, job.target, job.range),
     readCachedFastLanePair(env, job.start, job.target, job.range),
+    readGraphIndexPair(env, job.start, job.target, job.range),
     readCachedBfsPair(env, job.start, job.target, job.range),
   ]);
   const best = bestPairChain(results
@@ -1298,6 +1319,31 @@ async function tryCachedRouteLanes(env, job, stats, savedStepLimit) {
       hops: best.chain.hops,
     },
   };
+}
+
+async function tryPrimedGraphIndexPair(env, job, stats, savedStepLimit) {
+  const archiveLimit = Math.min(6, archiveLimitForRange(job.range) || 6);
+  const startEdges = await readOrFetchEdges(env, { username: job.start, archiveLimit }, stats).catch(() => null);
+  if (startEdges && edgeMapSize(startEdges.beatenByMe) === 0) {
+    return {
+      notFound: true,
+      progress: `${job.start} has no recent wins to trace from.`,
+    };
+  }
+  await readOrFetchEdges(env, { username: job.target, archiveLimit }, stats).catch(() => null);
+  const pair = await readGraphIndexPair(env, job.start, job.target, job.range);
+  if (!pair?.chain?.found || chainStepCount(pair.chain) >= savedStepLimit) return null;
+  return {
+    source: "graph-index",
+    chain: {
+      path: pair.chain.path,
+      hops: pair.chain.hops,
+    },
+  };
+}
+
+function edgeMapSize(map) {
+  return map instanceof Map ? map.size : 0;
 }
 
 async function tryLeaderboardRouteHint(env, job, stats) {
@@ -1611,6 +1657,146 @@ function deserializeEdgeMap(rows) {
   return map;
 }
 
+function graphIndexShape(raw) {
+  const rawNodes = raw?.nodes && typeof raw.nodes === "object" ? raw.nodes : {};
+  const nodes = {};
+  for (const [rawUsername, rawNode] of Object.entries(rawNodes)) {
+    const username = cleanUsername(rawUsername);
+    if (!username || !rawNode || typeof rawNode !== "object") continue;
+    nodes[username] = {
+      w: cleanGraphRows(rawNode.w),
+      l: cleanGraphRows(rawNode.l),
+      ts: Number.isFinite(rawNode.ts) ? rawNode.ts : 0,
+    };
+    if (Object.keys(nodes).length >= GRAPH_INDEX_NODE_LIMIT) break;
+  }
+  return {
+    version: 1,
+    updatedAt: Number.isFinite(raw?.updatedAt) ? raw.updatedAt : 0,
+    nodes,
+  };
+}
+
+function cleanGraphRows(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const username = cleanUsername(row?.[0]);
+    const url = cleanUrl(row?.[1]);
+    if (!username || !url || seen.has(username)) continue;
+    seen.add(username);
+    out.push([username, url]);
+    if (out.length >= GRAPH_INDEX_EDGE_LIMIT) break;
+  }
+  return out;
+}
+
+function graphRowsFromMap(map) {
+  const rows = [];
+  for (const [username, urls] of map instanceof Map ? map.entries() : []) {
+    const clean = cleanUsername(username);
+    const url = cleanUrl(Array.isArray(urls) ? urls[0] : "");
+    if (clean && url) rows.push([clean, url]);
+    if (rows.length >= GRAPH_INDEX_EDGE_LIMIT) break;
+  }
+  return rows;
+}
+
+async function upsertGraphIndex(envOrKv, username, edges, ts = Date.now()) {
+  const kv = envOrKv?.GAMES_CACHE || envOrKv;
+  const clean = cleanUsername(username);
+  if (!kv || !clean || !edges) return;
+  try {
+    const graph = graphIndexShape(await kv.get(GRAPH_INDEX_KEY, { type: "json" }));
+    graph.nodes[clean] = {
+      w: graphRowsFromMap(edges.beatenByMe),
+      l: graphRowsFromMap(edges.beatMe),
+      ts,
+    };
+    trimGraphIndex(graph);
+    await kv.put(GRAPH_INDEX_KEY, JSON.stringify({
+      version: 1,
+      updatedAt: Date.now(),
+      nodes: graph.nodes,
+    }), {
+      expirationTtl: KV_RETENTION_SECONDS,
+      metadata: { type: "graph-index" },
+    });
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "graph_index_update_failed",
+      username: clean,
+      message: error?.message || String(error),
+    }));
+  }
+}
+
+function trimGraphIndex(graph) {
+  const entries = Object.entries(graph.nodes || {});
+  if (entries.length <= GRAPH_INDEX_NODE_LIMIT) return;
+  entries
+    .sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0))
+    .slice(GRAPH_INDEX_NODE_LIMIT)
+    .forEach(([username]) => {
+      delete graph.nodes[username];
+    });
+}
+
+async function rebuildGraphIndex(env) {
+  const [edgeKeys, gameKeys] = await Promise.all([
+    listKvKeys(env, "edges:", GRAPH_INDEX_WARM_KEY_LIMIT),
+    listKvKeys(env, "games:", GRAPH_INDEX_WARM_KEY_LIMIT),
+  ]);
+  const nodes = {};
+  await runThrottled(edgeKeys.map((key) => async () => {
+    const cached = await env.GAMES_CACHE.get(key.name, { type: "json", cacheTtl: 60 });
+    const username = cleanUsername(key.name.replace(/^edges:/, "").split(":")[0]);
+    const edges = deserializeEdges(cached?.edges);
+    if (!username || !edges) return;
+    nodes[username] = {
+      w: graphRowsFromMap(edges.beatenByMe),
+      l: graphRowsFromMap(edges.beatMe),
+      ts: Number.isFinite(cached?.ts) ? cached.ts : Date.now(),
+    };
+  }), 12);
+  await runThrottled(gameKeys.map((key) => async () => {
+    const cacheName = key.name.replace(/^games:/, "");
+    const username = cleanUsername(cacheName.split(":")[0]);
+    if (!username || nodes[username]) return;
+    const cached = await env.GAMES_CACHE.get(key.name, { type: "json", cacheTtl: 60 });
+    const games = Array.isArray(cached?.games) ? cached.games : null;
+    if (!games) return;
+    const edges = edgesFromGames(username, games);
+    const ts = Number.isFinite(cached?.ts) ? cached.ts : Date.now();
+    await putEdgesCache(env.GAMES_CACHE, cacheName, { username, archiveLimit: archiveLimitFromCacheName(cacheName) }, edges, ts, false);
+    nodes[username] = {
+      w: graphRowsFromMap(edges.beatenByMe),
+      l: graphRowsFromMap(edges.beatMe),
+      ts,
+    };
+  }), 12);
+  const graph = graphIndexShape({ version: 1, updatedAt: Date.now(), nodes });
+  trimGraphIndex(graph);
+  await env.GAMES_CACHE.put(GRAPH_INDEX_KEY, JSON.stringify({
+    version: 1,
+    updatedAt: Date.now(),
+    nodes: graph.nodes,
+  }), {
+    expirationTtl: KV_RETENTION_SECONDS,
+    metadata: { type: "graph-index" },
+  });
+  return Object.keys(graph.nodes).length;
+}
+
+function archiveLimitFromCacheName(cacheName) {
+  const parts = String(cacheName || "").split(":");
+  if (parts[1] === "recent") {
+    const limit = Number(parts[2]);
+    return Number.isFinite(limit) ? limit : 6;
+  }
+  return parts[1] === "all" ? Infinity : 6;
+}
+
 function archiveLimitForRange(range) {
   if (range === "auto") return 6;
   if (range === "instant") return 2;
@@ -1621,9 +1807,36 @@ function archiveLimitForRange(range) {
 }
 
 async function handleWarm(url, env, ctx) {
+  const statusOnly = url.searchParams.get("status") === "1";
+  const indexOnly = url.searchParams.get("index") === "1";
+  const graphStatusOnly = url.searchParams.get("graph") === "1";
   const force = url.searchParams.get("force") === "1";
   const status = await env.GAMES_CACHE.get(WARM_STATUS_KEY, { type: "json" });
+  if (statusOnly) {
+    return json({ ok: true, status: publicWarmStatus(status) }, 200, "no-store");
+  }
+  if (graphStatusOnly) {
+    const graph = graphIndexShape(await env.GAMES_CACHE.get(GRAPH_INDEX_KEY, { type: "json" }));
+    const start = cleanUsername(url.searchParams.get("start"));
+    const target = cleanUsername(url.searchParams.get("target"));
+    return json({
+      ok: true,
+      graph: {
+        nodes: Object.keys(graph.nodes).length,
+        updatedAt: graph.updatedAt,
+        hasStart: start ? Boolean(graph.nodes[start]) : null,
+        hasTarget: target ? Boolean(graph.nodes[target]) : null,
+      },
+    }, 200, "no-store");
+  }
+  if (indexOnly) {
+    const graphNodes = await rebuildGraphIndex(env);
+    return json({ ok: true, graphNodes, status: publicWarmStatus({ ...status, graphNodes }) }, 200, "no-store");
+  }
   const age = Date.now() - (Number.isFinite(status?.updatedAt) ? status.updatedAt : 0);
+  if (!force && status?.status === "queued" && age < 5 * 60 * 1000) {
+    return json({ ok: true, status: publicWarmStatus(status), skipped: true }, 200, "no-store");
+  }
   if (!force && status?.status === "ready" && age < WARM_INTERVAL_SECONDS * 1000) {
     return json({ ok: true, status: publicWarmStatus(status), skipped: true }, 200, "no-store");
   }
@@ -1633,6 +1846,7 @@ async function handleWarm(url, env, ctx) {
     updatedAt: Date.now(),
     warmed: Number.isFinite(status?.warmed) ? status.warmed : 0,
     fragments: Number.isFinite(status?.fragments) ? status.fragments : 0,
+    graphNodes: Number.isFinite(status?.graphNodes) ? status.graphNodes : 0,
     errors: 0,
   };
   await env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify(next), {
@@ -1691,6 +1905,14 @@ async function warmLeaderboardTargets(env) {
     errors++;
     return 0;
   });
+  const graphNodes = await rebuildGraphIndex(env).catch((error) => {
+    console.warn(JSON.stringify({
+      event: "warm_graph_index_failed",
+      message: error?.message || String(error),
+    }));
+    errors++;
+    return 0;
+  });
 
   await env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify({
     status: "ready",
@@ -1698,6 +1920,7 @@ async function warmLeaderboardTargets(env) {
     startedAt,
     warmed,
     fragments,
+    graphNodes,
     errors,
   }), {
     expirationTtl: KV_RETENTION_SECONDS,
@@ -1711,6 +1934,7 @@ function publicWarmStatus(status) {
     updatedAt: Number.isFinite(status?.updatedAt) ? status.updatedAt : Date.now(),
     warmed: Number.isFinite(status?.warmed) ? status.warmed : 0,
     fragments: Number.isFinite(status?.fragments) ? status.fragments : 0,
+    graphNodes: Number.isFinite(status?.graphNodes) ? status.graphNodes : 0,
     errors: Number.isFinite(status?.errors) ? status.errors : 0,
   };
 }
@@ -2770,6 +2994,71 @@ function cachedBfsPairShape({ start, target, range, meeting, forwardVisited, bac
     savedAt: Date.now(),
     checkedAt: Date.now(),
   }, start, target, range);
+}
+
+async function readGraphIndexPair(env, start, target, range) {
+  const cleanStart = cleanUsername(start);
+  const cleanTarget = cleanUsername(target);
+  if (!cleanStart || !cleanTarget || cleanStart === cleanTarget) return null;
+  const graph = graphIndexShape(await env.GAMES_CACHE.get(GRAPH_INDEX_KEY, { type: "json" }));
+  const chain = graphIndexBfs(graph, cleanStart, cleanTarget);
+  if (!chain) return null;
+  return pairChainShape({
+    start: cleanStart,
+    target: cleanTarget,
+    range,
+    chain: {
+      target: cleanTarget,
+      display: cleanTarget,
+      found: true,
+      length: Math.max(0, chain.path.length - 1),
+      path: chain.path,
+      hops: cleanHopList(chain.hops),
+      quality: routeQuality(chain, { cached: 2, requests: 0, expanded: 0 }, "graph-index"),
+    },
+    players: {},
+    savedAt: graph.updatedAt || Date.now(),
+    checkedAt: Date.now(),
+  }, cleanStart, cleanTarget, range);
+}
+
+function graphIndexBfs(graph, start, target) {
+  const nodes = graph?.nodes;
+  if (!nodes?.[start] || !nodes?.[target]) return null;
+  const forwardVisited = new Map([[start, { prev: null, hopUrl: null }]]);
+  const backwardVisited = new Map([[target, { next: null, hopUrl: null }]]);
+  let forwardFrontier = [start];
+  let backwardFrontier = [target];
+
+  for (let depth = 0; depth < SEARCH_MAX_DEPTH; depth++) {
+    const expandForward = forwardFrontier.length > 0 && (!backwardFrontier.length || forwardFrontier.length <= backwardFrontier.length);
+    const frontier = expandForward ? forwardFrontier : backwardFrontier;
+    if (!frontier.length) break;
+    const next = [];
+    for (const node of frontier.slice(0, SEARCH_FRONTIER_LIMIT * 4)) {
+      const rows = expandForward ? nodes[node]?.w : nodes[node]?.l;
+      for (const row of Array.isArray(rows) ? rows : []) {
+        const opponent = cleanUsername(row?.[0]);
+        const url = cleanUrl(row?.[1]);
+        if (!opponent || !url) continue;
+        if (expandForward) {
+          if (forwardVisited.has(opponent)) continue;
+          forwardVisited.set(opponent, { prev: node, hopUrl: url });
+          if (backwardVisited.has(opponent)) return reconstructServerPath(opponent, forwardVisited, backwardVisited);
+        } else {
+          if (backwardVisited.has(opponent)) continue;
+          backwardVisited.set(opponent, { next: node, hopUrl: url });
+          if (forwardVisited.has(opponent)) return reconstructServerPath(opponent, forwardVisited, backwardVisited);
+        }
+        next.push(opponent);
+        if (next.length >= SEARCH_NEXT_FRONTIER_LIMIT) break;
+      }
+      if (next.length >= SEARCH_NEXT_FRONTIER_LIMIT) break;
+    }
+    if (expandForward) forwardFrontier = uniqueUsernameList(next, SEARCH_NEXT_FRONTIER_LIMIT);
+    else backwardFrontier = uniqueUsernameList(next, SEARCH_NEXT_FRONTIER_LIMIT);
+  }
+  return null;
 }
 
 async function readCachedFastLanePair(env, start, target, range) {
@@ -4013,7 +4302,7 @@ async function putGamesCache(kv, kvKey, parsed, games) {
   }
 }
 
-async function putEdgesCache(kv, key, parsed, edges, ts = Date.now()) {
+async function putEdgesCache(kv, key, parsed, edges, ts = Date.now(), updateIndex = true) {
   try {
     await kv.put(edgeCacheKey(key), JSON.stringify({
       ts,
@@ -4026,6 +4315,7 @@ async function putEdgesCache(kv, key, parsed, edges, ts = Date.now()) {
         type: "edges",
       },
     });
+    if (updateIndex) await upsertGraphIndex(kv, parsed.username, edges, ts);
   } catch (error) {
     console.warn(JSON.stringify({
       event: "edges_cache_write_failed",

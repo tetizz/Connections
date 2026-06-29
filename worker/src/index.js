@@ -40,10 +40,11 @@ const SEARCH_BACKGROUND_TIME_MS = 52000;
 const SEARCH_LEASE_MS = 20000;
 const SEARCH_VISITED_LIMIT = 12000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 3000;
-const CACHED_SHORTER_CHECK_REQUESTS = 0;
+const CACHED_SHORTER_CHECK_REQUESTS = 12;
 const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
-const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 48;
-const CACHED_SHORTER_CHECK_TIME_MS = 6000;
+const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 24;
+const CACHED_SHORTER_CHECK_CONCURRENCY = 16;
+const CACHED_SHORTER_CHECK_TIME_MS = 4500;
 const STARTUP_CACHE_BFS_EXPANSIONS = 96;
 const STARTUP_CACHE_BFS_TIME_MS = 900;
 const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 160;
@@ -181,7 +182,7 @@ export default {
     }
 
     if (url.pathname === "/search/job" && request.method === "GET") {
-      return handleSearchJob(url, env);
+      return handleSearchJob(url, env, ctx);
     }
 
     if (url.pathname === "/search/warm" && (request.method === "GET" || request.method === "POST")) {
@@ -441,12 +442,15 @@ async function handleSearchStart(request, env, ctx) {
     }), { expirationTtl: SEARCH_WINDOW_SECONDS * 2 });
   }
 
+  const shouldRefreshCachedPair = Boolean(cachedPair?.chain?.found && chainStepCount(cachedPair.chain) > 2);
   const job = searchJobShape({
     id,
     start,
     target,
     range,
-    status: cachedPair ? "found" : "queued",
+    status: cachedPair
+      ? shouldRefreshCachedPair ? "running" : "found"
+      : "queued",
     progress: cachedPair
       ? "Loaded saved connection instantly. Shorter route check is running in the background."
       : "Queued",
@@ -460,7 +464,17 @@ async function handleSearchStart(request, env, ctx) {
     updatedAt: Date.now(),
   });
   await writeSearchJob(env, job);
-  if (ctx?.waitUntil && cachedPair) {
+  if (ctx?.waitUntil && cachedPair && shouldRefreshCachedPair) {
+    ctx.waitUntil(runSearchJob(env, job).catch((error) => {
+      console.warn(JSON.stringify({
+        event: "cached_pair_refresh_failed",
+        jobId: job.id,
+        start: job.start,
+        target: job.target,
+        message: error?.message || String(error),
+      }));
+    }));
+  } else if (ctx?.waitUntil && cachedPair) {
     ctx.waitUntil(refreshCachedPairInBackground(env, job).catch((error) => {
       console.warn(JSON.stringify({
         event: "cached_pair_refresh_failed",
@@ -554,7 +568,7 @@ async function writeStartupPair(env, { id, start, target, range, pair, cached = 
   if (fragments) await writeFastLaneFragments(env, job);
 }
 
-async function handleSearchJob(url, env) {
+async function handleSearchJob(url, env, ctx) {
   const id = cleanAnalyticsId(url.searchParams.get("id"));
   if (!id) return json({ error: "missing id" }, 400, "no-store");
   const minExpanded = cleanNonNegativeNumber(url.searchParams.get("minExpanded"), SEARCH_MAX_EXPANSIONS) || 0;
@@ -568,9 +582,24 @@ async function handleSearchJob(url, env) {
       isActiveSearchStatus(job.status) &&
       Date.now() >= Number(job.processingUntil || 0)) {
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
+    if (cachedShorterCheck && ctx?.waitUntil) {
+      ctx.waitUntil(runSearchJobChunk(env, id, {
+        expansionBudget: CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS,
+        timeBudgetMs: CACHED_SHORTER_CHECK_TIME_MS,
+        concurrency: CACHED_SHORTER_CHECK_CONCURRENCY,
+      }).catch((error) => {
+        console.warn(JSON.stringify({
+          event: "cached_pair_poll_kick_failed",
+          jobId: id,
+          message: error?.message || String(error),
+        }));
+      }));
+      return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
+    }
     job = await runSearchJobChunk(env, id, {
       expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
       timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
+      concurrency: cachedShorterCheck ? CACHED_SHORTER_CHECK_CONCURRENCY : SEARCH_EXPANSION_CONCURRENCY,
     }) || await readSearchJob(env, id) || job;
   }
   return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
@@ -597,9 +626,11 @@ async function runSearchJob(env, queuedJob) {
   const deadline = Date.now() + SEARCH_BACKGROUND_TIME_MS;
   let job = await readSearchJob(env, queuedJob.id);
   while (job && isActiveSearchStatus(job.status) && Date.now() < deadline) {
+    const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
     const nextJob = await runSearchJobChunk(env, queuedJob.id, {
-      expansionBudget: SEARCH_CHUNK_EXPANSIONS,
-      timeBudgetMs: SEARCH_CHUNK_TIME_MS,
+      expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
+      timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
+      concurrency: cachedShorterCheck ? CACHED_SHORTER_CHECK_CONCURRENCY : SEARCH_EXPANSION_CONCURRENCY,
     });
     if (!nextJob || Number(nextJob.processingUntil || 0) > Date.now()) break;
     job = nextJob;
@@ -631,6 +662,7 @@ async function refreshCachedPairInBackground(env, cachedJob) {
     job = await runSearchJobChunk(env, refreshJob.id, {
       expansionBudget: CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS,
       timeBudgetMs: CACHED_SHORTER_CHECK_TIME_MS,
+      concurrency: CACHED_SHORTER_CHECK_CONCURRENCY,
     }) || await readSearchJob(env, refreshJob.id);
   }
 }
@@ -782,6 +814,7 @@ async function runSearchJobChunk(env, id, options = {}) {
     const result = await advanceServerSearch(env, job, search, stats, progress, {
       expansionBudget,
       timeBudgetMs,
+      concurrency: Number(options.concurrency) || SEARCH_EXPANSION_CONCURRENCY,
       chunkStartedAt,
     });
 
@@ -910,6 +943,7 @@ function shouldRunShorterBfs(job) {
 async function advanceServerSearch(env, job, search, stats, progress, options = {}) {
   const archiveLimit = archiveLimitForRange(job.range);
   const expansionBudget = Math.max(1, Number(options.expansionBudget) || SEARCH_CHUNK_EXPANSIONS);
+  const expansionConcurrency = Math.max(1, Math.min(SEARCH_EXPANSION_CONCURRENCY, Number(options.concurrency) || SEARCH_EXPANSION_CONCURRENCY));
   const chunkStartedAt = Number(options.chunkStartedAt) || Date.now();
   const deadline = chunkStartedAt + (Number(options.timeBudgetMs) || SEARCH_CHUNK_TIME_MS);
   const forwardVisited = visitedObjectToMap(search.forwardVisited);
@@ -936,18 +970,18 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
       meetingLength = steps;
     }
   };
-  const freshUsers = job.refreshCached && Array.isArray(job.chain?.path)
-    ? new Set(job.chain.path.map(cleanUsername).filter(Boolean))
-    : new Set();
   const getEdges = async (username) => {
     const key = username.toLowerCase();
     if (edgesCache.has(key)) return edgesCache.get(key);
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
+    const refreshArchiveLimit = cachedShorterCheck
+      ? Math.min(2, Number.isFinite(archiveLimit) ? archiveLimit : 2)
+      : archiveLimit;
     const mayRefreshKnownRoute = cachedShorterCheck &&
       Number(stats.requests || 0) < CACHED_SHORTER_CHECK_REQUESTS &&
-      (freshUsers.has(key) || key === job.start || key === job.target);
+      (key === job.start || key === job.target);
     const edges = mayRefreshKnownRoute
-      ? await readOrFetchEdges(env, { username: key, archiveLimit, forceFresh: true }, stats)
+      ? await readOrFetchEdges(env, { username: key, archiveLimit: refreshArchiveLimit, forceFresh: true }, stats)
       : await readCachedOrBuildEdges(env, { username: key, archiveLimit }, stats);
     edgesCache.set(key, edges);
     return edges;
@@ -1012,7 +1046,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
       SEARCH_MAX_EXPANSIONS - stats.expanded,
       search.activeFrontier.length - search.activeCursor,
     );
-    const batchSize = Math.max(1, Math.min(SEARCH_EXPANSION_CONCURRENCY, remainingBudget));
+    const batchSize = Math.max(1, Math.min(expansionConcurrency, remainingBudget));
     const batch = search.activeFrontier.slice(search.activeCursor, search.activeCursor + batchSize).filter(Boolean);
     search.activeCursor += batch.length;
     if (!batch.length) continue;
@@ -1025,7 +1059,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
       } catch {
         return { node, edges: { beatenByMe: new Map(), beatMe: new Map() } };
       }
-    }), SEARCH_EXPANSION_CONCURRENCY);
+    }), expansionConcurrency);
 
     for (const item of edgeBatch) {
       if (!item?.node || !item.edges) continue;
@@ -2916,6 +2950,19 @@ async function readCachedBfsPair(env, start, target, range) {
   let forwardFrontier = [cleanStart];
   let backwardFrontier = [cleanTarget];
   let depth = 0;
+  let bestMeeting = null;
+  let bestMeetingLength = Number.POSITIVE_INFINITY;
+
+  const considerCachedMeeting = (candidate) => {
+    const cleanCandidate = cleanUsername(candidate);
+    if (!cleanCandidate) return;
+    const chain = reconstructServerPath(cleanCandidate, forwardVisited, backwardVisited);
+    const steps = chainStepCount(chain);
+    if (steps < bestMeetingLength) {
+      bestMeeting = cleanCandidate;
+      bestMeetingLength = steps;
+    }
+  };
 
   const getEdges = async (username) => {
     return await readCachedEdges(env, { username, archiveLimit }, stats) || { beatenByMe: new Map(), beatMe: new Map() };
@@ -2962,7 +3009,8 @@ async function readCachedBfsPair(env, start, target, range) {
             if (forwardVisited.has(opponent)) continue;
             forwardVisited.set(opponent, { prev: node, hopUrl: urls[0] });
             if (backwardVisited.has(opponent)) {
-              return cachedBfsPairShape({ start: cleanStart, target: cleanTarget, range, meeting: opponent, forwardVisited, backwardVisited });
+              considerCachedMeeting(opponent);
+              continue;
             }
             if (nextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) nextFrontier.push(opponent);
           }
@@ -2971,12 +3019,17 @@ async function readCachedBfsPair(env, start, target, range) {
             if (backwardVisited.has(opponent)) continue;
             backwardVisited.set(opponent, { next: node, hopUrl: urls[0] });
             if (forwardVisited.has(opponent)) {
-              return cachedBfsPairShape({ start: cleanStart, target: cleanTarget, range, meeting: opponent, forwardVisited, backwardVisited });
+              considerCachedMeeting(opponent);
+              continue;
             }
             if (nextFrontier.length < SEARCH_NEXT_FRONTIER_LIMIT) nextFrontier.push(opponent);
           }
         }
       }
+    }
+
+    if (bestMeeting) {
+      return cachedBfsPairShape({ start: cleanStart, target: cleanTarget, range, meeting: bestMeeting, forwardVisited, backwardVisited });
     }
 
     if (expandForward) forwardFrontier = nextFrontier;
@@ -3045,6 +3098,19 @@ function graphIndexBfs(graph, start, target) {
   const backwardVisited = new Map([[target, { next: null, hopUrl: null }]]);
   let forwardFrontier = [start];
   let backwardFrontier = [target];
+  let bestMeeting = null;
+  let bestMeetingLength = Number.POSITIVE_INFINITY;
+
+  const considerGraphMeeting = (candidate) => {
+    const cleanCandidate = cleanUsername(candidate);
+    if (!cleanCandidate) return;
+    const chain = reconstructServerPath(cleanCandidate, forwardVisited, backwardVisited);
+    const steps = chainStepCount(chain);
+    if (steps < bestMeetingLength) {
+      bestMeeting = cleanCandidate;
+      bestMeetingLength = steps;
+    }
+  };
 
   for (let depth = 0; depth < SEARCH_MAX_DEPTH; depth++) {
     const expandForward = forwardFrontier.length > 0 && (!backwardFrontier.length || forwardFrontier.length <= backwardFrontier.length);
@@ -3060,17 +3126,24 @@ function graphIndexBfs(graph, start, target) {
         if (expandForward) {
           if (forwardVisited.has(opponent)) continue;
           forwardVisited.set(opponent, { prev: node, hopUrl: url });
-          if (backwardVisited.has(opponent)) return reconstructServerPath(opponent, forwardVisited, backwardVisited);
+          if (backwardVisited.has(opponent)) {
+            considerGraphMeeting(opponent);
+            continue;
+          }
         } else {
           if (backwardVisited.has(opponent)) continue;
           backwardVisited.set(opponent, { next: node, hopUrl: url });
-          if (forwardVisited.has(opponent)) return reconstructServerPath(opponent, forwardVisited, backwardVisited);
+          if (forwardVisited.has(opponent)) {
+            considerGraphMeeting(opponent);
+            continue;
+          }
         }
         next.push(opponent);
         if (next.length >= SEARCH_NEXT_FRONTIER_LIMIT) break;
       }
       if (next.length >= SEARCH_NEXT_FRONTIER_LIMIT) break;
     }
+    if (bestMeeting) return reconstructServerPath(bestMeeting, forwardVisited, backwardVisited);
     if (expandForward) forwardFrontier = uniqueUsernameList(next, SEARCH_NEXT_FRONTIER_LIMIT);
     else backwardFrontier = uniqueUsernameList(next, SEARCH_NEXT_FRONTIER_LIMIT);
   }

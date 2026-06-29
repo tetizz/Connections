@@ -68,6 +68,7 @@
     },
     ownerCode: "",
     queueTimer: null,
+    searchJobs: new Map(),
   };
 
   // ---------- small utils ----------
@@ -2078,12 +2079,17 @@
     if (!remoteBase || !id) return null;
     let job = null;
     for (let attempt = 0; attempt < 360; attempt++) {
-      const res = await fetch(`${remoteBase}/search/job?id=${encodeURIComponent(id)}`, {
+      const previous = state.searchJobs.get(id);
+      const previousStats = previous?.stats || {};
+      const params = new URLSearchParams({ id });
+      if (Number(previousStats.expanded || 0) > 0) params.set("minExpanded", String(Number(previousStats.expanded || 0)));
+      if (Number(previousStats.cached || 0) > 0) params.set("minCached", String(Number(previousStats.cached || 0)));
+      const res = await fetch(`${remoteBase}/search/job?${params.toString()}`, {
         headers: { "Accept": "application/json" },
       });
       if (!res.ok) throw new Error(`job poll failed (${res.status})`);
       const data = await res.json();
-      job = data.job;
+      job = mergeSearchJobSnapshot(data.job);
       if (!job) throw new Error("job missing");
       if (!background) showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
@@ -2098,6 +2104,40 @@
       start: analyticsBase?.start,
       target: analyticsBase?.target,
     };
+  }
+
+  function mergeSearchJobSnapshot(job) {
+    if (!job?.id) return job;
+    const previous = state.searchJobs.get(job.id);
+    const terminal = new Set(["found", "not_found", "timeout", "failed"]);
+    if (!previous) {
+      state.searchJobs.set(job.id, job);
+      return job;
+    }
+    if (terminal.has(previous.status) && !terminal.has(job.status)) return previous;
+    if (terminal.has(job.status)) {
+      state.searchJobs.set(job.id, job);
+      return job;
+    }
+    const prevStats = previous.stats || {};
+    const nextStats = job.stats || {};
+    const prevExpanded = Number(prevStats.expanded || 0);
+    const nextExpanded = Number(nextStats.expanded || 0);
+    const prevCached = Number(prevStats.cached || 0);
+    const nextCached = Number(nextStats.cached || 0);
+    const rewound = nextExpanded < prevExpanded || nextCached < prevCached;
+    const merged = {
+      ...job,
+      progress: rewound ? previous.progress : job.progress,
+      stats: {
+        ...nextStats,
+        expanded: Math.max(prevExpanded, nextExpanded),
+        cached: Math.max(prevCached, nextCached),
+        requests: Math.max(Number(prevStats.requests || 0), Number(nextStats.requests || 0)),
+      },
+    };
+    state.searchJobs.set(job.id, merged);
+    return merged;
   }
 
   function showServerJobProgress(job) {
@@ -2219,6 +2259,7 @@
   }
 
   function clearActiveJob(id = "") {
+    if (id) state.searchJobs.delete(id);
     try {
       const current = JSON.parse(localStorage.getItem(LS_ACTIVE_JOB_KEY) || "null");
       if (!id || !current?.id || current.id === id) localStorage.removeItem(LS_ACTIVE_JOB_KEY);

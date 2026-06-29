@@ -27,13 +27,13 @@ const MAX_ANALYTICS_EVENTS_PER_WINDOW = 80;
 const ANALYTICS_EVENTS_KEY = "analytics:events";
 const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
 const SEARCH_MAX_DEPTH = 5;
-const SEARCH_MAX_EXPANSIONS = 260;
+const SEARCH_MAX_EXPANSIONS = 520;
 const SEARCH_FRONTIER_LIMIT = 200;
-const SEARCH_CHUNK_EXPANSIONS = 72;
-const SEARCH_CHUNK_TIME_MS = 8500;
-const SEARCH_EXPANSION_CONCURRENCY = 10;
-const SEARCH_BACKGROUND_TIME_MS = 26000;
-const SEARCH_LEASE_MS = 15000;
+const SEARCH_CHUNK_EXPANSIONS = 140;
+const SEARCH_CHUNK_TIME_MS = 12000;
+const SEARCH_EXPANSION_CONCURRENCY = 18;
+const SEARCH_BACKGROUND_TIME_MS = 52000;
+const SEARCH_LEASE_MS = 65000;
 const SEARCH_VISITED_LIMIT = 12000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 3000;
 const CACHED_SHORTER_CHECK_REQUESTS = 0;
@@ -390,6 +390,16 @@ async function handleSearchStart(request, env, ctx) {
         message: error?.message || String(error),
       }));
     }));
+  } else if (!cachedPair && ctx?.waitUntil) {
+    ctx.waitUntil(runSearchJob(env, job).catch((error) => {
+      console.warn(JSON.stringify({
+        event: "search_start_background_failed",
+        jobId: job.id,
+        start: job.start,
+        target: job.target,
+        message: error?.message || String(error),
+      }));
+    }));
   }
 
   return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
@@ -467,9 +477,16 @@ async function writeStartupPair(env, { id, start, target, range, pair, cached = 
 async function handleSearchJob(url, env) {
   const id = cleanAnalyticsId(url.searchParams.get("id"));
   if (!id) return json({ error: "missing id" }, 400, "no-store");
+  const minExpanded = cleanNonNegativeNumber(url.searchParams.get("minExpanded"), SEARCH_MAX_EXPANSIONS) || 0;
+  const minCached = cleanNonNegativeNumber(url.searchParams.get("minCached"), 100000) || 0;
   let job = await readSearchJob(env, id);
   if (!job) return json({ error: "job not found" }, 404, "no-store");
-  if (isActiveSearchStatus(job.status) && Date.now() >= Number(job.processingUntil || 0)) {
+  if (isStaleForClient(job, minExpanded, minCached)) {
+    job = await readSearchJobAtLeast(env, id, minExpanded, minCached) || job;
+  }
+  if (!isStaleForClient(job, minExpanded, minCached) &&
+      isActiveSearchStatus(job.status) &&
+      Date.now() >= Number(job.processingUntil || 0)) {
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
     job = await runSearchJobChunk(env, id, {
       expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
@@ -479,14 +496,33 @@ async function handleSearchJob(url, env) {
   return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
 }
 
+async function readSearchJobAtLeast(env, id, minExpanded, minCached) {
+  let best = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const job = await readSearchJob(env, id);
+    if (job && (!best || Number(job.stats?.expanded || 0) > Number(best.stats?.expanded || 0))) best = job;
+    if (!isStaleForClient(job, minExpanded, minCached)) return job;
+    await delay(180);
+  }
+  return best;
+}
+
+function isStaleForClient(job, minExpanded, minCached) {
+  if (!job || !isActiveSearchStatus(job.status)) return false;
+  const stats = job.stats || {};
+  return Number(stats.expanded || 0) < minExpanded || Number(stats.cached || 0) < minCached;
+}
+
 async function runSearchJob(env, queuedJob) {
   const deadline = Date.now() + SEARCH_BACKGROUND_TIME_MS;
   let job = await readSearchJob(env, queuedJob.id);
   while (job && isActiveSearchStatus(job.status) && Date.now() < deadline) {
-    job = await runSearchJobChunk(env, queuedJob.id, {
+    const nextJob = await runSearchJobChunk(env, queuedJob.id, {
       expansionBudget: SEARCH_CHUNK_EXPANSIONS,
       timeBudgetMs: SEARCH_CHUNK_TIME_MS,
     });
+    if (!nextJob || Number(nextJob.processingUntil || 0) > Date.now()) break;
+    job = nextJob;
   }
 }
 
@@ -523,9 +559,12 @@ async function runSearchJobChunk(env, id, options = {}) {
   const chunkStartedAt = Date.now();
   const expansionBudget = Math.max(1, Math.min(SEARCH_CHUNK_EXPANSIONS, Number(options.expansionBudget) || SEARCH_CHUNK_EXPANSIONS));
   const timeBudgetMs = Math.max(1000, Math.min(SEARCH_CHUNK_TIME_MS, Number(options.timeBudgetMs) || SEARCH_CHUNK_TIME_MS));
+  const ownerToken = cleanAnalyticsId(options.ownerToken) || crypto.randomUUID();
   let job = await readSearchJob(env, id);
   if (!job || !isActiveSearchStatus(job.status)) return job;
   if (Number(job.processingUntil || 0) > Date.now()) return job;
+  job = await claimSearchJob(env, id, ownerToken, SEARCH_LEASE_MS);
+  if (!job || job.processingToken !== ownerToken) return job;
 
   const startedAt = job.startedAt || Date.now();
   const stats = job.searchInitialized
@@ -533,7 +572,7 @@ async function runSearchJobChunk(env, id, options = {}) {
     : { fetched: 0, requests: 0, cached: 0, expanded: 0 };
   const search = searchStateShape(job.search, job.start, job.target);
   const progress = async (message, patch = {}) => {
-    job = await updateSearchJob(env, id, {
+    const nextJob = await updateOwnedSearchJob(env, id, ownerToken, {
       status: "running",
       progress: message,
       startedAt,
@@ -541,7 +580,9 @@ async function runSearchJobChunk(env, id, options = {}) {
       stats: { ...stats },
       search,
       ...patch,
-    }) || job;
+    });
+    if (!nextJob) throw new Error("search lease lost");
+    job = nextJob;
   };
 
   await progress(job.progress || "Checking players");
@@ -559,8 +600,9 @@ async function runSearchJobChunk(env, id, options = {}) {
           stats,
           search,
           processingUntil: 0,
+          processingToken: "",
           durationMs: Date.now() - startedAt,
-        });
+        }, ownerToken);
         return readSearchJob(env, id);
       }
       search.profileChecked = true;
@@ -584,8 +626,9 @@ async function runSearchJobChunk(env, id, options = {}) {
               stats,
               search,
               processingUntil: 0,
+              processingToken: "",
               durationMs: Date.now() - startedAt,
-            });
+            }, ownerToken);
             return readSearchJob(env, id);
           }
         } else {
@@ -615,8 +658,9 @@ async function runSearchJobChunk(env, id, options = {}) {
           stats,
           search,
           processingUntil: 0,
+          processingToken: "",
           durationMs: Date.now() - startedAt,
-        });
+        }, ownerToken);
         return readSearchJob(env, id);
         }
       }
@@ -631,8 +675,9 @@ async function runSearchJobChunk(env, id, options = {}) {
             stats,
             search,
             processingUntil: 0,
+            processingToken: "",
             durationMs: Date.now() - startedAt,
-          });
+          }, ownerToken);
           return readSearchJob(env, id);
         }
         await progress("Saved route loaded. Searching wider graph for a shorter route.", { search });
@@ -658,16 +703,18 @@ async function runSearchJobChunk(env, id, options = {}) {
           stats,
           search,
           processingUntil: 0,
+          processingToken: "",
           durationMs: Date.now() - startedAt,
-        });
+        }, ownerToken);
         return readSearchJob(env, id);
       }
-      return updateSearchJob(env, id, {
+      return updateOwnedSearchJob(env, id, ownerToken, {
         status: "running",
         progress: result.progress,
         stats,
         search,
         processingUntil: 0,
+        processingToken: "",
         startedAt,
       });
     }
@@ -683,8 +730,9 @@ async function runSearchJobChunk(env, id, options = {}) {
           stats,
           search,
           processingUntil: 0,
+          processingToken: "",
           durationMs: Date.now() - startedAt,
-        });
+        }, ownerToken);
         return readSearchJob(env, id);
       }
       await completeSearchJob(env, job, {
@@ -694,8 +742,9 @@ async function runSearchJobChunk(env, id, options = {}) {
         stats,
         search,
         processingUntil: 0,
+        processingToken: "",
         durationMs: Date.now() - startedAt,
-      });
+      }, ownerToken);
       return readSearchJob(env, id);
     }
 
@@ -708,8 +757,9 @@ async function runSearchJobChunk(env, id, options = {}) {
         stats,
         search,
         processingUntil: 0,
+        processingToken: "",
         durationMs: Date.now() - startedAt,
-      });
+      }, ownerToken);
       return readSearchJob(env, id);
     }
 
@@ -747,11 +797,13 @@ async function runSearchJobChunk(env, id, options = {}) {
       stats,
       search,
       processingUntil: 0,
+      processingToken: "",
       durationMs: Date.now() - startedAt,
-    });
+    }, ownerToken);
     return readSearchJob(env, id);
   } catch (error) {
-    await failSearchJob(env, id, error);
+    if (error?.message === "search lease lost") return readSearchJob(env, id);
+    await failSearchJob(env, id, error, ownerToken);
     return readSearchJob(env, id);
   }
 }
@@ -945,7 +997,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
   };
 }
 
-async function completeSearchJob(env, job, patch) {
+async function completeSearchJob(env, job, patch, ownerToken = "") {
   const preparedPatch = { ...patch };
   if (preparedPatch.chain?.found) {
     preparedPatch.chain = {
@@ -953,10 +1005,14 @@ async function completeSearchJob(env, job, patch) {
       quality: preparedPatch.chain.quality || routeQuality(preparedPatch.chain, preparedPatch.stats || job.stats, "fresh-search"),
     };
   }
-  const next = await updateSearchJob(env, job.id, {
+  const update = {
     ...preparedPatch,
     updatedAt: Date.now(),
-  });
+  };
+  const next = ownerToken
+    ? await updateOwnedSearchJob(env, job.id, ownerToken, update)
+    : await updateSearchJob(env, job.id, update);
+  if (ownerToken && !next) return;
   const completed = next || { ...job, ...preparedPatch };
   if (completed?.status === "found" && completed.chain?.found) {
     await writePairChain(env, completed);
@@ -966,8 +1022,8 @@ async function completeSearchJob(env, job, patch) {
   if (event) await saveAnalyticsEvent(env, event);
 }
 
-async function failSearchJob(env, id, error) {
-  const job = await updateSearchJob(env, id, {
+async function failSearchJob(env, id, error, ownerToken = "") {
+  const patch = {
     status: isRateLimitError(error) ? "timeout" : "failed",
     outcome: isRateLimitError(error) ? "timeout" : "error",
     progress: isRateLimitError(error)
@@ -975,8 +1031,13 @@ async function failSearchJob(env, id, error) {
       : "Search failed before it could finish.",
     error: error?.message || String(error),
     processingUntil: 0,
+    processingToken: "",
     updatedAt: Date.now(),
-  });
+  };
+  const job = ownerToken
+    ? await updateOwnedSearchJob(env, id, ownerToken, patch)
+    : await updateSearchJob(env, id, patch);
+  if (ownerToken && !job) return;
   const event = searchJobAnalyticsEvent(job);
   if (event) await saveAnalyticsEvent(env, event);
   console.warn(JSON.stringify({
@@ -2107,6 +2168,31 @@ async function updateSearchJob(env, id, patch) {
   });
 }
 
+async function claimSearchJob(env, id, token, leaseMs) {
+  const current = await readSearchJob(env, id);
+  if (!current || !isActiveSearchStatus(current.status)) return null;
+  if (Number(current.processingUntil || 0) > Date.now() && current.processingToken !== token) return current;
+  return writeSearchJob(env, {
+    ...current,
+    status: "running",
+    processingToken: token,
+    processingUntil: Date.now() + leaseMs,
+    updatedAt: Date.now(),
+  });
+}
+
+async function updateOwnedSearchJob(env, id, token, patch) {
+  const current = await readSearchJob(env, id);
+  if (!current || current.processingToken !== token) return null;
+  return writeSearchJob(env, {
+    ...current,
+    ...patch,
+    processingToken: patch.processingToken ?? token,
+    stats: patch.stats || current.stats,
+    updatedAt: Date.now(),
+  });
+}
+
 async function readPairChain(env, start, target, range) {
   const key = pairChainKey(start, target, range);
   const record = await env.GAMES_CACHE.get(key, { type: "json", cacheTtl: 60 });
@@ -2724,6 +2810,7 @@ function searchJobShape(job) {
     startedAt: Number.isFinite(job.startedAt) ? job.startedAt : null,
     updatedAt: Number.isFinite(job.updatedAt) ? job.updatedAt : Date.now(),
     processingUntil: Number.isFinite(job.processingUntil) ? Math.max(0, job.processingUntil) : 0,
+    processingToken: cleanAnalyticsId(job.processingToken),
     refreshCached: Boolean(job.refreshCached),
     cachedAt: Number.isFinite(job.cachedAt) ? job.cachedAt : null,
     durationMs: cleanNonNegativeNumber(job.durationMs, 10 * 60 * 1000),

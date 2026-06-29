@@ -568,6 +568,27 @@ async function tryStartupFastLane(env, { id, start, target, range }) {
   });
   if (!job) return null;
 
+  const cachedStartGames = await readCachedGames(env, {
+    username: start,
+    archiveLimit: Math.min(6, archiveLimitForRange(range) || 6),
+  }, stats).catch(() => null);
+  if (cachedStartGames && edgeMapSize(edgesFromGames(start, cachedStartGames).beatenByMe) === 0) {
+    return {
+      job: searchJobShape({
+        ...job,
+        status: "not_found",
+        outcome: "not_found",
+        progress: `${start} has no recent wins to trace from.`,
+        stats,
+        processingUntil: 0,
+        processingToken: "",
+        startedAt,
+        durationMs: Date.now() - startedAt,
+        updatedAt: Date.now(),
+      }),
+    };
+  }
+
   const fastLane = await tryCachedRouteLanes(env, job, stats, Number.POSITIVE_INFINITY);
   const base = {
     ...job,

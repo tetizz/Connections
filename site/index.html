@@ -27,7 +27,7 @@
   <style>
     html, body { background: #0d100e; color: #f6efe2; }
   </style>
-  <link rel="stylesheet" href="styles.css?v=owner-graph-20260628" />
+  <link rel="stylesheet" href="styles.css?v=owner-speed-20260629" />
 </head>
 <body>
   <div class="site-shell">
@@ -281,9 +281,11 @@
             <div class="owner-tool-actions">
               <button class="setting__btn setting__btn--gold" id="owner-warm-run" type="button">Warm cache</button>
               <button class="setting__btn" id="owner-graph-rebuild" type="button">Rebuild graph</button>
+              <button class="setting__btn" id="owner-speed-check" type="button">Speed check</button>
               <button class="setting__btn" id="owner-warm-refresh" type="button">Refresh status</button>
             </div>
             <div class="owner-warm-metrics" id="owner-warm-metrics"></div>
+            <div class="owner-speed" id="owner-speed" hidden></div>
           </div>
           <span class="setting__hint" id="owner-status" hidden></span>
           <div class="owner-analytics" id="owner-analytics" hidden></div>
@@ -298,6 +300,6 @@
   <script src="cache.js?v=feature-expansion-20260627"></script>
   <script src="engine.js?v=feature-expansion-20260627"></script>
   <script src="leaderboard.js?v=ui-cleanup-20260628"></script>
-  <script src="app.js?v=owner-graph-20260628"></script>
+  <script src="app.js?v=owner-speed-20260629"></script>
 </body>
 </html>

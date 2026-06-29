@@ -1035,6 +1035,7 @@
     const metrics = $("#owner-warm-metrics");
     const runBtn = $("#owner-warm-run");
     const graphBtn = $("#owner-graph-rebuild");
+    const speedBtn = $("#owner-speed-check");
     const refreshBtn = $("#owner-warm-refresh");
     if (!remoteBase || !panel || !stateEl || !metrics || !state.ownerCode) return;
 
@@ -1050,6 +1051,7 @@
       <span><strong>...</strong> updated</span>`;
     if (runBtn) runBtn.disabled = true;
     if (graphBtn) graphBtn.disabled = true;
+    if (speedBtn) speedBtn.disabled = true;
     if (refreshBtn) refreshBtn.disabled = true;
 
     try {
@@ -1074,8 +1076,87 @@
     } finally {
       if (runBtn) runBtn.disabled = false;
       if (graphBtn) graphBtn.disabled = false;
+      if (speedBtn) speedBtn.disabled = false;
       if (refreshBtn) refreshBtn.disabled = false;
     }
+  }
+
+  const OWNER_SPEED_CASES = [
+    { label: "direct cached", start: "polish_fighter3000", target: "magnuscarlsen" },
+    { label: "two step", start: "ghandeevam2003", target: "magnuscarlsen" },
+    { label: "saved route", start: "knightmaneuver_12", target: "hikaru" },
+    { label: "no wins", start: "thechesswebsite", target: "hikaru" },
+  ];
+
+  async function runOwnerSpeedCheck() {
+    const remoteBase = workerBase();
+    const wrap = $("#owner-speed");
+    const btn = $("#owner-speed-check");
+    if (!remoteBase || !wrap || !state.ownerCode) return;
+    wrap.hidden = false;
+    wrap.innerHTML = `
+      <div class="owner-speed__head">
+        <strong>Speed check</strong>
+        <span>Running ${plainNumber(OWNER_SPEED_CASES.length)} checks...</span>
+      </div>`;
+    if (btn) btn.disabled = true;
+    const rows = [];
+    for (const test of OWNER_SPEED_CASES) {
+      const id = `owner-speed-${crypto.randomUUID()}`;
+      const started = performance.now();
+      try {
+        const res = await fetch(`${remoteBase}/search/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({
+            start: test.start,
+            target: test.target,
+            range: "auto",
+            searchId: id,
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const ms = Math.round(performance.now() - started);
+        const job = data?.job || {};
+        rows.push({
+          ...test,
+          ms,
+          status: job.status || "unknown",
+          steps: Array.isArray(job.chain?.path) ? Math.max(0, job.chain.path.length - 1) : null,
+        });
+      } catch (error) {
+        rows.push({ ...test, ms: Math.round(performance.now() - started), status: "error", error: error.message || "failed" });
+      }
+      renderOwnerSpeedRows(wrap, rows);
+    }
+    if (btn) btn.disabled = false;
+  }
+
+  function renderOwnerSpeedRows(wrap, rows) {
+    const best = rows.length ? Math.min(...rows.map((row) => row.ms)) : 0;
+    const worst = rows.length ? Math.max(...rows.map((row) => row.ms)) : 0;
+    wrap.innerHTML = `
+      <div class="owner-speed__head">
+        <strong>Speed check</strong>
+        <span>Best ${plainNumber(best)}ms · worst ${plainNumber(worst)}ms</span>
+      </div>
+      <div class="owner-speed__rows">
+        ${rows.map(ownerSpeedRow).join("")}
+      </div>`;
+  }
+
+  function ownerSpeedRow(row) {
+    const ok = row.status === "found" || row.status === "not_found" || row.status === "running";
+    const detail = row.error
+      ? row.error
+      : `${row.status}${Number.isFinite(row.steps) ? ` · ${row.steps} step${row.steps === 1 ? "" : "s"}` : ""}`;
+    return `
+      <div class="owner-speed__row ${ok ? "is-ok" : "is-bad"}">
+        <span>${esc(row.label)}</span>
+        <strong>${plainNumber(row.ms)}ms</strong>
+        <small>${esc(detail)}</small>
+      </div>`;
   }
 
   function renderOwnerWarmStatus(status) {
@@ -2799,6 +2880,9 @@
   });
   $("#owner-graph-rebuild")?.addEventListener("click", () => {
     loadOwnerWarmStatus("graph");
+  });
+  $("#owner-speed-check")?.addEventListener("click", () => {
+    runOwnerSpeedCheck();
   });
   $("#owner-warm-refresh")?.addEventListener("click", () => {
     loadOwnerWarmStatus("status");

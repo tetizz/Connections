@@ -17,3 +17,11 @@ crons = ["0 */6 * * *"]
 [[kv_namespaces]]
 binding = "GAMES_CACHE"
 id = "47131485ddf648b9b6b3d9b74eacfb60"
+
+[[durable_objects.bindings]]
+name = "SEARCH_JOBS"
+class_name = "SearchJobObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SearchJobObject"]

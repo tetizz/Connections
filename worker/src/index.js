@@ -29,11 +29,11 @@ const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
 const SEARCH_MAX_DEPTH = 5;
 const SEARCH_MAX_EXPANSIONS = 520;
 const SEARCH_FRONTIER_LIMIT = 200;
-const SEARCH_CHUNK_EXPANSIONS = 140;
+const SEARCH_CHUNK_EXPANSIONS = 220;
 const SEARCH_CHUNK_TIME_MS = 12000;
-const SEARCH_EXPANSION_CONCURRENCY = 18;
+const SEARCH_EXPANSION_CONCURRENCY = 64;
 const SEARCH_BACKGROUND_TIME_MS = 52000;
-const SEARCH_LEASE_MS = 65000;
+const SEARCH_LEASE_MS = 20000;
 const SEARCH_VISITED_LIMIT = 12000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 3000;
 const CACHED_SHORTER_CHECK_REQUESTS = 0;
@@ -67,6 +67,82 @@ const CORS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Accept, Content-Type, X-Owner-Code",
 };
+
+export class SearchJobObject {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    let body = {};
+    if (request.method !== "GET") {
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
+    }
+    if (url.pathname === "/read") {
+      return json({ job: searchJobShape(await this.state.storage.get("job")) }, 200, "no-store");
+    }
+    if (url.pathname === "/write") {
+      const shaped = searchJobShape(body.job);
+      if (!shaped) return json({ error: "invalid job" }, 400, "no-store");
+      await this.state.storage.put("job", shaped);
+      return json({ job: shaped }, 200, "no-store");
+    }
+    if (url.pathname === "/update") {
+      const current = searchJobShape(await this.state.storage.get("job"));
+      if (!current) return json({ job: null }, 200, "no-store");
+      const next = searchJobShape({
+        ...current,
+        ...(body.patch || {}),
+        stats: body.patch?.stats || current.stats,
+        updatedAt: Date.now(),
+      });
+      if (!next) return json({ job: null }, 200, "no-store");
+      await this.state.storage.put("job", next);
+      return json({ job: next }, 200, "no-store");
+    }
+    if (url.pathname === "/claim") {
+      const current = searchJobShape(await this.state.storage.get("job"));
+      if (!current || !isActiveSearchStatus(current.status)) return json({ job: null }, 200, "no-store");
+      const token = cleanAnalyticsId(body.token);
+      if (!token) return json({ job: current }, 200, "no-store");
+      if (Number(current.processingUntil || 0) > Date.now() && current.processingToken !== token) {
+        return json({ job: current }, 200, "no-store");
+      }
+      const next = searchJobShape({
+        ...current,
+        status: "running",
+        processingToken: token,
+        processingUntil: Date.now() + Math.max(1000, Number(body.leaseMs) || SEARCH_LEASE_MS),
+        updatedAt: Date.now(),
+      });
+      await this.state.storage.put("job", next);
+      return json({ job: next }, 200, "no-store");
+    }
+    if (url.pathname === "/update-owned") {
+      const current = searchJobShape(await this.state.storage.get("job"));
+      const token = cleanAnalyticsId(body.token);
+      if (!current || current.processingToken !== token) return json({ job: null }, 200, "no-store");
+      const patch = body.patch || {};
+      const next = searchJobShape({
+        ...current,
+        ...patch,
+        processingToken: patch.processingToken ?? token,
+        stats: patch.stats || current.stats,
+        updatedAt: Date.now(),
+      });
+      if (!next) return json({ job: null }, 200, "no-store");
+      await this.state.storage.put("job", next);
+      return json({ job: next }, 200, "no-store");
+    }
+    return json({ error: "not found" }, 404, "no-store");
+  }
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -853,14 +929,9 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     const mayRefreshKnownRoute = cachedShorterCheck &&
       Number(stats.requests || 0) < CACHED_SHORTER_CHECK_REQUESTS &&
       (freshUsers.has(key) || key === job.start || key === job.target);
-    const games = cachedShorterCheck && !mayRefreshKnownRoute
-      ? (await readCachedGames(env, { username: key, archiveLimit }, stats) || [])
-      : await readOrFetchGames(env, {
-          username: key,
-          archiveLimit,
-          forceFresh: mayRefreshKnownRoute,
-        }, stats);
-    const edges = edgesFromGames(key, games);
+    const edges = mayRefreshKnownRoute
+      ? await readOrFetchEdges(env, { username: key, archiveLimit, forceFresh: true }, stats)
+      : await readCachedOrBuildEdges(env, { username: key, archiveLimit }, stats);
     edgesCache.set(key, edges);
     return edges;
   };
@@ -1059,8 +1130,7 @@ async function findServerChain(env, start, target, range, stats, progress) {
   const getEdges = async (username) => {
     const key = username.toLowerCase();
     if (edgesCache.has(key)) return edgesCache.get(key);
-    const games = await readOrFetchGames(env, { username: key, archiveLimit }, stats);
-    const edges = edgesFromGames(key, games);
+    const edges = await readOrFetchEdges(env, { username: key, archiveLimit }, stats);
     edgesCache.set(key, edges);
     return edges;
   };
@@ -1418,6 +1488,28 @@ function pushEdge(map, key, url) {
   map.get(key).push(url);
 }
 
+async function readOrFetchEdges(env, parsed, stats = null) {
+  const key = cacheKeyFromParsed(parsed);
+  if (!parsed.forceFresh) {
+    const cachedEdges = await readCachedEdges(env, parsed, stats);
+    if (cachedEdges) return cachedEdges;
+  }
+  const games = await readOrFetchGames(env, parsed, stats);
+  const edges = edgesFromGames(parsed.username, games);
+  await putEdgesCache(env.GAMES_CACHE, key, parsed, edges);
+  return edges;
+}
+
+async function readCachedOrBuildEdges(env, parsed, stats = null) {
+  const cachedEdges = await readCachedEdges(env, parsed, stats);
+  if (cachedEdges) return cachedEdges;
+  const games = await readCachedGames(env, parsed, stats);
+  if (!games) return { beatenByMe: new Map(), beatMe: new Map() };
+  const edges = edgesFromGames(parsed.username, games);
+  await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed(parsed), parsed, edges);
+  return edges;
+}
+
 async function readOrFetchGames(env, parsed, stats = null) {
   const key = cacheKeyFromParsed(parsed);
   const kvKey = `games:${key}`;
@@ -1466,10 +1558,57 @@ async function readCachedGames(env, parsed, stats = null) {
   return cachedGames;
 }
 
+async function readCachedEdges(env, parsed, stats = null) {
+  const key = cacheKeyFromParsed(parsed);
+  const cached = await env.GAMES_CACHE.get(edgeCacheKey(key), { type: "json", cacheTtl: 60 });
+  const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
+  if (!cached || Date.now() - cachedAt >= TTL_SECONDS * 1000) return null;
+  const edges = deserializeEdges(cached.edges);
+  if (!edges) return null;
+  if (stats) stats.cached = Number(stats.cached || 0) + 1;
+  return edges;
+}
+
 function cacheKeyFromParsed(parsed) {
   return Number.isFinite(parsed.archiveLimit)
     ? `${parsed.username}:recent:${parsed.archiveLimit}`
     : `${parsed.username}:all`;
+}
+
+function edgeCacheKey(key) {
+  return `edges:${String(key || "").toLowerCase()}`;
+}
+
+function serializeEdges(edges) {
+  return {
+    beatenByMe: serializeEdgeMap(edges?.beatenByMe),
+    beatMe: serializeEdgeMap(edges?.beatMe),
+  };
+}
+
+function serializeEdgeMap(map) {
+  return [...(map instanceof Map ? map.entries() : [])]
+    .slice(0, SEARCH_VISITED_LIMIT)
+    .map(([username, urls]) => [username, Array.isArray(urls) ? urls.slice(0, 3) : []]);
+}
+
+function deserializeEdges(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    beatenByMe: deserializeEdgeMap(raw.beatenByMe),
+    beatMe: deserializeEdgeMap(raw.beatMe),
+  };
+}
+
+function deserializeEdgeMap(rows) {
+  const map = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const username = cleanUsername(row?.[0]);
+    const urls = Array.isArray(row?.[1]) ? row[1].map(cleanUrl).filter(Boolean) : [];
+    if (username && urls.length) map.set(username, urls);
+    if (map.size >= SEARCH_VISITED_LIMIT) break;
+  }
+  return map;
 }
 
 function archiveLimitForRange(range) {
@@ -2144,12 +2283,16 @@ async function saveAnalyticsEvent(env, event) {
 }
 
 async function readSearchJob(env, id) {
+  const durable = await durableSearchJobRequest(env, id, "read");
+  if (durable.used) return durable.job;
   const record = await env.GAMES_CACHE.get(`search:job:${id}`, { type: "json" });
   return searchJobShape(record);
 }
 
 async function writeSearchJob(env, job) {
   const shaped = searchJobShape(job);
+  const durable = await durableSearchJobRequest(env, shaped.id, "write", { job: shaped });
+  if (durable.used) return durable.job;
   await env.GAMES_CACHE.put(`search:job:${shaped.id}`, JSON.stringify(shaped), {
     expirationTtl: SEARCH_JOB_TTL_SECONDS,
     metadata: { type: "search-job", start: shaped.start, target: shaped.target },
@@ -2158,6 +2301,8 @@ async function writeSearchJob(env, job) {
 }
 
 async function updateSearchJob(env, id, patch) {
+  const durable = await durableSearchJobRequest(env, id, "update", { patch });
+  if (durable.used) return durable.job;
   const current = await readSearchJob(env, id);
   if (!current) return null;
   return writeSearchJob(env, {
@@ -2169,6 +2314,8 @@ async function updateSearchJob(env, id, patch) {
 }
 
 async function claimSearchJob(env, id, token, leaseMs) {
+  const durable = await durableSearchJobRequest(env, id, "claim", { token, leaseMs });
+  if (durable.used) return durable.job;
   const current = await readSearchJob(env, id);
   if (!current || !isActiveSearchStatus(current.status)) return null;
   if (Number(current.processingUntil || 0) > Date.now() && current.processingToken !== token) return current;
@@ -2182,6 +2329,8 @@ async function claimSearchJob(env, id, token, leaseMs) {
 }
 
 async function updateOwnedSearchJob(env, id, token, patch) {
+  const durable = await durableSearchJobRequest(env, id, "update-owned", { token, patch });
+  if (durable.used) return durable.job;
   const current = await readSearchJob(env, id);
   if (!current || current.processingToken !== token) return null;
   return writeSearchJob(env, {
@@ -2191,6 +2340,20 @@ async function updateOwnedSearchJob(env, id, token, patch) {
     stats: patch.stats || current.stats,
     updatedAt: Date.now(),
   });
+}
+
+async function durableSearchJobRequest(env, id, action, payload = {}) {
+  const cleanId = cleanAnalyticsId(id);
+  if (!cleanId || !env.SEARCH_JOBS) return { used: false, job: null };
+  const stub = env.SEARCH_JOBS.getByName(cleanId);
+  const res = await stub.fetch(`https://search-job/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) return { used: true, job: null };
+  const data = await res.json();
+  return { used: true, job: searchJobShape(data.job) };
 }
 
 async function readPairChain(env, start, target, range) {
@@ -2515,8 +2678,7 @@ async function readCachedBfsPair(env, start, target, range) {
   let depth = 0;
 
   const getEdges = async (username) => {
-    const games = await readCachedGames(env, { username, archiveLimit }, stats);
-    return edgesFromGames(username, games || []);
+    return await readCachedEdges(env, { username, archiveLimit }, stats) || { beatenByMe: new Map(), beatMe: new Map() };
   };
 
   while (
@@ -3833,17 +3995,41 @@ function isBetterLeaderboardRow(candidate, current) {
 
 async function putGamesCache(kv, kvKey, parsed, games) {
   try {
-    await kv.put(kvKey, JSON.stringify({ ts: Date.now(), games }), {
+    const ts = Date.now();
+    await kv.put(kvKey, JSON.stringify({ ts, games }), {
       expirationTtl: KV_RETENTION_SECONDS,
       metadata: {
         username: parsed.username,
         range: Number.isFinite(parsed.archiveLimit) ? `recent:${parsed.archiveLimit}` : "all",
       },
     });
+    await putEdgesCache(kv, cacheKeyFromParsed(parsed), parsed, edgesFromGames(parsed.username, games), ts);
   } catch (error) {
     console.warn(JSON.stringify({
       event: "games_cache_write_failed",
       key: kvKey,
+      message: error?.message || String(error),
+    }));
+  }
+}
+
+async function putEdgesCache(kv, key, parsed, edges, ts = Date.now()) {
+  try {
+    await kv.put(edgeCacheKey(key), JSON.stringify({
+      ts,
+      edges: serializeEdges(edges),
+    }), {
+      expirationTtl: KV_RETENTION_SECONDS,
+      metadata: {
+        username: parsed.username,
+        range: Number.isFinite(parsed.archiveLimit) ? `recent:${parsed.archiveLimit}` : "all",
+        type: "edges",
+      },
+    });
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "edges_cache_write_failed",
+      key,
       message: error?.message || String(error),
     }));
   }

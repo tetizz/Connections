@@ -51,6 +51,7 @@ const STARTUP_CACHE_BFS_EXPANSIONS = 96;
 const STARTUP_CACHE_BFS_TIME_MS = 900;
 const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 160;
 const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
+const START_NO_WINS_TTL_SECONDS = 30 * 60;
 const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const SHARE_ID_LENGTH = 8;
 const SEARCH_JOB_TTL_SECONDS = 2 * 60 * 60;
@@ -568,11 +569,31 @@ async function tryStartupFastLane(env, { id, start, target, range }) {
   });
   if (!job) return null;
 
+  const cachedNoWins = await readStartNoWins(env, start, range).catch(() => null);
+  if (cachedNoWins) {
+    stats.cached = Number(stats.cached || 0) + 1;
+    return {
+      job: searchJobShape({
+        ...job,
+        status: "not_found",
+        outcome: "not_found",
+        progress: `${start} has no recent wins to trace from.`,
+        stats,
+        processingUntil: 0,
+        processingToken: "",
+        startedAt,
+        durationMs: Date.now() - startedAt,
+        updatedAt: Date.now(),
+      }),
+    };
+  }
+
   const cachedStartGames = await readCachedGames(env, {
     username: start,
     archiveLimit: Math.min(6, archiveLimitForRange(range) || 6),
   }, stats).catch(() => null);
   if (cachedStartGames && edgeMapSize(edgesFromGames(start, cachedStartGames).beatenByMe) === 0) {
+    await writeStartNoWins(env, start, range).catch(() => {});
     return {
       job: searchJobShape({
         ...job,
@@ -1500,6 +1521,7 @@ async function tryPrimedGraphIndexPair(env, job, stats, savedStepLimit) {
       .catch(() => {});
   }
   if (startEdges && edgeMapSize(startEdges.beatenByMe) === 0) {
+    await writeStartNoWins(env, job.start, job.range).catch(() => {});
     return {
       notFound: true,
       progress: `${job.start} has no recent wins to trace from.`,
@@ -2841,6 +2863,7 @@ async function readPairChain(env, start, target, range) {
 async function writePairChain(env, job) {
   const shaped = searchJobShape(job);
   if (!shaped?.chain?.found) return null;
+  await clearStartNoWins(env, shaped.start, shaped.range).catch(() => {});
   const key = pairChainKey(shaped.start, shaped.target, shaped.range);
   const current = await readPairChain(env, shaped.start, shaped.target, shaped.range);
   const currentSteps = chainStepCount(current?.chain);
@@ -2870,6 +2893,41 @@ async function writePairChain(env, job) {
     },
   });
   return pairChainShape(record, shaped.start, shaped.target, shaped.range);
+}
+
+function startNoWinsKey(start, range) {
+  return `search:nowins:${cleanRange(range) || "auto"}:${cleanUsername(start)}`;
+}
+
+async function readStartNoWins(env, start, range) {
+  const cleanStart = cleanUsername(start);
+  if (!cleanStart) return null;
+  const record = await env.GAMES_CACHE.get(startNoWinsKey(cleanStart, range), { type: "json", cacheTtl: 60 });
+  const ts = Number(record?.ts || 0);
+  if (record?.start !== cleanStart || Date.now() - ts >= START_NO_WINS_TTL_SECONDS * 1000) return null;
+  return record;
+}
+
+async function writeStartNoWins(env, start, range) {
+  const cleanStart = cleanUsername(start);
+  if (!cleanStart) return null;
+  const record = {
+    start: cleanStart,
+    range: cleanRange(range) || "auto",
+    ts: Date.now(),
+  };
+  await env.GAMES_CACHE.put(startNoWinsKey(cleanStart, range), JSON.stringify(record), {
+    expirationTtl: START_NO_WINS_TTL_SECONDS,
+    metadata: { type: "start-no-wins", start: cleanStart, range: record.range },
+  });
+  return record;
+}
+
+async function clearStartNoWins(env, start, range) {
+  const cleanStart = cleanUsername(start);
+  if (!cleanStart) return;
+  const ranges = [...new Set([cleanRange(range) || "auto", "auto"])];
+  await Promise.all(ranges.map((item) => env.GAMES_CACHE.delete(startNoWinsKey(cleanStart, item))));
 }
 
 async function writeFastLaneFragments(env, job) {

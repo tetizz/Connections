@@ -185,7 +185,7 @@ export default {
     }
 
     if (url.pathname === "/search/warm" && (request.method === "GET" || request.method === "POST")) {
-      return handleWarm(url, env, ctx);
+      return handleWarm(url, request, env, ctx);
     }
 
     if (url.pathname === "/share" && request.method === "POST") {
@@ -1788,6 +1788,11 @@ async function rebuildGraphIndex(env) {
   return Object.keys(graph.nodes).length;
 }
 
+async function readGraphIndexNodeCount(env) {
+  const graph = graphIndexShape(await env.GAMES_CACHE.get(GRAPH_INDEX_KEY, { type: "json" }));
+  return Object.keys(graph.nodes).length;
+}
+
 function archiveLimitFromCacheName(cacheName) {
   const parts = String(cacheName || "").split(":");
   if (parts[1] === "recent") {
@@ -1806,14 +1811,15 @@ function archiveLimitForRange(range) {
   return 6;
 }
 
-async function handleWarm(url, env, ctx) {
+async function handleWarm(url, request, env, ctx) {
   const statusOnly = url.searchParams.get("status") === "1";
   const indexOnly = url.searchParams.get("index") === "1";
   const graphStatusOnly = url.searchParams.get("graph") === "1";
   const force = url.searchParams.get("force") === "1";
   const status = await env.GAMES_CACHE.get(WARM_STATUS_KEY, { type: "json" });
   if (statusOnly) {
-    return json({ ok: true, status: publicWarmStatus(status) }, 200, "no-store");
+    const graphNodes = await readGraphIndexNodeCount(env);
+    return json({ ok: true, status: publicWarmStatus({ ...status, graphNodes }) }, 200, "no-store");
   }
   if (graphStatusOnly) {
     const graph = graphIndexShape(await env.GAMES_CACHE.get(GRAPH_INDEX_KEY, { type: "json" }));
@@ -1830,8 +1836,18 @@ async function handleWarm(url, env, ctx) {
     }, 200, "no-store");
   }
   if (indexOnly) {
+    if (!ownerAuthorized(request, env)) return json({ error: "unauthorized" }, 401, "no-store");
     const graphNodes = await rebuildGraphIndex(env);
-    return json({ ok: true, graphNodes, status: publicWarmStatus({ ...status, graphNodes }) }, 200, "no-store");
+    await env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify({
+      ...(status || {}),
+      status: "ready",
+      updatedAt: Date.now(),
+      graphNodes,
+    }), { expirationTtl: KV_RETENTION_SECONDS, metadata: { type: "warm" } });
+    return json({ ok: true, graphNodes, status: publicWarmStatus({ ...status, status: "ready", updatedAt: Date.now(), graphNodes }) }, 200, "no-store");
+  }
+  if (force && !ownerAuthorized(request, env)) {
+    return json({ error: "unauthorized" }, 401, "no-store");
   }
   const age = Date.now() - (Number.isFinite(status?.updatedAt) ? status.updatedAt : 0);
   if (!force && status?.status === "queued" && age < 5 * 60 * 1000) {

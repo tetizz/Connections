@@ -1015,7 +1015,7 @@
       status.hidden = false;
       const total = Number(data.total || 0);
       status.textContent = `${plainNumber(total)} matching event${total === 1 ? "" : "s"}.`;
-      loadOwnerWarmStatus(false).catch(() => {});
+      loadOwnerWarmStatus("status").catch(() => {});
     } catch (error) {
       state.ownerCode = "";
       wrap.hidden = true;
@@ -1028,41 +1028,52 @@
     }
   }
 
-  async function loadOwnerWarmStatus(force = false) {
+  async function loadOwnerWarmStatus(mode = "status") {
     const remoteBase = workerBase();
     const panel = $("#owner-tools");
     const stateEl = $("#owner-warm-state");
     const metrics = $("#owner-warm-metrics");
     const runBtn = $("#owner-warm-run");
+    const graphBtn = $("#owner-graph-rebuild");
     const refreshBtn = $("#owner-warm-refresh");
     if (!remoteBase || !panel || !stateEl || !metrics || !state.ownerCode) return;
 
+    const action = mode === true ? "warm" : mode;
+    const isBusy = action === "warm" || action === "graph";
     panel.hidden = false;
-    stateEl.textContent = force ? "Warming" : "Checking";
+    stateEl.textContent = action === "warm" ? "Warming" : action === "graph" ? "Rebuilding" : "Checking";
     metrics.innerHTML = `
       <span><strong>...</strong> players</span>
       <span><strong>...</strong> fragments</span>
+      <span><strong>...</strong> graph nodes</span>
       <span><strong>...</strong> issues</span>
       <span><strong>...</strong> updated</span>`;
     if (runBtn) runBtn.disabled = true;
+    if (graphBtn) graphBtn.disabled = true;
     if (refreshBtn) refreshBtn.disabled = true;
 
     try {
       const url = new URL(`${remoteBase}/search/warm`);
-      if (force) url.searchParams.set("force", "1");
+      if (action === "warm") url.searchParams.set("force", "1");
+      else if (action === "graph") url.searchParams.set("index", "1");
+      else url.searchParams.set("status", "1");
       const res = await fetch(url.toString(), {
-        method: force ? "POST" : "GET",
+        method: isBusy ? "POST" : "GET",
         headers: { "Accept": "application/json", "X-Owner-Code": state.ownerCode },
       });
       if (!res.ok) throw new Error("Cache status unavailable.");
       const data = await res.json();
-      renderOwnerWarmStatus(data?.status || data || {});
+      renderOwnerWarmStatus({
+        ...(data?.status || data || {}),
+        graphNodes: data?.graphNodes ?? data?.status?.graphNodes,
+      });
     } catch (error) {
       stateEl.textContent = "Unavailable";
       metrics.innerHTML = `
         <span class="owner-warm-metric--wide"><strong>Could not load</strong> ${esc(error.message || "Try again.")}</span>`;
     } finally {
       if (runBtn) runBtn.disabled = false;
+      if (graphBtn) graphBtn.disabled = false;
       if (refreshBtn) refreshBtn.disabled = false;
     }
   }
@@ -1083,6 +1094,7 @@
     metrics.innerHTML = `
       <span><strong>${plainNumber(status?.warmed || 0)}</strong> players</span>
       <span><strong>${plainNumber(status?.fragments || 0)}</strong> fragments</span>
+      <span><strong>${plainNumber(status?.graphNodes || 0)}</strong> graph nodes</span>
       <span><strong>${plainNumber(status?.errors || 0)}</strong> issues</span>
       <span><strong>${esc(timeAgo(status?.updatedAt) || "unknown")}</strong> updated</span>`;
   }
@@ -2783,10 +2795,13 @@
     loadOwnerAnalytics();
   });
   $("#owner-warm-run")?.addEventListener("click", () => {
-    loadOwnerWarmStatus(true);
+    loadOwnerWarmStatus("warm");
+  });
+  $("#owner-graph-rebuild")?.addEventListener("click", () => {
+    loadOwnerWarmStatus("graph");
   });
   $("#owner-warm-refresh")?.addEventListener("click", () => {
-    loadOwnerWarmStatus(false);
+    loadOwnerWarmStatus("status");
   });
 
   // persist username typed in settings

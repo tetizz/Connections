@@ -450,6 +450,45 @@ async function handleSearchStart(request, env, ctx) {
     }), { expirationTtl: SEARCH_WINDOW_SECONDS * 2 });
   }
 
+  const startupFastLane = cachedPair ? null : await tryStartupFastLane(env, {
+    id,
+    start,
+    target,
+    range,
+  }).catch((error) => {
+    console.warn(JSON.stringify({
+      event: "startup_fast_lane_failed",
+      start,
+      target,
+      message: error?.message || String(error),
+    }));
+    return null;
+  });
+  if (startupFastLane?.job) {
+    await writeSearchJob(env, startupFastLane.job);
+    if (startupFastLane.job.chain?.found) {
+      const cachePromise = Promise.all([
+        writePairChain(env, startupFastLane.job),
+        writeFastLaneFragments(env, startupFastLane.job),
+      ]).catch((error) => {
+        console.warn(JSON.stringify({
+          event: "startup_fast_lane_cache_failed",
+          jobId: id,
+          message: error?.message || String(error),
+        }));
+      });
+      if (ctx?.waitUntil) ctx.waitUntil(cachePromise);
+      else await cachePromise;
+    }
+    const event = searchJobAnalyticsEvent(startupFastLane.job);
+    if (event) {
+      const analyticsPromise = saveAnalyticsEvent(env, event);
+      if (ctx?.waitUntil) ctx.waitUntil(analyticsPromise);
+      else await analyticsPromise;
+    }
+    return json({ ok: true, job: publicSearchJob(startupFastLane.job) }, 200, "no-store");
+  }
+
   const shouldRefreshCachedPair = Boolean(
     cachedPair?.chain?.found &&
     chainStepCount(cachedPair.chain) >= VISIBLE_SHORTER_CHECK_MIN_STEPS
@@ -463,7 +502,9 @@ async function handleSearchStart(request, env, ctx) {
       ? shouldRefreshCachedPair ? "running" : "found"
       : "queued",
     progress: cachedPair
-      ? "Loaded saved connection instantly. Shorter route check is running in the background."
+      ? shouldRefreshCachedPair
+        ? "Loaded saved connection instantly. Shorter route check is running in the background."
+        : "Loaded saved connection instantly."
       : "Queued",
     stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
     chain: cachedPair?.chain,
@@ -508,6 +549,69 @@ async function handleSearchStart(request, env, ctx) {
   }
 
   return json({ ok: true, job: publicSearchJob(job) }, 202, "no-store");
+}
+
+async function tryStartupFastLane(env, { id, start, target, range }) {
+  const startedAt = Date.now();
+  const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+  const job = searchJobShape({
+    id,
+    start,
+    target,
+    range,
+    status: "running",
+    progress: "Checking fast lanes.",
+    stats,
+    search: initialSearchState(start, target),
+    createdAt: startedAt,
+    updatedAt: startedAt,
+  });
+  if (!job) return null;
+
+  const fastLane = await tryCachedRouteLanes(env, job, stats, Number.POSITIVE_INFINITY);
+  const base = {
+    ...job,
+    stats,
+    processingUntil: 0,
+    processingToken: "",
+    startedAt,
+    durationMs: Date.now() - startedAt,
+    updatedAt: Date.now(),
+  };
+  if (fastLane?.notFound) {
+    return {
+      job: searchJobShape({
+        ...base,
+        status: "not_found",
+        outcome: "not_found",
+        progress: fastLane.progress || "No connection found in this search.",
+      }),
+    };
+  }
+  if (!fastLane?.chain?.path?.length) return null;
+
+  const targetProfile = await readOrFetchProfile(env, target).catch(() => null);
+  const chain = {
+    target,
+    display: targetProfile?.name || targetProfile?.username || target,
+    found: true,
+    length: Math.max(0, fastLane.chain.path.length - 1),
+    path: fastLane.chain.path,
+    hops: cleanHopList(fastLane.chain.hops),
+    quality: routeQuality(fastLane.chain, stats, fastLane.source || "startup-fast-lane"),
+  };
+  return {
+    job: searchJobShape({
+      ...base,
+      status: "found",
+      outcome: "found",
+      progress: fastLane.source === "direct-recent-win" || fastLane.source === "direct-cached-win"
+        ? `Found a direct win from ${start} to ${target}.`
+        : `Found ${start} to ${target} through a warmed route.`,
+      chain,
+      players: targetProfile ? { [target]: targetProfile } : {},
+    }),
+  };
 }
 
 function bestPairChain(candidates) {

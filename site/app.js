@@ -3047,7 +3047,7 @@
     const remoteBase = workerBase();
     if (!remoteBase || !id) return null;
     let job = null;
-    for (let attempt = 0; attempt < 360; attempt++) {
+    for (let attempt = 0; ; attempt++) {
       const previous = state.searchJobs.get(id);
       const previousStats = previous?.stats || {};
       const params = new URLSearchParams({ id });
@@ -3065,14 +3065,6 @@
       if (["found", "not_found", "timeout", "failed"].includes(job.status)) return job;
       await new Promise((resolve) => setTimeout(resolve, attempt < 12 ? 350 : 900));
     }
-    return {
-      id,
-      status: "timeout",
-      outcome: "timeout",
-      progress: "Search is still running. Keep this tab open and it will keep checking.",
-      start: analyticsBase?.start,
-      target: analyticsBase?.target,
-    };
   }
 
   function mergeSearchJobSnapshot(job) {

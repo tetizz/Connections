@@ -31,16 +31,16 @@ const GRAPH_INDEX_NODE_LIMIT = 900;
 const GRAPH_INDEX_EDGE_LIMIT = 24;
 const GRAPH_INDEX_WARM_KEY_LIMIT = 900;
 const GRAPH_BRIDGE_CONNECTOR_LIMIT = 120;
-const SEARCH_MAX_DEPTH = 8;
-const SEARCH_MAX_EXPANSIONS = 2200;
-const SEARCH_FRONTIER_LIMIT = 520;
-const SEARCH_CHUNK_EXPANSIONS = 340;
+const SEARCH_MAX_DEPTH = 1000000;
+const SEARCH_MAX_EXPANSIONS = Number.MAX_SAFE_INTEGER;
+const SEARCH_FRONTIER_LIMIT = 60000;
+const SEARCH_CHUNK_EXPANSIONS = 520;
 const SEARCH_CHUNK_TIME_MS = 12000;
 const SEARCH_EXPANSION_CONCURRENCY = 64;
-const SEARCH_BACKGROUND_TIME_MS = 90000;
+const SEARCH_BACKGROUND_TIME_MS = 120000;
 const SEARCH_LEASE_MS = 20000;
-const SEARCH_VISITED_LIMIT = 36000;
-const SEARCH_NEXT_FRONTIER_LIMIT = 9000;
+const SEARCH_VISITED_LIMIT = 250000;
+const SEARCH_NEXT_FRONTIER_LIMIT = 60000;
 const CACHED_SHORTER_CHECK_REQUESTS = 12;
 const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
 const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 24;
@@ -1121,7 +1121,6 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     return edges;
   };
   const beginLayer = async () => {
-    if (search.depth >= SEARCH_MAX_DEPTH || stats.expanded >= SEARCH_MAX_EXPANSIONS) return false;
     const forwardCount = search.forwardFrontier.length;
     const backwardCount = search.backwardFrontier.length;
     if (!forwardCount && !backwardCount) return false;
@@ -1156,17 +1155,12 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     syncSearch();
     await progress(`Checked ${stats.expanded} players, ${totalVisited()} candidates`, { depth: search.depth });
   };
-  const limitProgress = () =>
-    `Search reached the automatic limit after checking ${stats.expanded} players and ${totalVisited()} candidates.`;
 
-  while (processed < expansionBudget && Date.now() < deadline && stats.expanded < SEARCH_MAX_EXPANSIONS) {
+  while (processed < expansionBudget && Date.now() < deadline) {
     if (!search.activeSide) {
       const startedLayer = await beginLayer();
       if (!startedLayer) {
         syncSearch();
-        if (stats.expanded >= SEARCH_MAX_EXPANSIONS || search.depth >= SEARCH_MAX_DEPTH) {
-          return { status: "timeout", progress: limitProgress() };
-        }
         return { status: "not_found", progress: "No connection found in this search." };
       }
     }
@@ -1182,7 +1176,6 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
 
     const remainingBudget = Math.min(
       expansionBudget - processed,
-      SEARCH_MAX_EXPANSIONS - stats.expanded,
       search.activeFrontier.length - search.activeCursor,
     );
     const batchSize = Math.max(1, Math.min(expansionConcurrency, remainingBudget));
@@ -1247,9 +1240,6 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
   }
 
   syncSearch();
-  if (stats.expanded >= SEARCH_MAX_EXPANSIONS || search.depth >= SEARCH_MAX_DEPTH) {
-    return { status: "timeout", progress: limitProgress() };
-  }
   return {
     status: "running",
     progress: search.activeSide

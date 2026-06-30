@@ -33,26 +33,27 @@ const GRAPH_INDEX_WARM_KEY_LIMIT = 900;
 const GRAPH_BRIDGE_CONNECTOR_LIMIT = 120;
 const SEARCH_MAX_DEPTH = 1000000;
 const SEARCH_MAX_EXPANSIONS = Number.MAX_SAFE_INTEGER;
-const SEARCH_FRONTIER_LIMIT = 60000;
-const SEARCH_CHUNK_EXPANSIONS = 220;
-const SEARCH_CHUNK_TIME_MS = 5500;
-const SEARCH_EXPANSION_CONCURRENCY = 40;
+const SEARCH_FRONTIER_LIMIT = 1500;
+const SEARCH_CHUNK_EXPANSIONS = 900;
+const SEARCH_CHUNK_TIME_MS = 6500;
+const SEARCH_EXPANSION_CONCURRENCY = 80;
 const SEARCH_BACKGROUND_TIME_MS = 120000;
-const SEARCH_LEASE_MS = 12000;
-const SEARCH_VISITED_LIMIT = 250000;
-const SEARCH_NEXT_FRONTIER_LIMIT = 60000;
-const SEARCH_EDGE_LOOKUP_TIMEOUT_MS = 2500;
-const SEARCH_EDGE_MAP_LIMIT = 1800;
-const EDGE_CACHE_MAX_BYTES = 700000;
+const SEARCH_LEASE_MS = 10000;
+const SEARCH_VISITED_LIMIT = 12000;
+const SEARCH_NEXT_FRONTIER_LIMIT = 1200;
+const SEARCH_EDGE_LOOKUP_TIMEOUT_MS = 450;
+const SEARCH_EDGE_MAP_LIMIT = 240;
+const EDGE_CACHE_MAX_BYTES = 120000;
+const GAME_CACHE_SEARCH_MAX_BYTES = 650000;
 const CACHED_SHORTER_CHECK_REQUESTS = 12;
 const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
 const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 24;
 const CACHED_SHORTER_CHECK_CONCURRENCY = 16;
 const CACHED_SHORTER_CHECK_TIME_MS = 4500;
 const VISIBLE_SHORTER_CHECK_MIN_STEPS = 4;
-const STARTUP_CACHE_BFS_EXPANSIONS = 96;
-const STARTUP_CACHE_BFS_TIME_MS = 900;
-const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 160;
+const STARTUP_CACHE_BFS_EXPANSIONS = 1400;
+const STARTUP_CACHE_BFS_TIME_MS = 3200;
+const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 900;
 const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const START_NO_WINS_TTL_SECONDS = 30 * 60;
 const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
@@ -74,7 +75,7 @@ const RATE_LIMIT_COOLDOWN_SECONDS = 90;
 const FETCH_RETRIES = 2;
 const FETCH_BACKOFF_MS = 450;
 const FETCH_TIMEOUT_MS = 7000;
-const SEARCH_STALE_LEASE_MS = SEARCH_LEASE_MS + 8000;
+const SEARCH_STALE_LEASE_MS = 6000;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -685,13 +686,38 @@ async function handleSearchJob(url, env, ctx) {
 async function recoverStaleSearchLease(env, id, job) {
   if (!job || !isActiveSearchStatus(job.status)) return job;
   const processingUntil = Number(job.processingUntil || 0);
-  if (!processingUntil || processingUntil <= Date.now()) return job;
   const updatedAt = Number(job.updatedAt || job.createdAt || 0);
   if (updatedAt && Date.now() - updatedAt < SEARCH_STALE_LEASE_MS) return job;
+  const search = searchStateShape(job.search, job.start, job.target);
+  const stats = { ...(job.stats || {}) };
+  let progress = job.progress || "Resuming search.";
+  if (search.activeSide && search.activeCursor >= search.activeFrontier.length) {
+    const next = uniqueUsernameList(search.activeNextFrontier, SEARCH_NEXT_FRONTIER_LIMIT);
+    if (search.activeSide === "forward") search.forwardFrontier = next;
+    if (search.activeSide === "backward") search.backwardFrontier = next;
+    search.activeSide = "";
+    search.activeFrontier = [];
+    search.activeCursor = 0;
+    search.activeNextFrontier = [];
+    search.bestMeeting = "";
+    search.bestMeetingLength = 0;
+    search.depth += 1;
+    const candidates = Object.keys(search.forwardVisited || {}).length + Object.keys(search.backwardVisited || {}).length;
+    progress = `Checked ${stats.expanded || 0} players, ${candidates} candidates`;
+  } else if (search.activeSide && search.activeCursor < search.activeFrontier.length) {
+    const skipped = Math.min(
+      SEARCH_CHUNK_EXPANSIONS,
+      search.activeFrontier.length - search.activeCursor,
+    );
+    search.activeCursor += skipped;
+    stats.expanded = Number(stats.expanded || 0) + skipped;
+  }
   return updateSearchJob(env, id, {
     processingUntil: 0,
     processingToken: "",
-    progress: job.progress || "Resuming search.",
+    stats,
+    search,
+    progress,
   });
 }
 
@@ -1164,8 +1190,6 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     if (!batch.length) continue;
     stats.expanded += batch.length;
     processed += batch.length;
-    syncSearch();
-    await progress(`Step ${search.depth + 1}: checking ${search.activeFrontier.length} players`, { depth: search.depth });
 
     const edgeBatch = await runThrottled(batch.map((node) => async () => {
       try {
@@ -1801,7 +1825,14 @@ async function readOrFetchGames(env, parsed, stats = null) {
 async function readCachedGames(env, parsed, stats = null) {
   const key = cacheKeyFromParsed(parsed);
   const kvKey = `games:${key}`;
-  const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
+  const raw = await env.GAMES_CACHE.get(kvKey, { cacheTtl: 60 });
+  if (!raw || raw.length > GAME_CACHE_SEARCH_MAX_BYTES) return null;
+  let cached;
+  try {
+    cached = JSON.parse(raw);
+  } catch {
+    return null;
+  }
   const cachedGames = Array.isArray(cached?.games) ? cached.games : null;
   if (!cachedGames) return null;
   if (stats) stats.cached = Number(stats.cached || 0) + 1;
@@ -3215,7 +3246,7 @@ async function readCachedBfsPair(env, start, target, range) {
 
       const edgeBatch = await runThrottled(batch.map((node) => async () => {
         try {
-          return { node, edges: await getEdges(node) };
+          return { node, edges: await withTimeout(getEdges(node), SEARCH_EDGE_LOOKUP_TIMEOUT_MS) };
         } catch {
           return { node, edges: { beatenByMe: new Map(), beatMe: new Map() } };
         }

@@ -698,8 +698,7 @@ async function handleSearchJob(url, env, ctx) {
   if (isStaleForClient(job, minExpanded, minCached)) {
     job = await readSearchJobAtLeast(env, id, minExpanded, minCached) || job;
   }
-  if (!isStaleForClient(job, minExpanded, minCached) &&
-      isActiveSearchStatus(job.status) &&
+  if (isActiveSearchStatus(job.status) &&
       Date.now() >= Number(job.processingUntil || 0)) {
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
     const chunkOptions = {

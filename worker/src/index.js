@@ -702,25 +702,24 @@ async function handleSearchJob(url, env, ctx) {
       isActiveSearchStatus(job.status) &&
       Date.now() >= Number(job.processingUntil || 0)) {
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
-    if (cachedShorterCheck && ctx?.waitUntil) {
+    const chunkOptions = {
+      expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
+      timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
+      concurrency: cachedShorterCheck ? CACHED_SHORTER_CHECK_CONCURRENCY : SEARCH_EXPANSION_CONCURRENCY,
+    };
+    if (ctx?.waitUntil) {
       ctx.waitUntil(runSearchJobChunk(env, id, {
-        expansionBudget: CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS,
-        timeBudgetMs: CACHED_SHORTER_CHECK_TIME_MS,
-        concurrency: CACHED_SHORTER_CHECK_CONCURRENCY,
+        ...chunkOptions,
       }).catch((error) => {
         console.warn(JSON.stringify({
-          event: "cached_pair_poll_kick_failed",
+          event: "search_poll_kick_failed",
           jobId: id,
           message: error?.message || String(error),
         }));
       }));
       return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
     }
-    job = await runSearchJobChunk(env, id, {
-      expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
-      timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
-      concurrency: cachedShorterCheck ? CACHED_SHORTER_CHECK_CONCURRENCY : SEARCH_EXPANSION_CONCURRENCY,
-    }) || await readSearchJob(env, id) || job;
+    job = await runSearchJobChunk(env, id, chunkOptions) || await readSearchJob(env, id) || job;
   }
   return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
 }

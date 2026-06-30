@@ -448,6 +448,17 @@
       if (!startRes.ok) throw new Error(`HTTP ${startRes.status}`);
       let job = (await startRes.json()).job;
       if (!job?.id) throw new Error("missing job");
+      if (job.chain?.found) {
+        const ms = Math.round(performance.now() - started);
+        const steps = Array.isArray(job.chain?.path) ? Math.max(0, job.chain.path.length - 1) : null;
+        return {
+          player,
+          status: "found",
+          ms,
+          steps,
+          job: { ...job, status: "found" },
+        };
+      }
       while (["queued", "running"].includes(job.status) && performance.now() - started < TOP_TRACE_HARD_LIMIT_MS && runId === state.topTraceRunId) {
         await new Promise((resolve) => setTimeout(resolve, TOP_TRACE_POLL_INTERVAL_MS));
         const pollRes = await fetch(`${remoteBase}/search/job?id=${encodeURIComponent(job.id)}`, {
@@ -455,6 +466,7 @@
         });
         if (!pollRes.ok) throw new Error(`poll ${pollRes.status}`);
         job = (await pollRes.json()).job || job;
+        if (job.chain?.found) job = { ...job, status: "found" };
       }
       const ms = Math.round(performance.now() - started);
       const steps = Array.isArray(job.chain?.path) ? Math.max(0, job.chain.path.length - 1) : null;
@@ -3062,6 +3074,7 @@
       if (!job) throw new Error("job missing");
       if (!background) showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
+      if (job.chain?.found && !background) return { ...job, status: "found" };
       if (["found", "not_found", "timeout", "failed"].includes(job.status)) return job;
       await new Promise((resolve) => setTimeout(resolve, attempt < 12 ? 350 : 900));
     }
@@ -3089,6 +3102,9 @@
     const rewound = nextExpanded < prevExpanded || nextCached < prevCached;
     const merged = {
       ...job,
+      start: job.start || previous.start,
+      target: job.target || previous.target,
+      range: job.range || previous.range,
       progress: rewound ? previous.progress : job.progress,
       stats: {
         ...nextStats,

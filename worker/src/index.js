@@ -34,14 +34,17 @@ const GRAPH_BRIDGE_CONNECTOR_LIMIT = 120;
 const SEARCH_MAX_DEPTH = 1000000;
 const SEARCH_MAX_EXPANSIONS = Number.MAX_SAFE_INTEGER;
 const SEARCH_FRONTIER_LIMIT = 1000;
-const SEARCH_CHUNK_EXPANSIONS = 260;
-const SEARCH_CHUNK_TIME_MS = 2800;
-const SEARCH_EXPANSION_CONCURRENCY = 32;
+const SEARCH_CHUNK_EXPANSIONS = 512;
+const SEARCH_CHUNK_TIME_MS = 5000;
+const SEARCH_EXPANSION_CONCURRENCY = 64;
 const SEARCH_BACKGROUND_TIME_MS = 120000;
 const SEARCH_LEASE_MS = 10000;
 const SEARCH_VISITED_LIMIT = 8000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 800;
-const SEARCH_EDGE_LOOKUP_TIMEOUT_MS = 250;
+const SEARCH_CACHE_EDGE_LOOKUP_TIMEOUT_MS = 350;
+const SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS = 2500;
+const SEARCH_FRESH_EDGE_REQUEST_LIMIT = 80;
+const SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK = 12;
 const SEARCH_EDGE_MAP_LIMIT = 80;
 const EDGE_CACHE_MAX_BYTES = 45000;
 const GAME_CACHE_SEARCH_MAX_BYTES = 250000;
@@ -473,13 +476,9 @@ async function handleSearchStart(request, env, ctx) {
     start,
     target,
     range,
-    status: cachedPair
-      ? shouldRefreshCachedPair ? "running" : "found"
-      : "queued",
+    status: cachedPair ? "found" : "queued",
     progress: cachedPair
-      ? shouldRefreshCachedPair
-        ? "Loaded saved connection instantly. Shorter route check is running in the background."
-        : "Loaded saved connection instantly."
+      ? "Loaded saved connection instantly."
       : "Queued",
     stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
     chain: cachedPair?.chain,
@@ -492,7 +491,7 @@ async function handleSearchStart(request, env, ctx) {
   });
   await writeSearchJob(env, job);
   if (ctx?.waitUntil && cachedPair && shouldRefreshCachedPair) {
-    ctx.waitUntil(kickSearchJobChunk(env, job.id).catch((error) => {
+    ctx.waitUntil(refreshCachedPairInBackground(env, job).catch((error) => {
       console.warn(JSON.stringify({
         event: "cached_pair_refresh_failed",
         jobId: job.id,
@@ -663,31 +662,79 @@ async function handleSearchJob(url, env, ctx) {
   if (!id) return json({ error: "missing id" }, 400, "no-store");
   const minExpanded = cleanNonNegativeNumber(url.searchParams.get("minExpanded"), SEARCH_MAX_EXPANSIONS) || 0;
   const minCached = cleanNonNegativeNumber(url.searchParams.get("minCached"), 100000) || 0;
-  let job = await readSearchJob(env, id);
-  if (!job) {
-    const publicJob = await readPublicSearchJob(env, id);
-    if (publicJob) return json({ ok: true, job: publicJob }, 200, "no-store");
-    return json({ error: "job not found" }, 404, "no-store");
-  }
-  if (isStaleForClient(job, minExpanded, minCached)) {
-    job = await readSearchJobAtLeast(env, id, minExpanded, minCached) || job;
-  }
-  job = await recoverStaleSearchLease(env, id, job) || job;
-  if (isActiveSearchStatus(job.status) &&
-      Date.now() >= Number(job.processingUntil || 0)) {
-    if (ctx?.waitUntil) {
-      ctx.waitUntil(kickSearchJobChunk(env, id).catch((error) => {
-        console.warn(JSON.stringify({
-          event: "search_poll_kick_failed",
-          jobId: id,
-          message: error?.message || String(error),
-        }));
-      }));
-      return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
+  try {
+    let job = await readSearchJob(env, id);
+    if (!job) {
+      const publicJob = await readPublicSearchJob(env, id);
+      if (publicJob) {
+        if (ctx?.waitUntil && isActiveSearchStatus(publicJob.status)) {
+          ctx.waitUntil(kickSearchJobChunk(env, id).catch((error) => {
+            console.warn(JSON.stringify({
+              event: "public_search_poll_kick_failed",
+              jobId: id,
+              message: error?.message || String(error),
+            }));
+          }));
+        }
+        return json({ ok: true, job: publicJob }, 200, "no-store");
+      }
+      return json({ error: "job not found" }, 404, "no-store");
     }
-    job = await kickSearchJobChunk(env, id) || await readSearchJob(env, id) || job;
+    if (isStaleForClient(job, minExpanded, minCached)) {
+      job = await readSearchJobAtLeast(env, id, minExpanded, minCached) || job;
+    }
+    job = await recoverStaleSearchLease(env, id, job) || job;
+    if (isActiveSearchStatus(job.status) &&
+        Date.now() >= Number(job.processingUntil || 0)) {
+      if (ctx?.waitUntil) {
+        ctx.waitUntil(kickSearchJobChunk(env, id).catch((error) => {
+          console.warn(JSON.stringify({
+            event: "search_poll_kick_failed",
+            jobId: id,
+            message: error?.message || String(error),
+          }));
+        }));
+        return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
+      }
+      job = await kickSearchJobChunk(env, id) || await readSearchJob(env, id) || job;
+    }
+    return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "search_job_poll_failed",
+      jobId: id,
+      message: error?.message || String(error),
+    }));
+    const publicJob = await readPublicSearchJob(env, id).catch(() => null);
+    if (publicJob) return json({ ok: true, job: publicJob, warning: "snapshot" }, 200, "no-store");
+    const kvJob = await env.GAMES_CACHE.get(`search:job:${id}`, { type: "json" })
+      .then((record) => publicSearchJob(searchJobShape(record)))
+      .catch(() => null);
+    if (kvJob) return json({ ok: true, job: kvJob, warning: "kv-snapshot" }, 200, "no-store");
+    return json({
+      ok: true,
+      warning: "pending-snapshot",
+      job: {
+        id,
+        start: "",
+        target: "",
+        range: "auto",
+        status: "running",
+        outcome: "started",
+        progress: "Search is still running.",
+        error: "",
+        stats: { fetched: 0, requests: 0, cached: minCached, expanded: minExpanded },
+        chain: null,
+        players: {},
+        refreshCached: false,
+        cachedAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        durationMs: null,
+        quality: null,
+      },
+    }, 200, "no-store");
   }
-  return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
 }
 
 async function recoverStaleSearchLease(env, id, job) {
@@ -1097,6 +1144,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
   const backwardVisited = visitedObjectToMap(search.backwardVisited);
   const edgesCache = new Map();
   let processed = 0;
+  let freshRequestsThisChunk = 0;
   let meeting = cleanUsername(search.bestMeeting);
   let meetingLength = meeting ? cleanNonNegativeNumber(search.bestMeetingLength, SEARCH_MAX_DEPTH * 2 + 2) || Number.POSITIVE_INFINITY : Number.POSITIVE_INFINITY;
 
@@ -1127,9 +1175,27 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     const mayRefreshKnownRoute = cachedShorterCheck &&
       Number(stats.requests || 0) < CACHED_SHORTER_CHECK_REQUESTS &&
       (key === job.start || key === job.target);
-    const edges = mayRefreshKnownRoute
-      ? await readOrFetchEdges(env, { username: key, archiveLimit: refreshArchiveLimit, forceFresh: true }, stats)
-      : await readCachedOrBuildEdges(env, { username: key, archiveLimit }, stats);
+    let edges = null;
+    if (mayRefreshKnownRoute) {
+      edges = await readOrFetchEdges(env, { username: key, archiveLimit: refreshArchiveLimit, forceFresh: true }, stats);
+    } else {
+      const cached = await readCachedExpansionEdges(env, { username: key, archiveLimit }, stats);
+      edges = cached.edges;
+      const canFetchFresh =
+        !cachedShorterCheck &&
+        cached.source === "miss" &&
+        freshRequestsThisChunk < SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK &&
+        Number(stats.requests || 0) < SEARCH_FRESH_EDGE_REQUEST_LIMIT;
+      if (canFetchFresh) {
+        freshRequestsThisChunk++;
+        try {
+          edges = await readOrFetchEdges(env, { username: key, archiveLimit }, stats);
+        } catch (error) {
+          if (!isRateLimitError(error) && !isMissingArchivesError(error)) throw error;
+        }
+      }
+    }
+    if (!edges) edges = { beatenByMe: new Map(), beatMe: new Map() };
     edgesCache.set(key, edges);
     return edges;
   };
@@ -1200,7 +1266,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
 
     const edgeBatch = await runThrottled(batch.map((node) => async () => {
       try {
-        return { node, edges: await withTimeout(getEdges(node), SEARCH_EDGE_LOOKUP_TIMEOUT_MS) };
+        return { node, edges: await withTimeout(getEdges(node), SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS) };
       } catch {
         return { node, edges: { beatenByMe: new Map(), beatMe: new Map() } };
       }
@@ -1789,6 +1855,16 @@ async function readCachedOrBuildEdges(env, parsed, stats = null) {
   const edges = edgesFromGames(parsed.username, games);
   await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed(parsed), parsed, edges);
   return edges;
+}
+
+async function readCachedExpansionEdges(env, parsed, stats = null) {
+  const cachedEdges = await readCachedEdges(env, parsed, stats);
+  if (cachedEdges) return { edges: cachedEdges, source: "edge-cache" };
+  const games = await readCachedGames(env, parsed, stats);
+  if (!games) return { edges: null, source: "miss" };
+  const edges = edgesFromGames(parsed.username, games);
+  await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed(parsed), parsed, edges);
+  return { edges, source: "game-cache" };
 }
 
 async function readOrFetchGames(env, parsed, stats = null) {
@@ -2781,7 +2857,7 @@ async function saveAnalyticsEvent(env, event) {
 
 async function readSearchJob(env, id) {
   const durable = await durableSearchJobRequest(env, id, "read", {}, { timeoutMs: SEARCH_DURABLE_READ_TIMEOUT_MS });
-  if (durable.used) return durable.job;
+  if (durable.used && durable.job) return durable.job;
   const record = await env.GAMES_CACHE.get(`search:job:${id}`, { type: "json" });
   return searchJobShape(record);
 }
@@ -3305,7 +3381,7 @@ async function readCachedBfsPair(env, start, target, range) {
 
       const edgeBatch = await runThrottled(batch.map((node) => async () => {
         try {
-          return { node, edges: await withTimeout(getEdges(node), SEARCH_EDGE_LOOKUP_TIMEOUT_MS) };
+          return { node, edges: await withTimeout(getEdges(node), SEARCH_CACHE_EDGE_LOOKUP_TIMEOUT_MS) };
         } catch {
           return { node, edges: { beatenByMe: new Map(), beatMe: new Map() } };
         }

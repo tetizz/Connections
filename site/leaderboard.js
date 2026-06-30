@@ -10,6 +10,7 @@ window.Leaderboard = (() => {
   const WORKER_URL = String(
     window.CONNECTIONS_CACHE_API || "https://connections-cache.tetizz.workers.dev"
   ).replace(/\/+$/, "");
+  const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
   let activeCategory = "connectors";
   let tabsWired = false;
 
@@ -61,7 +62,10 @@ window.Leaderboard = (() => {
         `<div class="lb-empty">no ${esc(categoryLabel(category).toLowerCase())} yet.</div>`;
       return;
     }
-    const top = entries.filter((entry) => entry?.username).slice(0, 10);
+    const top = entries
+      .filter((entry) => entry?.username)
+      .filter((entry) => !entryHasBlockedUser(entry))
+      .slice(0, 10);
     if (!top.length) {
       el.innerHTML =
         `<div class="lb-empty">no ${esc(categoryLabel(category).toLowerCase())} yet.</div>`;
@@ -190,6 +194,25 @@ window.Leaderboard = (() => {
 
   function displayName(profile, username) {
     return profile.name || profile.username || username;
+  }
+
+  function cleanUsername(value) {
+    return String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  }
+
+  function isBlockedUsername(username) {
+    return BLOCKED_USERNAMES.has(cleanUsername(username));
+  }
+
+  function entryHasBlockedUser(entry) {
+    if (isBlockedUsername(entry?.username) || isBlockedUsername(entry?.target)) return true;
+    if (Array.isArray(entry?.path) && entry.path.some(isBlockedUsername)) return true;
+    if (Array.isArray(entry?.examples)) {
+      return entry.examples.some((example) =>
+        isBlockedUsername(example?.start) || isBlockedUsername(example?.target) ||
+        (Array.isArray(example?.path) && example.path.some(isBlockedUsername)));
+    }
+    return false;
   }
 
   async function loadProfiles(usernames) {

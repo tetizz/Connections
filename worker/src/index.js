@@ -66,6 +66,7 @@ const WARM_VERIFY_TIME_MS = 22000;
 const FAST_LANE_FRAGMENT_LIMIT = 200;
 const START_LANE_FRAGMENT_LIMIT = 300;
 const COMMON_WARM_TARGETS = ["magnuscarlsen", "hikaru", "danielnaroditsky", "fabianocaruana", "gothamchess"];
+const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
 const RATE_LIMIT_COOLDOWN_SECONDS = 90;
 const FETCH_RETRIES = 2;
 const FETCH_BACKOFF_MS = 450;
@@ -289,6 +290,7 @@ async function handleLeaderboard(url, env) {
 async function handleProfile(url, env) {
   const username = cleanUsername(url.searchParams.get("username"));
   if (!username) return json({ error: "Invalid username" }, 400);
+  if (isBlockedUsername(username)) return json({ error: "Profile unavailable" }, 404, "no-store");
 
   const kvKey = `profile:${username}`;
   const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
@@ -336,6 +338,7 @@ async function handleSuggest(url, env) {
   const seen = new Map();
   const add = (profile, source = "cloudflare") => {
     const suggestion = suggestionShape(profile, source);
+    if (isBlockedUsername(suggestion?.username)) return;
     if (!suggestion || !matchesSuggestion(suggestion, query)) return;
     const existing = seen.get(suggestion.username);
     if (!existing || suggestionScore(suggestion, query) > suggestionScore(existing, query)) {
@@ -365,11 +368,12 @@ async function handleSuggest(url, env) {
 
   if (query.length >= 3 && !seen.has(query)) {
     const exact = await readOrFetchProfile(env, query);
-    if (exact) add(exact, "exact match");
+    if (exact && !isBlockedUsername(query)) add(exact, "exact match");
   }
 
   const suggestions = [...seen.values()]
     .filter((item) => matchesSuggestion(item, query))
+    .filter((item) => !isBlockedUsername(item.username))
     .sort((a, b) => suggestionScore(b, query) - suggestionScore(a, query) || a.username.localeCompare(b.username))
     .slice(0, limit);
 
@@ -2580,6 +2584,9 @@ async function handleSubmit(request, env) {
       !Number.isFinite(length) || length < 0 || length > 10) {
     return json({ error: "missing fields" }, 400);
   }
+  if (isBlockedUsername(start) || isBlockedUsername(target) || pathHasBlockedUser(normalizedPath)) {
+    return json({ ok: true, skipped: true }, 200, "no-store");
+  }
 
   const entries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
   const key = `${start}|${target}`;
@@ -3983,6 +3990,14 @@ function cleanLeaderboardCategory(value) {
     : "connectors";
 }
 
+function isBlockedUsername(username) {
+  return BLOCKED_USERNAMES.has(cleanUsername(username));
+}
+
+function pathHasBlockedUser(path) {
+  return Array.isArray(path) && path.some(isBlockedUsername);
+}
+
 function cleanTimestampMs(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
@@ -4244,6 +4259,7 @@ async function addProfilesFromKV(env, query, seen, maxCandidates) {
       const username = cleanUsername(key.name.replace(/^profile:/, ""));
       if (!username || !username.includes(query)) continue;
       const profile = await readCachedProfile(env, username);
+      if (isBlockedUsername(username)) continue;
       seen.set(username, suggestionShape(profile || { username }, "cloudflare cache"));
       if (seen.size >= maxCandidates) return;
     }
@@ -4264,6 +4280,7 @@ async function addLeaderboardSuggestions(query, seen, maxCandidates) {
     for (const [key, source] of groups) {
       const rows = Array.isArray(data?.[key]) ? data[key] : [];
       for (const row of rows.slice(0, 25)) {
+        if (isBlockedUsername(row.username)) continue;
         const item = suggestionShape({
           username: row.username,
           name: row.name,
@@ -4273,7 +4290,7 @@ async function addLeaderboardSuggestions(query, seen, maxCandidates) {
           score: row.score,
           rank: row.rank,
         }, source);
-        if (!item || !matchesSuggestion(item, query)) continue;
+        if (!item || isBlockedUsername(item.username) || !matchesSuggestion(item, query)) continue;
         seen.set(item.username, item);
         if (seen.size >= maxCandidates) return;
       }
@@ -4289,7 +4306,7 @@ async function addTitledSuggestions(env, query, seen, maxCandidates) {
     const players = await readTitledPlayers(env, title);
     for (const username of players) {
       const key = cleanUsername(username);
-      if (!key || !key.includes(query) || seen.has(key)) continue;
+      if (!key || isBlockedUsername(key) || !key.includes(query) || seen.has(key)) continue;
       const item = suggestionShape({ username: key, title }, "");
       if (item) seen.set(item.username, item);
       if (seen.size >= maxCandidates) return;
@@ -4419,7 +4436,8 @@ function normalizeEntries(entries) {
       const length = connectionCount(path, parseInt(entry.length, 10));
       const submittedHops = cleanHopList(entry.hops);
       const hops = submittedHops.length === path.length - 1 ? submittedHops : [];
-      if (!start || !target || start === target || path.length < 2) return null;
+      if (!start || !target || start === target || path.length < 2 ||
+          isBlockedUsername(start) || isBlockedUsername(target) || pathHasBlockedUser(path)) return null;
       return {
         start,
         target,
@@ -4525,6 +4543,7 @@ function fastestLeaderboard(events) {
 function topTargetsLeaderboard(events) {
   const targets = new Map();
   for (const event of events.filter((item) => ["found", "saved"].includes(item.outcome))) {
+    if (isBlockedUsername(event.start) || isBlockedUsername(event.target) || pathHasBlockedUser(event.path)) continue;
     const current = targets.get(event.target) || {
       category: "top_targets",
       username: event.target,
@@ -4548,8 +4567,9 @@ function topTargetsLeaderboard(events) {
 function searchedLeaderboard(events) {
   const players = new Map();
   for (const event of events) {
+    if (isBlockedUsername(event.start) || isBlockedUsername(event.target) || pathHasBlockedUser(event.path)) continue;
     for (const username of [event.start, event.target]) {
-      if (!username) continue;
+      if (!username || isBlockedUsername(username)) continue;
       const current = players.get(username) || {
         category: "searched",
         username,
@@ -4591,7 +4611,8 @@ function eventLeaderboardRow(event, category) {
   const path = normalizePath(start, target, Array.isArray(event.path)
     ? event.path.slice(0, 12).map(cleanUsername).filter(Boolean)
     : []);
-  if (!start || !target || start === target || path.length < 2) return null;
+  if (!start || !target || start === target || path.length < 2 ||
+      isBlockedUsername(start) || isBlockedUsername(target) || pathHasBlockedUser(path)) return null;
   const steps = Math.max(0, path.length - 1);
   const length = connectionCount(path, parseInt(event.length, 10));
   return {

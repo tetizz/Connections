@@ -28,6 +28,12 @@
   const SUGGEST_MIN_CHARS = 2;
   const SUGGEST_LIMIT = 10;
   const OWNER_ANALYTICS_LIMIT = 30;
+  const TOP_TRACE_BATCH_LIMIT = 30;
+  const TOP_TRACE_CONCURRENCY = 6;
+  const TOP_TRACE_TIMEOUT_MS = 9000;
+  const TOP_TRACE_SUBMIT_LIMIT = 30;
+  const TOP_TRACE_SUBMIT_CONCURRENCY = 4;
+  const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
   let introCompletedThisSession = false;
   const QUICK_TARGET_GROUPS = [
     {
@@ -69,6 +75,10 @@
     ownerCode: "",
     queueTimer: null,
     searchJobs: new Map(),
+    quickTargetGroups: [],
+    topTraceRunId: 0,
+    topTraceResults: [],
+    topTraceSubmittedKeys: new Set(),
   };
 
   // ---------- small utils ----------
@@ -100,6 +110,8 @@
   const avatarOf = (u) => state.players?.[u.toLowerCase()]?.avatar || null;
   const cleanUsernameInput = (value) =>
     String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  const isBlockedUsername = (username) => BLOCKED_USERNAMES.has(cleanUsernameInput(username));
+  const pathHasBlockedUser = (path) => Array.isArray(path) && path.some(isBlockedUsername);
 
   // ---------- data load ----------
   async function loadShowcase() {
@@ -153,6 +165,7 @@
 
   function renderLeaderboardUnavailable(error) {
     const wrap = $("#quick-target-groups");
+    state.quickTargetGroups = [];
     if (!wrap) return;
     wrap.innerHTML = `
       <div class="quick-targets__empty" role="status">
@@ -164,6 +177,7 @@
 
   function renderQuickTargets(groups) {
     const wrap = $("#quick-target-groups");
+    state.quickTargetGroups = Array.isArray(groups) ? groups : [];
     if (!wrap) return;
     const playableGroups = groups.filter((group) => group.players?.length);
     if (!playableGroups.length) {
@@ -277,6 +291,235 @@
     return normalized;
   }
 
+  function topTraceCandidates() {
+    const seen = new Map();
+    const add = (player, source, priority) => {
+      const username = cleanUsernameInput(player?.username || player);
+      if (!username || isBlockedUsername(username)) return;
+      const current = seen.get(username);
+      const slot = {
+        source,
+        rank: Number(player?.rank || 99),
+        score: Number(player?.score || player?.rating || 0),
+      };
+      const next = {
+        ...(typeof player === "object" ? player : {}),
+        username,
+        display: player?.display || player?.name || username,
+        source,
+        priority,
+        slots: [slot],
+        slotCount: 1,
+      };
+      const slots = [...(current?.slots || []), slot];
+      const sourceLabel = [...new Set(slots.map((item) => item.source).filter(Boolean))].join(" + ") || source;
+      if (!current || priority < current.priority) {
+        seen.set(username, {
+          ...(current || {}),
+          ...next,
+          source: sourceLabel,
+          slots,
+          slotCount: slots.length,
+          priority,
+        });
+      } else {
+        seen.set(username, {
+          ...current,
+          avatar: current.avatar || next.avatar || "",
+          title: current.title || next.title || "",
+          score: Number.isFinite(current.score) ? current.score : next.score,
+          rank: Number.isFinite(current.rank) ? current.rank : next.rank,
+          display: current.display || next.display || username,
+          source: sourceLabel,
+          slots,
+          slotCount: slots.length,
+        });
+      }
+    };
+    (state.quickTargetGroups || []).forEach((group, groupIndex) => {
+      for (const player of (group.players || []).slice(0, 10)) {
+        const rank = Number(player.rank || 99);
+        add(player, group.label, rank * 10 + groupIndex);
+      }
+    });
+    return [...seen.values()]
+      .sort((a, b) => a.priority - b.priority || String(a.username).localeCompare(String(b.username)))
+      .slice(0, TOP_TRACE_BATCH_LIMIT);
+  }
+
+  function topTraceLeaderboardSlotCount() {
+    return (state.quickTargetGroups || []).reduce((total, group) =>
+      total + Math.min(10, Array.isArray(group.players) ? group.players.length : 0), 0);
+  }
+
+  function topTraceFoundSlotCount(items) {
+    return (items || []).reduce((total, item) => {
+      if (!(item.status === "found" && item.job?.chain?.found)) return total;
+      return total + Math.max(1, Number(item.player?.slotCount) || 1);
+    }, 0);
+  }
+
+  async function runTopPlayersTrace() {
+    const start = cleanUsernameInput($("#search-start")?.value || "");
+    const btn = $("#trace-top-players");
+    if (!btn) return;
+    if (!introComplete()) {
+      openIntroGate();
+      return;
+    }
+    if (!start) {
+      showStatus("error", "input your username first.");
+      $("#search-start")?.focus();
+      return;
+    }
+    localStorage.setItem(LS_KEY, start);
+    $("#setting-username").value = start;
+    const candidates = topTraceCandidates().filter((player) => player.username !== start);
+    if (!candidates.length) {
+      showStatus("error", "live leaderboard targets are still loading.");
+      return;
+    }
+
+    const runId = ++state.topTraceRunId;
+    const results = candidates.map((player) => ({
+      player,
+      status: "queued",
+      ms: null,
+      steps: null,
+      job: null,
+    }));
+    state.topTraceResults = results;
+    btn.disabled = true;
+    showStatus("working", `tracing ${start} to top leaderboard players...`);
+
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < results.length && runId === state.topTraceRunId) {
+        const index = cursor++;
+        results[index].status = "running";
+        results[index] = await traceTopCandidate(start, results[index].player, runId);
+        if (results[index].status === "found" && results[index].job?.chain?.found) {
+          renderTopTraceCurrentTree(start, results, { scroll: false, progressive: true });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, results.length) }, worker));
+    if (runId !== state.topTraceRunId) return;
+    const found = sortedTopTraceResults(results).find((item) => item.status === "found" && item.job?.chain?.found);
+    if (found) {
+      await renderTopTraceCurrentTree(start, results, { scroll: true });
+    } else {
+      showStatus("error", "no top-player chain finished in this quick batch.");
+    }
+    btn.disabled = false;
+  }
+
+  async function traceTopCandidate(start, player, runId) {
+    const target = cleanUsernameInput(player?.username);
+    const started = performance.now();
+    const id = newSearchEventId();
+    const result = { player, status: "error", ms: null, steps: null, job: null };
+    const remoteBase = workerBase();
+    if (!remoteBase || !target || start === target) return { ...result, status: "skipped", ms: 0 };
+    try {
+      const startRes = await fetch(`${remoteBase}/search/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({ start, target, range: $("#search-range")?.value || "auto", searchId: id }),
+      });
+      if (!startRes.ok) throw new Error(`HTTP ${startRes.status}`);
+      let job = (await startRes.json()).job;
+      if (!job?.id) throw new Error("missing job");
+      while (["queued", "running"].includes(job.status) && performance.now() - started < TOP_TRACE_TIMEOUT_MS && runId === state.topTraceRunId) {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        const pollRes = await fetch(`${remoteBase}/search/job?id=${encodeURIComponent(job.id)}`, {
+          headers: { "Accept": "application/json" },
+        });
+        if (!pollRes.ok) throw new Error(`poll ${pollRes.status}`);
+        job = (await pollRes.json()).job || job;
+      }
+      const ms = Math.round(performance.now() - started);
+      const steps = Array.isArray(job.chain?.path) ? Math.max(0, job.chain.path.length - 1) : null;
+      return {
+        player,
+        status: job.chain?.found ? "found" : job.status || "not_found",
+        ms,
+        steps,
+        job,
+      };
+    } catch (error) {
+      return {
+        ...result,
+        status: "error",
+        ms: Math.round(performance.now() - started),
+        error: error.message || "failed",
+      };
+    }
+  }
+
+  function sortedTopTraceResults(results) {
+    return [...(results || [])].sort((a, b) => {
+      const aFound = a.status === "found" && a.job?.chain?.found;
+      const bFound = b.status === "found" && b.job?.chain?.found;
+      if (aFound !== bFound) return aFound ? -1 : 1;
+      const aSteps = Number.isFinite(a.steps) ? a.steps : 999;
+      const bSteps = Number.isFinite(b.steps) ? b.steps : 999;
+      if (aSteps !== bSteps) return aSteps - bSteps;
+      const aMs = Number.isFinite(a.ms) ? a.ms : 999999;
+      const bMs = Number.isFinite(b.ms) ? b.ms : 999999;
+      return aMs - bMs;
+    });
+  }
+
+  function topTraceStepCount(chain) {
+    if (Array.isArray(chain?.path)) return Math.max(0, chain.path.length - 1);
+    if (Number.isFinite(chain?.length)) return chain.length;
+    return 999;
+  }
+
+  async function renderTopTraceCurrentTree(start, results, options = {}) {
+    const { scroll = false, progressive = false } = options;
+    const foundItems = sortedTopTraceResults(results)
+      .filter((item) => item.status === "found" && item.job?.chain?.found)
+      .filter((item) => !pathHasBlockedUser(item.job?.chain?.path))
+    const found = foundItems.map((item) => ({
+        ...item.job.chain,
+        target: item.job.target,
+        display: item.player?.display || item.job.target,
+        source: item.player?.source || "live",
+        slotCount: Math.max(1, Number(item.player?.slotCount) || 1),
+        slots: item.player?.slots || [],
+        ms: item.ms,
+      }));
+    if (!found.length) return;
+    const root = cleanUsernameInput(start || found[0].path?.[0]);
+    const targets = found.map((chain) => chain.target);
+    const shortest = found.reduce((best, chain) => !best || topTraceStepCount(chain) < topTraceStepCount(best) ? chain : best, null);
+    const targetCount = Math.max(results.length, topTraceLeaderboardSlotCount());
+    const foundSlotCount = topTraceFoundSlotCount(foundItems);
+    if (!progressive) await hydrateTopTracePlayers(foundItems).catch(() => {});
+    $("#search-target").value = shortest?.target || targets[0] || $("#search-target").value;
+    setActiveChip($("#search-target").value);
+    renderChain({
+      tree: true,
+      found: true,
+      root,
+      target: shortest?.target || targets[0],
+      display: `${foundSlotCount} of ${targetCount} top-player targets`,
+      branchCount: found.length,
+      targetCount,
+      foundSlotCount,
+      length: found.length,
+      path: shortest?.path || found[0].path,
+      hops: shortest?.hops || found[0].hops,
+      chains: found,
+    });
+    if (!progressive) submitTopTraceLeaderboardBranches(root, found);
+    showStatus(progressive ? "working" : "done",
+      `${progressive ? "building" : "✓ built"} a top-player tree — ${esc(root)} has ${plainNumber(foundSlotCount)} of ${plainNumber(targetCount)} leaderboard targets found across ${plainNumber(found.length)} merged branches.`);
+    if (scroll) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+  }
+
   // ---------- username autocomplete ----------
   function suggestConfig(field = state.suggest.field || "start") {
     return field === "target"
@@ -354,7 +597,7 @@
 
   function normalizeSuggestion(item) {
     const username = cleanUsernameInput(item?.username);
-    if (!username) return null;
+    if (!username || isBlockedUsername(username)) return null;
     return {
       username,
       name: String(item?.name || item?.display || ""),
@@ -452,6 +695,11 @@
   function selectUsernameSuggestion(username, field = state.suggest.field) {
     const value = cleanUsernameInput(username);
     if (!value) return;
+    if (isBlockedUsername(value)) {
+      hideUsernameSuggest();
+      showStatus("error", "that player is not available.");
+      return;
+    }
     if (field === "target") {
       $("#search-target").value = value;
       setActiveChip(value);
@@ -523,9 +771,16 @@
   }
 
   function renderChain(chain) {
+    if (!chain?.tree && pathHasBlockedUser(chain?.path)) {
+      showStatus("error", "that chain is not available.");
+      return;
+    }
     state.currentChain = chain;
     $("#target-name").textContent = chain.display || chain.target;
-    $("#chain-length").textContent = chain.found ? chain.length : "—";
+    $("#chain-length").textContent = chain.tree && chain.targetCount
+      ? `${chain.foundSlotCount || chain.branchCount}/${chain.targetCount}`
+      : chain.tree ? chain.branchCount : chain.found ? chain.length : "—";
+    $(".graph-length-label").textContent = chain.tree ? "found" : "recorded wins";
     renderGraph(chain);
     renderCards(chain);
     updateShareButton(chain);
@@ -554,7 +809,7 @@
     const btn = $("#copy-share");
     const imageBtn = $("#save-share-image");
     if (!btn) return;
-    if (!chain?.found || !Array.isArray(chain.path) || !chain.path.length) {
+    if (chain?.tree || !chain?.found || !Array.isArray(chain.path) || !chain.path.length) {
       btn.hidden = true;
       if (imageBtn) imageBtn.hidden = true;
       delete btn.dataset.shareUrl;
@@ -914,8 +1169,93 @@
 
   function submitLeaderboardChain(start, target, chain) {
     if (!window.Leaderboard || !chain?.found || !Array.isArray(chain.path)) return;
+    if (isBlockedUsername(start) || isBlockedUsername(target) || pathHasBlockedUser(chain.path)) return;
     window.Leaderboard.submit(start, target, connectionCount(chain.path), chain.path, chain.hops || [])
       .then(() => window.Leaderboard && window.Leaderboard.load());
+  }
+
+  async function hydrateTopTracePlayers(items) {
+    const usernames = new Set();
+    state.players = state.players || {};
+    for (const item of items || []) {
+      for (const [username, profile] of Object.entries(item.job?.players || {})) {
+        const key = cleanUsernameInput(username);
+        if (!key) continue;
+        state.players[key] = {
+          ...(state.players[key] || {}),
+          ...metaShape({ username: key, ...profile }),
+          profileComplete: Boolean(profile?.stats),
+        };
+      }
+      for (const username of item.job?.chain?.path || []) {
+        const key = cleanUsernameInput(username);
+        if (key) usernames.add(key);
+      }
+    }
+    const missing = [...usernames].filter((username) => {
+      const player = state.players?.[username];
+      return !player?.avatar || !player?.name || !player?.profileComplete;
+    });
+    await Promise.all(missing.map((username) => fetchProfile(username).catch(() => null)));
+  }
+
+  function preloadTreeProfiles(nodes) {
+    const usernames = [...new Set((nodes || [])
+      .map((node) => cleanUsernameInput(node?.username))
+      .filter(Boolean))]
+      .filter((username) => {
+        const player = state.players?.[username];
+        return !player?.profileComplete || !player?.avatar || !player?.name;
+      });
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < usernames.length) {
+        const username = usernames[cursor++];
+        await fetchProfile(username).then(() => refreshGraphProfileNodes(username)).catch(() => null);
+      }
+    };
+    const count = Math.min(6, usernames.length);
+    for (let i = 0; i < count; i++) worker();
+  }
+
+  async function submitTopTraceLeaderboardBranches(start, branches) {
+    if (!window.Leaderboard || !Array.isArray(branches) || !branches.length) return;
+    showStatus("working", "submitting top-player branches to Top connectors...");
+    const queue = [];
+    const seen = new Set();
+    for (const branch of branches) {
+      if (queue.length >= TOP_TRACE_SUBMIT_LIMIT) break;
+      const path = Array.isArray(branch.path) ? branch.path : [];
+      const key = chainKey(path);
+      const target = cleanUsernameInput(branch.target || path[path.length - 1]);
+      if (!key || !target || isBlockedUsername(target) || pathHasBlockedUser(path) ||
+          seen.has(key) || state.topTraceSubmittedKeys.has(key)) continue;
+      seen.add(key);
+      queue.push({ branch, path, key, target });
+    }
+    let submitted = 0;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < queue.length) {
+        const item = queue[cursor++];
+        state.topTraceSubmittedKeys.add(item.key);
+        try {
+          await window.Leaderboard.submit(start, item.target, connectionCount(item.path), item.path, item.branch.hops || []);
+          submitted++;
+        } catch {
+          state.topTraceSubmittedKeys.delete(item.key);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(TOP_TRACE_SUBMIT_CONCURRENCY, queue.length) }, worker));
+    if (submitted && window.Leaderboard) {
+      try {
+        await window.Leaderboard.load("connectors");
+      } catch {
+        // keep the graph usable even if the leaderboard reload fails
+      }
+      showStatus("done", `submitted ${plainNumber(submitted)} top-player branch${submitted === 1 ? "" : "es"} to Top connectors.`);
+    }
   }
 
   function workerBase() {
@@ -1422,8 +1762,14 @@
 
   // ---------- graph ----------
   function renderGraph(chain) {
+    hideGraphExplorer();
+    if (chain?.tree) {
+      renderTreeGraph(chain);
+      return;
+    }
     const svg = $("#graph");
     svg.innerHTML = "";
+    svg.classList.remove("is-tree-graph");
     svg.setAttribute("viewBox", "0 0 1040 420");
 
     const defs = el("defs");
@@ -1476,10 +1822,12 @@
         class: "node" + (isStart ? " is-start" : "") + (isTarget ? " is-target" : ""),
         transform: `translate(${pos.x}, ${pos.y})`,
         "data-profile-user": u,
+        "data-profile-trigger": "",
         tabindex: "0",
         role: "button",
         "aria-label": `${nameOf(u)} profile`,
       });
+      g.appendChild(el("circle", { class: "node__hit", r: 46 }));
       g.appendChild(el("ellipse", { class: "node__shadow", cx: 0, cy: 42, rx: 34, ry: 8 }));
       g.appendChild(el("circle", { class: "node__pulse", r: 34 }));
       g.appendChild(el("circle", { class: "node__ring", r: 32 }));
@@ -1536,6 +1884,170 @@
       `every arrow is a real win from a real game. ${n - 1} link${n - 1 === 1 ? "" : "s"} in total.`;
 
     animateGraph(svg, traveller, spark);
+  }
+
+  if (location.hostname === "127.0.0.1" || location.hostname === "localhost") {
+    window.__connectionsDebugRenderGraph = renderGraph;
+  }
+
+  function renderTreeGraph(treeChain) {
+    const svg = $("#graph");
+    svg.innerHTML = "";
+    svg.classList.add("is-tree-graph");
+
+    const defs = el("defs");
+    const grad = el("linearGradient", { id: "edge-grad", x1: "0", y1: "0", x2: "1", y2: "0" });
+    grad.appendChild(el("stop", { offset: "0%", "stop-color": "#496a46" }));
+    grad.appendChild(el("stop", { offset: "52%", "stop-color": "#c99b4b" }));
+    grad.appendChild(el("stop", { offset: "100%", "stop-color": "#7e8b83" }));
+    defs.appendChild(grad);
+    const clip = el("clipPath", { id: "clip" });
+    clip.appendChild(el("circle", { r: 28, cx: 0, cy: 0 }));
+    defs.appendChild(clip);
+    svg.appendChild(defs);
+
+    const graph = buildMergedChainTree(treeChain.chains || []);
+    if (!graph.nodes.length) {
+      $("#graph-hint").textContent = "no top-player tree available yet.";
+      return;
+    }
+    const viewWidth = graph.width || 1180;
+    const viewHeight = graph.height || 680;
+    svg.setAttribute("viewBox", `0 0 ${viewWidth} ${viewHeight}`);
+    svg.style.setProperty("--tree-graph-height", `${Math.min(2200, Math.max(620, viewHeight * 0.84))}px`);
+
+    const edgesGroup = el("g", { class: "tree-edges" });
+    for (const edge of graph.edges) {
+      const a = graph.positions.get(edge.from);
+      const b = graph.positions.get(edge.to);
+      if (!a || !b) continue;
+      const c1x = a.x + Math.max(42, (b.x - a.x) * .46);
+      const c2x = b.x - Math.max(42, (b.x - a.x) * .34);
+      const d = `M ${a.x} ${a.y} C ${c1x} ${a.y} ${c2x} ${b.y} ${b.x} ${b.y}`;
+      const edgeKey = `${edge.from}|${edge.to}`;
+      edgesGroup.appendChild(el("path", { class: "edge-glow tree-edge-glow", d, "data-tree-edge": edgeKey, "data-edge-depth": edge.depth || 1 }));
+      edgesGroup.appendChild(el("path", { class: "edge-line tree-edge-line", d, "data-tree-edge": edgeKey, "data-edge-depth": edge.depth || 1 }));
+    }
+    svg.appendChild(edgesGroup);
+
+    const nodesGroup = el("g", { class: "tree-nodes" });
+    for (const node of graph.nodes) {
+      const pos = graph.positions.get(node.id);
+      if (!pos) continue;
+      const g = el("g", {
+        class: "node tree-node" + (node.depth === 0 ? " is-start" : "") + (node.isTarget ? " is-target" : "") + (node.children.length > 1 ? " is-split" : ""),
+        transform: `translate(${pos.x}, ${pos.y})`,
+        "data-tree-node-id": node.id,
+        "data-profile-user": node.username,
+        "data-profile-trigger": "",
+        tabindex: "0",
+        role: "button",
+        "aria-label": `${nameOf(node.username)} profile`,
+      });
+      g.appendChild(el("circle", { class: "node__hit", r: 42 }));
+      g.appendChild(el("ellipse", { class: "node__shadow", cx: 0, cy: 36, rx: 28, ry: 7 }));
+      g.appendChild(el("circle", { class: "node__pulse", r: 28 }));
+      g.appendChild(el("circle", { class: "node__ring", r: 28 }));
+      const av = avatarOf(node.username);
+      if (av) {
+        g.appendChild(el("image", {
+          class: "node__img", href: av,
+          x: -28, y: -28, width: 56, height: 56,
+          "clip-path": "url(#clip)", preserveAspectRatio: "xMidYMid slice",
+        }));
+      } else {
+        const icon = el("text", { class: "node__icon", x: 0, y: 0 });
+        icon.textContent = pieceFor(node.depth === 0, node.isTarget);
+        g.appendChild(icon);
+      }
+      const label = el("text", { class: "node__label", x: 0, y: 52 });
+      label.textContent = compactGraphLabel(nameOf(node.username), node.depth === 0 ? 15 : 12);
+      g.appendChild(label);
+      const title = titleOf(node.username) || (node.depth === 0 ? "YOU" : node.isTarget ? "TARGET" : "");
+      if (title) {
+        const ttag = el("text", { class: "node__title", x: 0, y: 68 });
+        ttag.textContent = title;
+        g.appendChild(ttag);
+      }
+      nodesGroup.appendChild(g);
+    }
+    svg.appendChild(nodesGroup);
+
+    $("#graph-hint").textContent =
+      `${treeChain.foundSlotCount || treeChain.branchCount} of ${treeChain.targetCount || treeChain.branchCount} leaderboard targets found from ${treeChain.root}; duplicate players merge into ${treeChain.branchCount} unique branch${treeChain.branchCount === 1 ? "" : "es"}.`;
+
+    preloadTreeProfiles(graph.nodes);
+    animateTreeGraph(svg);
+  }
+
+  function buildMergedChainTree(chains) {
+    const rootPath = chains.find((chain) => Array.isArray(chain.path) && chain.path.length >= 2)?.path || [];
+    const root = cleanUsernameInput(rootPath[0]);
+    if (!root) return { nodes: [], edges: [], positions: new Map() };
+    const rootNode = { id: root, username: root, depth: 0, parent: null, children: [], targets: new Set(), leafOrder: null, isTarget: false };
+    const nodesByKey = new Map([[root, rootNode]]);
+    const edgesByKey = new Map();
+
+    for (const chain of chains) {
+      const path = Array.isArray(chain.path) ? chain.path.map(cleanUsernameInput).filter(Boolean) : [];
+      if (path.length < 2 || path[0] !== root) continue;
+      let parent = rootNode;
+      for (let i = 1; i < path.length; i++) {
+        const username = path[i];
+        const id = `${parent.id}>${username}`;
+        let node = nodesByKey.get(id);
+        if (!node) {
+          node = { id, username, depth: i, parent, children: [], targets: new Set(), leafOrder: null, isTarget: false };
+          nodesByKey.set(id, node);
+          parent.children.push(node);
+          edgesByKey.set(`${parent.id}|${id}`, { from: parent.id, to: id, depth: i });
+        }
+        if (i === path.length - 1) {
+          node.isTarget = true;
+          node.targets.add(chain.target || username);
+        }
+        parent = node;
+      }
+    }
+
+    const leaves = [];
+    const assignLeaves = (node) => {
+      if (!node.children.length) {
+        node.leafOrder = leaves.length;
+        leaves.push(node);
+        return node.leafOrder;
+      }
+      const childOrders = node.children.map(assignLeaves);
+      node.leafOrder = childOrders.reduce((sum, value) => sum + value, 0) / childOrders.length;
+      return node.leafOrder;
+    };
+    assignLeaves(rootNode);
+
+    const maxDepth = Math.max(1, ...[...nodesByKey.values()].map((node) => node.depth));
+    const leafCount = Math.max(1, leaves.length);
+    const positions = new Map();
+    const width = 1180;
+    const height = Math.max(680, leafCount * 86 + 150);
+    const leftPad = 112;
+    const rightPad = 116;
+    const topPad = 86;
+    const bottomPad = 92;
+    const xForDepth = (depth) => leftPad + (depth / maxDepth) * (width - leftPad - rightPad);
+    const yForLeaf = (leafOrder) => leafCount === 1 ? height / 2 : topPad + (leafOrder / (leafCount - 1)) * (height - topPad - bottomPad);
+    for (const node of nodesByKey.values()) {
+      positions.set(node.id, {
+        x: xForDepth(node.depth),
+        y: yForLeaf(node.leafOrder ?? 0),
+      });
+    }
+
+    return {
+      nodes: [...nodesByKey.values()],
+      edges: [...edgesByKey.values()],
+      positions,
+      width,
+      height,
+    };
   }
 
   const pieceFor = (isStart, isTarget) => (isTarget ? "♚" : "♟");
@@ -1604,6 +2116,179 @@
       marker.style.transition = "opacity .3s ease";
       marker.style.opacity = 0;
     });
+  }
+
+  function animateTreeGraph(svg) {
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const nodes = Array.from(svg.querySelectorAll(".node"));
+    const lines = Array.from(svg.querySelectorAll(".edge-line"));
+    const glows = Array.from(svg.querySelectorAll(".edge-glow"));
+    svg.querySelector(".tree-riders")?.remove();
+    nodes.forEach((node) => {
+      node.classList.remove("is-placed");
+    });
+
+    lines.forEach((path) => {
+      const len = path.getTotalLength();
+      path.style.strokeDasharray = len;
+      path.style.strokeDashoffset = reduced ? 0 : len;
+      path.style.transition = "none";
+    });
+    glows.forEach((path) => {
+      const len = path.getTotalLength();
+      path.style.strokeDasharray = len;
+      path.style.strokeDashoffset = reduced ? 0 : len;
+      path.style.opacity = reduced ? 0.04 : 0;
+      path.style.transition = "none";
+    });
+    nodes.forEach((node) => {
+      node.style.opacity = reduced ? 1 : 0;
+      node.style.transition = "none";
+      if (reduced) node.classList.add("is-placed");
+    });
+    if (reduced) return;
+
+    const riders = el("g", { class: "tree-riders", "aria-hidden": "true" });
+    svg.appendChild(riders);
+    const nodeById = new Map(nodes.map((node) => [node.dataset.treeNodeId || node.dataset.profileUser, node]));
+    const edgesByFrom = new Map();
+    const glowByEdge = new Map();
+    glows.forEach((path) => {
+      const key = path.dataset.treeEdge;
+      if (key) glowByEdge.set(key, path);
+    });
+    lines.forEach((path, index) => {
+      const [from, to] = String(path.dataset.treeEdge || "").split("|");
+      if (!from || !to) return;
+      const edge = {
+        from,
+        to,
+        path,
+        glow: glowByEdge.get(path.dataset.treeEdge),
+        index,
+      };
+      if (!edgesByFrom.has(from)) edgesByFrom.set(from, []);
+      edgesByFrom.get(from).push(edge);
+    });
+
+    requestAnimationFrame(() => {
+      const root = nodes.find((node) => node.classList.contains("is-start"))?.dataset.profileUser;
+      const rootEdge = lines.find((path) => String(path.dataset.treeEdge || "").startsWith(`${root}|`));
+      const rootId = rootEdge ? String(rootEdge.dataset.treeEdge).split("|")[0] : null;
+      const rootNode = rootId ? nodeById.get(rootId) : nodes.find((node) => node.classList.contains("is-start"));
+      revealTreeNode(rootNode, 0);
+      if (rootId) {
+        setTimeout(() => cascadeTreeRiders(rootId, edgesByFrom, riders, nodeById), 360);
+      } else {
+        lines.forEach((path, index) => {
+          drawTreePath(path, glows[index], index * 110);
+        });
+      }
+    });
+  }
+
+  function cascadeTreeRiders(fromId, edgesByFrom, riders, nodeById) {
+    const edges = edgesByFrom.get(fromId) || [];
+    if (!edges.length) return Promise.resolve();
+    return Promise.all(edges.map((edge, branchIndex) => {
+      const branchDelay = branchIndex * 140;
+      const duration = 980 + Math.min(320, Number(edge.path.dataset.edgeDepth || 1) * 55);
+      drawTreePath(edge.path, edge.glow, branchDelay, duration);
+      return rideTreePath(edge.path, riders, branchDelay, duration)
+        .then(async () => {
+          const reachedNode = nodeById?.get(edge.to);
+          await warmNodeProfileForReveal(reachedNode);
+          revealTreeNode(reachedNode, 0);
+          const nextEdges = edgesByFrom.get(edge.to) || [];
+          if (!nextEdges.length) return Promise.resolve();
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              cascadeTreeRiders(edge.to, edgesByFrom, riders, nodeById).then(resolve);
+            }, 260);
+          });
+        });
+    }));
+  }
+
+  function warmNodeProfileForReveal(node) {
+    const username = cleanUsernameInput(node?.dataset?.profileUser);
+    if (!username) return Promise.resolve();
+    const current = state.players?.[username];
+    if (current?.profileComplete && (current.avatar || current.name)) {
+      refreshGraphProfileNodes(username);
+      return Promise.resolve();
+    }
+    return Promise.race([
+      fetchProfile(username).catch(() => null),
+      new Promise((resolve) => setTimeout(resolve, 240)),
+    ]).then(() => refreshGraphProfileNodes(username));
+  }
+
+  function revealTreeNode(node, delay = 0) {
+    if (!node || node.classList.contains("is-placed")) return;
+    setTimeout(() => {
+      node.style.transition = "opacity .28s ease";
+      node.style.opacity = 1;
+      node.classList.add("is-placed");
+      pulse(node);
+    }, delay);
+  }
+
+  function drawTreePath(path, glow, delay = 0, duration = 820) {
+    if (!path) return;
+    path.style.transition = `stroke-dashoffset ${duration}ms cubic-bezier(.2,.8,.2,1) ${delay}ms`;
+    path.style.strokeDashoffset = 0;
+    if (glow) {
+      glow.style.transition = `stroke-dashoffset ${duration}ms cubic-bezier(.2,.8,.2,1) ${delay}ms, opacity .28s ease ${delay}ms`;
+      glow.style.strokeDashoffset = 0;
+      glow.style.opacity = 0.04;
+    }
+  }
+
+  function rideTreePath(path, riders, delay = 0, duration = 820) {
+    if (!path || !riders) return Promise.resolve();
+    const len = path.getTotalLength();
+    const rider = el("text", {
+      class: "tree-rider",
+      x: 0,
+      y: 0,
+    });
+    rider.textContent = "♞";
+    rider.style.opacity = 0;
+    riders.appendChild(rider);
+    return new Promise((resolve) => window.setTimeout(() => {
+      const start = performance.now();
+      let resolved = false;
+      rider.style.opacity = 1;
+      const step = (now) => {
+        const t = Math.min(1, (now - start) / duration);
+        const eased = 1 - Math.pow(1 - t, 3);
+        const point = path.getPointAtLength(len * eased);
+        const next = path.getPointAtLength(Math.min(len, len * eased + 2));
+        const angle = Math.atan2(next.y - point.y, next.x - point.x) * 180 / Math.PI;
+        rider.setAttribute("x", point.x);
+        rider.setAttribute("y", point.y);
+        rider.setAttribute("transform", `rotate(${angle} ${point.x} ${point.y})`);
+        if (t < 1) {
+          requestAnimationFrame(step);
+        } else {
+          rider.classList.add("is-arrived");
+          if (!resolved) {
+            resolved = true;
+            resolve();
+          }
+          setTimeout(() => {
+            rider.style.transition = "opacity .45s ease, filter .45s ease, transform .45s ease";
+            rider.style.opacity = 0;
+            rider.style.filter = "drop-shadow(0 0 2px rgba(240, 201, 119, .12))";
+          }, 760);
+          setTimeout(() => {
+            rider.remove();
+          }, 1260);
+        }
+      };
+      requestAnimationFrame(step);
+    }, delay));
   }
 
   function revealNode(node, delay = 0) {
@@ -1679,6 +2364,10 @@
   function renderCards(chain) {
     const wrap = $("#cards");
     wrap.innerHTML = "";
+    if (chain.tree) {
+      renderTreeCards(chain, wrap);
+      return;
+    }
     if (!chain.found) {
       wrap.innerHTML = `<p style="color:var(--text-faint)">no connection found for ${esc(chain.display || chain.target)}.</p>`;
       return;
@@ -1739,6 +2428,83 @@
         setTimeout(() => card.classList.add("in"), index * 80);
       });
     });
+  }
+
+  function renderTreeCards(chain, wrap) {
+    const branches = [...(Array.isArray(chain.chains) ? chain.chains : [])]
+      .sort((a, b) =>
+        topTraceStepCount(a) - topTraceStepCount(b) ||
+        String(a.display || a.target || "").localeCompare(String(b.display || b.target || "")));
+    if (!branches.length) {
+      wrap.innerHTML = `<p style="color:var(--text-faint)">no top-player branches found yet.</p>`;
+      return;
+    }
+    branches.forEach((branch, index) => {
+      const target = branch.target || branch.path?.[branch.path.length - 1] || "";
+      const card = document.createElement("div");
+      card.className = "card tree-proof";
+      card.style.setProperty("--branch-index", index);
+
+      const avatars = document.createElement("div");
+      avatars.className = "card__avatars";
+      const rank = document.createElement("span");
+      rank.className = "tree-proof__rank";
+      rank.textContent = String(index + 1);
+      avatars.appendChild(rank);
+      avatars.appendChild(avatarEl(chain.root));
+      const arrow = document.createElement("span");
+      arrow.className = "card__arrow";
+      arrow.textContent = "↳";
+      avatars.appendChild(arrow);
+      avatars.appendChild(avatarEl(target));
+
+      const body = document.createElement("div");
+      body.className = "card__body";
+      const line = document.createElement("div");
+      line.className = "card__line";
+      line.innerHTML =
+        `<button class="player-text winner" type="button" data-profile-trigger data-profile-user="${esc(chain.root)}">${esc(nameOf(chain.root))}</button> branches to ` +
+        `<button class="player-text loser" type="button" data-profile-trigger data-profile-user="${esc(target)}">${esc(branch.display || nameOf(target))}</button>`;
+      body.appendChild(line);
+      const slotLabel = branch.slotCount > 1
+        ? `${branch.slotCount} leaderboard slots`
+        : branch.source || "leaderboard";
+      const meta = document.createElement("div");
+      meta.className = "tree-proof__meta";
+      meta.innerHTML = `
+        <span>${esc(slotLabel)}</span>
+        <span>${plainNumber(Math.max(0, (branch.path || []).length - 1))} links</span>
+        ${Number.isFinite(branch.ms) ? `<span>${plainNumber(branch.ms)}ms</span>` : ""}
+      `;
+      body.appendChild(meta);
+      const path = document.createElement("div");
+      path.className = "tree-proof__path";
+      path.innerHTML = treeBranchPath(branch.path || []);
+      body.appendChild(path);
+
+      const open = document.createElement("button");
+      open.className = "card__proof";
+      open.type = "button";
+      open.dataset.treeOpen = target;
+      open.textContent = "Open branch";
+
+      card.appendChild(avatars);
+      card.appendChild(body);
+      card.appendChild(open);
+      wrap.appendChild(card);
+      setTimeout(() => card.classList.add("in"), index * 70);
+    });
+  }
+
+  function treeBranchPath(path) {
+    const clean = Array.isArray(path) ? path.map(cleanUsernameInput).filter(Boolean) : [];
+    if (!clean.length) return "";
+    return clean.map((username, index) => `
+      <button class="tree-proof__path-node${index === 0 ? " is-root" : index === clean.length - 1 ? " is-target" : ""}" type="button" data-profile-trigger data-profile-user="${esc(username)}">
+        @${esc(username)}
+      </button>
+      ${index < clean.length - 1 ? `<span class="tree-proof__path-arrow">→</span>` : ""}
+    `).join("");
   }
 
   function proofDetails(hop, index, total) {
@@ -1814,6 +2580,47 @@
         ${neighbors.length ? neighbors.map(explorerNeighborRow).join("") : `<div class="graph-explorer__row"><strong>No proof neighbors in this chain.</strong><small>Try a longer route.</small></div>`}
       </div>
     `;
+  }
+
+  function hideGraphExplorer() {
+    const panel = $("#graph-explorer");
+    if (panel) {
+      panel.hidden = true;
+      panel.innerHTML = "";
+    }
+  }
+
+  function graphNodeFromEvent(event) {
+    const direct = event.target?.closest?.(".node[data-profile-user]");
+    if (direct) return direct;
+    if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return null;
+    let best = null;
+    let bestDistance = Infinity;
+    document.querySelectorAll("#graph .node[data-profile-user]").forEach((node) => {
+      const hit = node.querySelector(".node__hit") || node;
+      const rect = hit.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dx = event.clientX - cx;
+      const dy = event.clientY - cy;
+      const distance = Math.hypot(dx, dy);
+      const radius = Math.max(32, Math.max(rect.width, rect.height) * .72);
+      if (distance <= radius && distance < bestDistance) {
+        best = node;
+        bestDistance = distance;
+      }
+    });
+    return best;
+  }
+
+  function activateGraphProfile(event) {
+    const node = graphNodeFromEvent(event);
+    if (!node) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    showProfilePopover(node.dataset.profileUser, node);
+    return true;
   }
 
   function chainNeighbors(username) {
@@ -1893,11 +2700,54 @@
         ...shaped,
         profileComplete: true,
       };
+      refreshGraphProfileNodes(key);
       return state.players[key];
     })();
 
     state.profilePromises.set(key, promise);
     return promise;
+  }
+
+  function refreshGraphProfileNodes(username) {
+    const key = cleanUsernameInput(username);
+    const profile = state.players?.[key];
+    const svg = $("#graph");
+    if (!key || !profile || !svg) return;
+    svg.querySelectorAll(`.node[data-profile-user="${CSS.escape(key)}"]`).forEach((node) => {
+      const placed = node.classList.contains("is-placed") && Number(getComputedStyle(node).opacity) > 0.2;
+      if (!placed) {
+        const display = nameOf(key);
+        const label = node.querySelector(".node__label");
+        if (label) label.textContent = compactGraphLabel(display, node.classList.contains("is-start") ? 15 : 12);
+        let title = node.querySelector(".node__title");
+        const titleText = titleOf(key) || (node.classList.contains("is-start") ? "YOU" : node.classList.contains("is-target") ? "TARGET" : "");
+        if (titleText) {
+          if (!title) {
+            title = el("text", { class: "node__title", x: 0, y: node.classList.contains("tree-node") ? 68 : 76 });
+            node.appendChild(title);
+          }
+          title.textContent = titleText;
+        }
+      }
+      if (profile.avatar && !node.querySelector(".node__img")) {
+        const size = node.classList.contains("tree-node") ? 56 : 64;
+        const img = el("image", {
+          class: "node__img",
+          href: profile.avatar,
+          x: -size / 2,
+          y: -size / 2,
+          width: size,
+          height: size,
+          "clip-path": "url(#clip)",
+          preserveAspectRatio: "xMidYMid slice",
+        });
+        img.addEventListener("error", () => img.remove());
+        const icon = node.querySelector(".node__icon");
+        if (icon) icon.replaceWith(img);
+        else node.appendChild(img);
+      }
+      node.classList.add("is-profile-loaded");
+    });
   }
 
   function renderProfilePopover(profile, username, anchor) {
@@ -2420,8 +3270,8 @@
 
   // ---------- live search ----------
   async function runSearch(startRaw, targetRaw, range) {
-    const start = startRaw.trim().toLowerCase();
-    const target = targetRaw.trim().toLowerCase();
+    const start = cleanUsernameInput(startRaw);
+    const target = cleanUsernameInput(targetRaw);
     const status = $("#search-status");
     const logEl = $("#search-log");
     const btn = $(".search__btn");
@@ -2434,6 +3284,10 @@
     }
     if (start === target) {
       showStatus("error", "those are the same player — pick two different ones.");
+      return;
+    }
+    if (isBlockedUsername(start) || isBlockedUsername(target)) {
+      showStatus("error", "that player is not available.");
       return;
     }
     const searchStartedAt = performance.now();
@@ -2696,7 +3550,7 @@
         });
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
     } catch (e) {
-      console.error(e);
+      console.debug("showcase data unavailable:", e.message || e);
       showStatus("error", `something went wrong: ${esc(e.message)}`);
       recordSearchEvent("error", {
         ...analyticsBase,
@@ -2923,6 +3777,10 @@
 
   // ---------- wire up ----------
   $("#replay").addEventListener("click", () => {
+    if (state.currentChain?.tree) {
+      renderGraph(state.currentChain);
+      return;
+    }
     const svg = $("#graph");
     const traveller = svg.querySelector(".traveller");
     const spark = svg.querySelector(".edge-spark");
@@ -2931,15 +3789,48 @@
   $("#copy-share")?.addEventListener("click", copyShareLink);
   $("#save-share-image")?.addEventListener("click", saveShareImage);
   $("#graph")?.addEventListener("click", (event) => {
+    activateGraphProfile(event);
+  });
+
+  $("#graph")?.addEventListener("pointerup", (event) => {
+    if (event.pointerType === "mouse") return;
+    activateGraphProfile(event);
+  });
+
+  $("#graph")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
     const node = event.target.closest(".node[data-profile-user]");
     if (!node) return;
-    openGraphExplorer(node.dataset.profileUser);
+    event.preventDefault();
+    showProfilePopover(node.dataset.profileUser, node);
+  });
+  $("#cards")?.addEventListener("click", (event) => {
+    const open = event.target.closest("[data-tree-open]");
+    if (!open || !state.currentChain?.tree) return;
+    const target = cleanUsernameInput(open.dataset.treeOpen);
+    const branch = (state.currentChain.chains || []).find((item) => cleanUsernameInput(item.target) === target);
+    if (!branch) return;
+    renderChain({
+      target: branch.target,
+      display: branch.display || nameOf(branch.target),
+      found: true,
+      length: Math.max(0, (branch.path || []).length - 1),
+      path: branch.path || [],
+      hops: branch.hops || [],
+      quality: branch.quality || null,
+    });
+    setActiveChip(branch.target);
+    document.querySelector(".graph-section")?.scrollIntoView({ behavior: "smooth" });
   });
 
   $("#search-form").addEventListener("submit", (e) => {
     e.preventDefault();
     hideUsernameSuggest();
     runSearch($("#search-start").value, $("#search-target").value, $("#search-range").value);
+  });
+  $("#trace-top-players")?.addEventListener("click", () => {
+    hideUsernameSuggest();
+    runTopPlayersTrace();
   });
 
   function wireSuggestInput(selector, field) {
@@ -3033,8 +3924,7 @@
       hideUsernameSuggest();
     }
     if (event.target.closest("[data-explorer-close]")) {
-      const panel = $("#graph-explorer");
-      if (panel) panel.hidden = true;
+      hideGraphExplorer();
       return;
     }
     const target = event.target.closest("[data-profile-trigger][data-profile-user]");

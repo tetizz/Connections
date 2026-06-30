@@ -1885,14 +1885,12 @@ html[data-theme="dark"] .node__ring {
 .tree-edge-line {
   stroke-width: 5;
   stroke-opacity: 1;
-  filter:
-    drop-shadow(0 2px 3px rgba(0, 0, 0, .18))
-    drop-shadow(0 0 2px rgba(240, 201, 119, .26));
+  filter: none;
 }
 
 .tree-edge-glow {
-  stroke-width: 11;
-  opacity: .06;
+  display: none;
+  opacity: 0;
 }
 
 .traveller {

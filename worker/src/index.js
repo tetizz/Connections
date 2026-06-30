@@ -56,7 +56,7 @@ const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const SHARE_ID_LENGTH = 8;
 const SEARCH_JOB_TTL_SECONDS = 2 * 60 * 60;
 const SEARCH_WINDOW_SECONDS = 60;
-const MAX_SEARCH_JOBS_PER_WINDOW = 16;
+const MAX_SEARCH_JOBS_PER_WINDOW = 48;
 const WARM_STATUS_KEY = "warm:leaderboard-targets";
 const WARM_INTERVAL_SECONDS = 6 * 60 * 60;
 const WARM_PLAYER_LIMIT = 36;
@@ -572,47 +572,6 @@ async function tryStartupFastLane(env, { id, start, target, range }) {
     updatedAt: startedAt,
   });
   if (!job) return null;
-
-  const cachedNoWins = await readStartNoWins(env, start, range).catch(() => null);
-  if (cachedNoWins) {
-    stats.cached = Number(stats.cached || 0) + 1;
-    return {
-      job: searchJobShape({
-        ...job,
-        status: "not_found",
-        outcome: "not_found",
-        progress: `${start} has no recent wins to trace from.`,
-        stats,
-        processingUntil: 0,
-        processingToken: "",
-        startedAt,
-        durationMs: Date.now() - startedAt,
-        updatedAt: Date.now(),
-      }),
-    };
-  }
-
-  const cachedStartGames = await readCachedGames(env, {
-    username: start,
-    archiveLimit: Math.min(6, archiveLimitForRange(range) || 6),
-  }, stats).catch(() => null);
-  if (cachedStartGames && edgeMapSize(edgesFromGames(start, cachedStartGames).beatenByMe) === 0) {
-    await writeStartNoWins(env, start, range).catch(() => {});
-    return {
-      job: searchJobShape({
-        ...job,
-        status: "not_found",
-        outcome: "not_found",
-        progress: `${start} has no recent wins to trace from.`,
-        stats,
-        processingUntil: 0,
-        processingToken: "",
-        startedAt,
-        durationMs: Date.now() - startedAt,
-        updatedAt: Date.now(),
-      }),
-    };
-  }
 
   const fastLane = await tryCachedRouteLanes(env, job, stats, Number.POSITIVE_INFINITY);
   const base = {

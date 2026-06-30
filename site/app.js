@@ -30,7 +30,8 @@
   const OWNER_ANALYTICS_LIMIT = 30;
   const TOP_TRACE_BATCH_LIMIT = 30;
   const TOP_TRACE_CONCURRENCY = 6;
-  const TOP_TRACE_TIMEOUT_MS = 9000;
+  const TOP_TRACE_POLL_INTERVAL_MS = 900;
+  const TOP_TRACE_HARD_LIMIT_MS = 120000;
   const TOP_TRACE_SUBMIT_LIMIT = 30;
   const TOP_TRACE_SUBMIT_CONCURRENCY = 4;
   const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
@@ -359,6 +360,14 @@
     }, 0);
   }
 
+  function topTraceProgress(results) {
+    const list = results || [];
+    const checked = list.filter((item) => !["queued", "running"].includes(item.status)).length;
+    const found = list.filter((item) => item.status === "found" && item.job?.chain?.found).length;
+    const unfinished = list.filter((item) => ["error", "failed", "timeout"].includes(item.status)).length;
+    return { checked, found, unfinished, total: list.length };
+  }
+
   async function runTopPlayersTrace() {
     const start = cleanUsernameInput($("#search-start")?.value || "");
     const btn = $("#trace-top-players");
@@ -398,20 +407,29 @@
         const index = cursor++;
         results[index].status = "running";
         results[index] = await traceTopCandidate(start, results[index].player, runId);
+        const progress = topTraceProgress(results);
+        showStatus("working", `tracing top players... ${plainNumber(progress.checked)} of ${plainNumber(progress.total)} checked, ${plainNumber(progress.found)} branches found.`);
         if (results[index].status === "found" && results[index].job?.chain?.found) {
           renderTopTraceCurrentTree(start, results, { scroll: false, progressive: true });
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, results.length) }, worker));
-    if (runId !== state.topTraceRunId) return;
-    const found = sortedTopTraceResults(results).find((item) => item.status === "found" && item.job?.chain?.found);
-    if (found) {
-      await renderTopTraceCurrentTree(start, results, { scroll: true });
-    } else {
-      showStatus("error", "no top-player chain finished in this quick batch.");
+    try {
+      await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, results.length) }, worker));
+      if (runId !== state.topTraceRunId) return;
+      const found = sortedTopTraceResults(results).find((item) => item.status === "found" && item.job?.chain?.found);
+      const progress = topTraceProgress(results);
+      if (found) {
+        await renderTopTraceCurrentTree(start, results, { scroll: true });
+        if (progress.unfinished) {
+          showStatus("working", `top-player trace finished with ${plainNumber(progress.found)} branches found and ${plainNumber(progress.unfinished)} unfinished searches.`);
+        }
+      } else {
+        showStatus("error", "no top-player chain finished in this batch.");
+      }
+    } finally {
+      btn.disabled = false;
     }
-    btn.disabled = false;
   }
 
   async function traceTopCandidate(start, player, runId) {
@@ -430,8 +448,8 @@
       if (!startRes.ok) throw new Error(`HTTP ${startRes.status}`);
       let job = (await startRes.json()).job;
       if (!job?.id) throw new Error("missing job");
-      while (["queued", "running"].includes(job.status) && performance.now() - started < TOP_TRACE_TIMEOUT_MS && runId === state.topTraceRunId) {
-        await new Promise((resolve) => setTimeout(resolve, 600));
+      while (["queued", "running"].includes(job.status) && performance.now() - started < TOP_TRACE_HARD_LIMIT_MS && runId === state.topTraceRunId) {
+        await new Promise((resolve) => setTimeout(resolve, TOP_TRACE_POLL_INTERVAL_MS));
         const pollRes = await fetch(`${remoteBase}/search/job?id=${encodeURIComponent(job.id)}`, {
           headers: { "Accept": "application/json" },
         });
@@ -440,6 +458,15 @@
       }
       const ms = Math.round(performance.now() - started);
       const steps = Array.isArray(job.chain?.path) ? Math.max(0, job.chain.path.length - 1) : null;
+      if (["queued", "running"].includes(job.status)) {
+        return {
+          player,
+          status: runId === state.topTraceRunId ? "timeout" : "cancelled",
+          ms,
+          steps,
+          job,
+        };
+      }
       return {
         player,
         status: job.chain?.found ? "found" : job.status || "not_found",
@@ -1925,7 +1952,6 @@
       const c2x = b.x - Math.max(42, (b.x - a.x) * .34);
       const d = `M ${a.x} ${a.y} C ${c1x} ${a.y} ${c2x} ${b.y} ${b.x} ${b.y}`;
       const edgeKey = `${edge.from}|${edge.to}`;
-      edgesGroup.appendChild(el("path", { class: "edge-glow tree-edge-glow", d, "data-tree-edge": edgeKey, "data-edge-depth": edge.depth || 1 }));
       edgesGroup.appendChild(el("path", { class: "edge-line tree-edge-line", d, "data-tree-edge": edgeKey, "data-edge-depth": edge.depth || 1 }));
     }
     svg.appendChild(edgesGroup);
@@ -2241,7 +2267,7 @@
     if (glow) {
       glow.style.transition = `stroke-dashoffset ${duration}ms cubic-bezier(.2,.8,.2,1) ${delay}ms, opacity .28s ease ${delay}ms`;
       glow.style.strokeDashoffset = 0;
-      glow.style.opacity = 0.04;
+      glow.style.opacity = 0;
     }
   }
 

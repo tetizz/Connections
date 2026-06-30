@@ -82,6 +82,7 @@ const FETCH_RETRIES = 2;
 const FETCH_BACKOFF_MS = 450;
 const FETCH_TIMEOUT_MS = 7000;
 const SEARCH_STALE_LEASE_MS = 6000;
+const SEARCH_POLL_FORCE_AFTER_MS = 18000;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -683,9 +684,32 @@ async function handleSearchJob(url, env, ctx) {
     if (isStaleForClient(job, minExpanded, minCached)) {
       job = await readSearchJobAtLeast(env, id, minExpanded, minCached) || job;
     }
+    const activeIdleMs = isActiveSearchStatus(job.status)
+      ? Date.now() - Number(job.updatedAt || job.createdAt || 0)
+      : 0;
     job = await recoverStaleSearchLease(env, id, job) || job;
     if (isActiveSearchStatus(job.status) &&
         Date.now() >= Number(job.processingUntil || 0)) {
+      if (activeIdleMs >= SEARCH_POLL_FORCE_AFTER_MS) {
+        const beforeKick = job;
+        job = await kickSearchJobChunk(env, id, { force: true, timeBudgetMs: 3500 }) ||
+          await readSearchJob(env, id) ||
+          job;
+        if (isActiveSearchStatus(job.status) && !searchJobMadeProgress(beforeKick, job)) {
+          await completeSearchJob(env, job, {
+            status: "not_found",
+            outcome: "not_found",
+            progress: "No connection found in this search.",
+            stats: job.stats || beforeKick.stats,
+            search: job.search || beforeKick.search,
+            processingUntil: 0,
+            processingToken: "",
+            durationMs: Date.now() - Number(job.startedAt || job.createdAt || Date.now()),
+          });
+          job = await readSearchJob(env, id) || job;
+        }
+        return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
+      }
       if (ctx?.waitUntil) {
         ctx.waitUntil(kickSearchJobChunk(env, id).catch((error) => {
           console.warn(JSON.stringify({
@@ -775,14 +799,15 @@ async function recoverStaleSearchLease(env, id, job) {
   });
 }
 
-async function kickSearchJobChunk(env, id) {
+async function kickSearchJobChunk(env, id, options = {}) {
   const job = await readSearchJob(env, id);
   if (!job || !isActiveSearchStatus(job.status)) return job;
   const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
   return runSearchJobChunk(env, id, {
     expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
-    timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
+    timeBudgetMs: Number(options.timeBudgetMs) || (cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS),
     concurrency: cachedShorterCheck ? CACHED_SHORTER_CHECK_CONCURRENCY : SEARCH_EXPANSION_CONCURRENCY,
+    force: Boolean(options.force),
   });
 }
 
@@ -801,6 +826,18 @@ function isStaleForClient(job, minExpanded, minCached) {
   if (!job || !isActiveSearchStatus(job.status)) return false;
   const stats = job.stats || {};
   return Number(stats.expanded || 0) < minExpanded || Number(stats.cached || 0) < minCached;
+}
+
+function searchJobMadeProgress(before, after) {
+  if (!before || !after) return false;
+  const beforeStats = before.stats || {};
+  const afterStats = after.stats || {};
+  if (Number(afterStats.expanded || 0) > Number(beforeStats.expanded || 0)) return true;
+  if (Number(afterStats.cached || 0) > Number(beforeStats.cached || 0)) return true;
+  if (Number(afterStats.requests || 0) > Number(beforeStats.requests || 0)) return true;
+  if (String(after.progress || "") !== String(before.progress || "")) return true;
+  if (String(after.status || "") !== String(before.status || "")) return true;
+  return false;
 }
 
 async function runSearchJob(env, queuedJob) {
@@ -854,7 +891,13 @@ async function runSearchJobChunk(env, id, options = {}) {
   const ownerToken = cleanAnalyticsId(options.ownerToken) || crypto.randomUUID();
   let job = await readSearchJob(env, id);
   if (!job || !isActiveSearchStatus(job.status)) return job;
-  if (Number(job.processingUntil || 0) > Date.now()) return job;
+  if (Number(job.processingUntil || 0) > Date.now()) {
+    if (!options.force) return job;
+    await updateSearchJob(env, id, {
+      processingUntil: 0,
+      processingToken: "",
+    });
+  }
   job = await claimSearchJob(env, id, ownerToken, SEARCH_LEASE_MS);
   if (!job || job.processingToken !== ownerToken) return job;
 
@@ -991,6 +1034,7 @@ async function runSearchJobChunk(env, id, options = {}) {
       }
     }
 
+    const beforeAdvanceMarker = searchProgressMarker(search, stats);
     const result = await advanceServerSearch(env, job, search, stats, progress, {
       expansionBudget,
       timeBudgetMs,
@@ -999,6 +1043,19 @@ async function runSearchJobChunk(env, id, options = {}) {
     });
 
     if (result?.status === "running") {
+      if (searchProgressMarker(search, stats) === beforeAdvanceMarker) {
+        await completeSearchJob(env, job, {
+          status: "not_found",
+          outcome: "not_found",
+          progress: "No connection found in this search.",
+          stats,
+          search,
+          processingUntil: 0,
+          processingToken: "",
+          durationMs: Date.now() - startedAt,
+        }, ownerToken);
+        return readSearchJob(env, id);
+      }
       if (job.chain?.found && job.refreshCached && Number(stats.expanded || 0) >= CACHED_SHORTER_CHECK_EXPANSIONS) {
         await completeSearchJob(env, job, {
           status: "found",
@@ -3912,6 +3969,21 @@ function searchStateShape(state, start, target) {
     bestMeeting: activeSide ? cleanUsername(state.bestMeeting) : "",
     bestMeetingLength: activeSide ? cleanNonNegativeNumber(state.bestMeetingLength, SEARCH_MAX_DEPTH * 2 + 2) || 0 : 0,
   };
+}
+
+function searchProgressMarker(search, stats) {
+  return [
+    Number(stats?.expanded || 0),
+    Number(stats?.cached || 0),
+    Number(stats?.requests || 0),
+    Number(search?.depth || 0),
+    String(search?.activeSide || ""),
+    Number(search?.activeCursor || 0),
+    Array.isArray(search?.forwardFrontier) ? search.forwardFrontier.length : 0,
+    Array.isArray(search?.backwardFrontier) ? search.backwardFrontier.length : 0,
+    Array.isArray(search?.activeFrontier) ? search.activeFrontier.length : 0,
+    Array.isArray(search?.activeNextFrontier) ? search.activeNextFrontier.length : 0,
+  ].join("|");
 }
 
 function cleanUsernameList(value, max) {

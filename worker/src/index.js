@@ -33,32 +33,35 @@ const GRAPH_INDEX_WARM_KEY_LIMIT = 900;
 const GRAPH_BRIDGE_CONNECTOR_LIMIT = 120;
 const SEARCH_MAX_DEPTH = 1000000;
 const SEARCH_MAX_EXPANSIONS = Number.MAX_SAFE_INTEGER;
-const SEARCH_FRONTIER_LIMIT = 1500;
-const SEARCH_CHUNK_EXPANSIONS = 900;
-const SEARCH_CHUNK_TIME_MS = 6500;
-const SEARCH_EXPANSION_CONCURRENCY = 80;
+const SEARCH_FRONTIER_LIMIT = 1000;
+const SEARCH_CHUNK_EXPANSIONS = 260;
+const SEARCH_CHUNK_TIME_MS = 2800;
+const SEARCH_EXPANSION_CONCURRENCY = 32;
 const SEARCH_BACKGROUND_TIME_MS = 120000;
 const SEARCH_LEASE_MS = 10000;
-const SEARCH_VISITED_LIMIT = 12000;
-const SEARCH_NEXT_FRONTIER_LIMIT = 1200;
-const SEARCH_EDGE_LOOKUP_TIMEOUT_MS = 450;
-const SEARCH_EDGE_MAP_LIMIT = 240;
-const EDGE_CACHE_MAX_BYTES = 120000;
-const GAME_CACHE_SEARCH_MAX_BYTES = 650000;
+const SEARCH_VISITED_LIMIT = 8000;
+const SEARCH_NEXT_FRONTIER_LIMIT = 800;
+const SEARCH_EDGE_LOOKUP_TIMEOUT_MS = 250;
+const SEARCH_EDGE_MAP_LIMIT = 80;
+const EDGE_CACHE_MAX_BYTES = 45000;
+const GAME_CACHE_SEARCH_MAX_BYTES = 250000;
 const CACHED_SHORTER_CHECK_REQUESTS = 12;
 const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
 const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 24;
 const CACHED_SHORTER_CHECK_CONCURRENCY = 16;
 const CACHED_SHORTER_CHECK_TIME_MS = 4500;
 const VISIBLE_SHORTER_CHECK_MIN_STEPS = 4;
-const STARTUP_CACHE_BFS_EXPANSIONS = 1400;
-const STARTUP_CACHE_BFS_TIME_MS = 3200;
-const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 900;
+const STARTUP_CACHE_BFS_EXPANSIONS = 600;
+const STARTUP_CACHE_BFS_TIME_MS = 1600;
+const STARTUP_CACHE_BFS_FRONTIER_LIMIT = 500;
 const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const START_NO_WINS_TTL_SECONDS = 30 * 60;
 const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const SHARE_ID_LENGTH = 8;
 const SEARCH_JOB_TTL_SECONDS = 2 * 60 * 60;
+const SEARCH_PUBLIC_JOB_TTL_SECONDS = SEARCH_JOB_TTL_SECONDS;
+const SEARCH_DURABLE_READ_TIMEOUT_MS = 700;
+const SEARCH_DURABLE_WRITE_TIMEOUT_MS = 2500;
 const SEARCH_WINDOW_SECONDS = 60;
 const MAX_SEARCH_JOBS_PER_WINDOW = 48;
 const WARM_STATUS_KEY = "warm:leaderboard-targets";
@@ -661,7 +664,11 @@ async function handleSearchJob(url, env, ctx) {
   const minExpanded = cleanNonNegativeNumber(url.searchParams.get("minExpanded"), SEARCH_MAX_EXPANSIONS) || 0;
   const minCached = cleanNonNegativeNumber(url.searchParams.get("minCached"), 100000) || 0;
   let job = await readSearchJob(env, id);
-  if (!job) return json({ error: "job not found" }, 404, "no-store");
+  if (!job) {
+    const publicJob = await readPublicSearchJob(env, id);
+    if (publicJob) return json({ ok: true, job: publicJob }, 200, "no-store");
+    return json({ error: "job not found" }, 404, "no-store");
+  }
   if (isStaleForClient(job, minExpanded, minCached)) {
     job = await readSearchJobAtLeast(env, id, minExpanded, minCached) || job;
   }
@@ -2773,7 +2780,7 @@ async function saveAnalyticsEvent(env, event) {
 }
 
 async function readSearchJob(env, id) {
-  const durable = await durableSearchJobRequest(env, id, "read");
+  const durable = await durableSearchJobRequest(env, id, "read", {}, { timeoutMs: SEARCH_DURABLE_READ_TIMEOUT_MS });
   if (durable.used) return durable.job;
   const record = await env.GAMES_CACHE.get(`search:job:${id}`, { type: "json" });
   return searchJobShape(record);
@@ -2781,18 +2788,25 @@ async function readSearchJob(env, id) {
 
 async function writeSearchJob(env, job) {
   const shaped = searchJobShape(job);
-  const durable = await durableSearchJobRequest(env, shaped.id, "write", { job: shaped });
-  if (durable.used) return durable.job;
+  const durable = await durableSearchJobRequest(env, shaped.id, "write", { job: shaped }, { timeoutMs: SEARCH_DURABLE_WRITE_TIMEOUT_MS });
+  if (durable.used && durable.job) {
+    await writePublicSearchJob(env, durable.job);
+    return durable.job;
+  }
   await env.GAMES_CACHE.put(`search:job:${shaped.id}`, JSON.stringify(shaped), {
     expirationTtl: SEARCH_JOB_TTL_SECONDS,
     metadata: { type: "search-job", start: shaped.start, target: shaped.target },
   });
+  await writePublicSearchJob(env, shaped);
   return shaped;
 }
 
 async function updateSearchJob(env, id, patch) {
-  const durable = await durableSearchJobRequest(env, id, "update", { patch });
-  if (durable.used) return durable.job;
+  const durable = await durableSearchJobRequest(env, id, "update", { patch }, { timeoutMs: SEARCH_DURABLE_WRITE_TIMEOUT_MS });
+  if (durable.used && durable.job) {
+    await writePublicSearchJob(env, durable.job);
+    return durable.job;
+  }
   const current = await readSearchJob(env, id);
   if (!current) return null;
   return writeSearchJob(env, {
@@ -2804,8 +2818,12 @@ async function updateSearchJob(env, id, patch) {
 }
 
 async function claimSearchJob(env, id, token, leaseMs) {
-  const durable = await durableSearchJobRequest(env, id, "claim", { token, leaseMs });
-  if (durable.used) return durable.job;
+  const durable = await durableSearchJobRequest(env, id, "claim", { token, leaseMs }, { timeoutMs: SEARCH_DURABLE_WRITE_TIMEOUT_MS });
+  if (durable.used && durable.job) {
+    await writePublicSearchJob(env, durable.job);
+    return durable.job;
+  }
+  if (durable.used && !durable.timedOut) return durable.job;
   const current = await readSearchJob(env, id);
   if (!current || !isActiveSearchStatus(current.status)) return null;
   if (Number(current.processingUntil || 0) > Date.now() && current.processingToken !== token) return current;
@@ -2819,8 +2837,12 @@ async function claimSearchJob(env, id, token, leaseMs) {
 }
 
 async function updateOwnedSearchJob(env, id, token, patch) {
-  const durable = await durableSearchJobRequest(env, id, "update-owned", { token, patch });
-  if (durable.used) return durable.job;
+  const durable = await durableSearchJobRequest(env, id, "update-owned", { token, patch }, { timeoutMs: SEARCH_DURABLE_WRITE_TIMEOUT_MS });
+  if (durable.used && durable.job) {
+    await writePublicSearchJob(env, durable.job);
+    return durable.job;
+  }
+  if (durable.used && !durable.timedOut) return durable.job;
   const current = await readSearchJob(env, id);
   if (!current || current.processingToken !== token) return null;
   return writeSearchJob(env, {
@@ -2832,18 +2854,55 @@ async function updateOwnedSearchJob(env, id, token, patch) {
   });
 }
 
-async function durableSearchJobRequest(env, id, action, payload = {}) {
+async function readPublicSearchJob(env, id) {
+  const cleanId = cleanAnalyticsId(id);
+  if (!cleanId) return null;
+  const record = await env.GAMES_CACHE.get(`search:public:${cleanId}`, { type: "json", cacheTtl: 5 });
+  return publicSearchJobShape(record);
+}
+
+async function writePublicSearchJob(env, job) {
+  const publicJob = publicSearchJob(job);
+  if (!publicJob?.id) return null;
+  await env.GAMES_CACHE.put(`search:public:${publicJob.id}`, JSON.stringify(publicJob), {
+    expirationTtl: SEARCH_PUBLIC_JOB_TTL_SECONDS,
+    metadata: { type: "search-public-job", start: publicJob.start, target: publicJob.target },
+  });
+  return publicJob;
+}
+
+async function durableSearchJobRequest(env, id, action, payload = {}, options = {}) {
   const cleanId = cleanAnalyticsId(id);
   if (!cleanId || !env.SEARCH_JOBS) return { used: false, job: null };
   const stub = env.SEARCH_JOBS.getByName(cleanId);
-  const res = await stub.fetch(`https://search-job/${action}`, {
+  const controller = new AbortController();
+  const timeoutMs = Math.max(500, Number(options.timeoutMs) || SEARCH_DURABLE_WRITE_TIMEOUT_MS);
+  const fetchPromise = stub.fetch(`https://search-job/${action}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
     body: JSON.stringify(payload),
+    signal: controller.signal,
+  }).catch((error) => ({ searchJobRequestError: error }));
+  const timeoutPromise = delay(timeoutMs).then(() => {
+    controller.abort();
+    return { searchJobRequestTimedOut: true };
   });
-  if (!res.ok) return { used: true, job: null };
-  const data = await res.json();
-  return { used: true, job: searchJobShape(data.job) };
+  const res = await Promise.race([fetchPromise, timeoutPromise]);
+  if (res?.searchJobRequestTimedOut) return { used: true, job: null, timedOut: true };
+  if (res?.searchJobRequestError) {
+    return {
+      used: true,
+      job: null,
+      timedOut: res.searchJobRequestError?.name === "AbortError",
+    };
+  }
+  try {
+    if (!res.ok) return { used: true, job: null };
+    const data = await res.json();
+    return { used: true, job: searchJobShape(data.job) };
+  } catch {
+    return { used: true, job: null };
+  }
 }
 
 async function readPairChain(env, start, target, range) {
@@ -3632,6 +3691,41 @@ function publicSearchJob(job) {
     updatedAt: shaped.updatedAt,
     durationMs: shaped.durationMs,
     quality: shaped.chain?.quality || null,
+  };
+}
+
+function publicSearchJobShape(job) {
+  if (!job || typeof job !== "object") return null;
+  const id = cleanAnalyticsId(job.id);
+  const start = cleanUsername(job.start);
+  const target = cleanUsername(job.target);
+  if (!id || !start || !target) return null;
+  const stats = job.stats && typeof job.stats === "object" ? job.stats : {};
+  return {
+    id,
+    start,
+    target,
+    range: cleanRange(job.range) || "auto",
+    status: isActiveSearchStatus(job.status) || ["found", "not_found", "timeout", "failed", "expired"].includes(job.status)
+      ? job.status
+      : "running",
+    outcome: analyticsOutcomeFilter(job.outcome) || statusToOutcome(job.status),
+    progress: String(job.progress || "").slice(0, 180),
+    error: String(job.error || "").slice(0, 240),
+    stats: {
+      fetched: cleanNonNegativeNumber(stats.fetched, 100000) || 0,
+      requests: cleanNonNegativeNumber(stats.requests, 100000) || 0,
+      cached: cleanNonNegativeNumber(stats.cached, 100000) || 0,
+      expanded: cleanNonNegativeNumber(stats.expanded, 100000) || 0,
+    },
+    chain: job.chain && typeof job.chain === "object" ? publicSearchJob({ ...job, start, target }).chain : null,
+    players: job.players && typeof job.players === "object" ? job.players : {},
+    refreshCached: Boolean(job.refreshCached),
+    cachedAt: Number.isFinite(job.cachedAt) ? job.cachedAt : null,
+    createdAt: Number.isFinite(job.createdAt) ? job.createdAt : Date.now(),
+    updatedAt: Number.isFinite(job.updatedAt) ? job.updatedAt : Date.now(),
+    durationMs: cleanNonNegativeNumber(job.durationMs, 10 * 60 * 1000),
+    quality: qualityShape(job.quality) || qualityShape(job.chain?.quality),
   };
 }
 

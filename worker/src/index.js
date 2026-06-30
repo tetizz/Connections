@@ -34,13 +34,16 @@ const GRAPH_BRIDGE_CONNECTOR_LIMIT = 120;
 const SEARCH_MAX_DEPTH = 1000000;
 const SEARCH_MAX_EXPANSIONS = Number.MAX_SAFE_INTEGER;
 const SEARCH_FRONTIER_LIMIT = 60000;
-const SEARCH_CHUNK_EXPANSIONS = 520;
-const SEARCH_CHUNK_TIME_MS = 12000;
-const SEARCH_EXPANSION_CONCURRENCY = 64;
+const SEARCH_CHUNK_EXPANSIONS = 220;
+const SEARCH_CHUNK_TIME_MS = 5500;
+const SEARCH_EXPANSION_CONCURRENCY = 40;
 const SEARCH_BACKGROUND_TIME_MS = 120000;
-const SEARCH_LEASE_MS = 20000;
+const SEARCH_LEASE_MS = 12000;
 const SEARCH_VISITED_LIMIT = 250000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 60000;
+const SEARCH_EDGE_LOOKUP_TIMEOUT_MS = 2500;
+const SEARCH_EDGE_MAP_LIMIT = 1800;
+const EDGE_CACHE_MAX_BYTES = 700000;
 const CACHED_SHORTER_CHECK_REQUESTS = 12;
 const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
 const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 24;
@@ -70,6 +73,8 @@ const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 
 const RATE_LIMIT_COOLDOWN_SECONDS = 90;
 const FETCH_RETRIES = 2;
 const FETCH_BACKOFF_MS = 450;
+const FETCH_TIMEOUT_MS = 7000;
+const SEARCH_STALE_LEASE_MS = SEARCH_LEASE_MS + 8000;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -455,45 +460,6 @@ async function handleSearchStart(request, env, ctx) {
     }), { expirationTtl: SEARCH_WINDOW_SECONDS * 2 });
   }
 
-  const startupFastLane = cachedPair ? null : await tryStartupFastLane(env, {
-    id,
-    start,
-    target,
-    range,
-  }).catch((error) => {
-    console.warn(JSON.stringify({
-      event: "startup_fast_lane_failed",
-      start,
-      target,
-      message: error?.message || String(error),
-    }));
-    return null;
-  });
-  if (startupFastLane?.job) {
-    await writeSearchJob(env, startupFastLane.job);
-    if (startupFastLane.job.chain?.found) {
-      const cachePromise = Promise.all([
-        writePairChain(env, startupFastLane.job),
-        writeFastLaneFragments(env, startupFastLane.job),
-      ]).catch((error) => {
-        console.warn(JSON.stringify({
-          event: "startup_fast_lane_cache_failed",
-          jobId: id,
-          message: error?.message || String(error),
-        }));
-      });
-      if (ctx?.waitUntil) ctx.waitUntil(cachePromise);
-      else await cachePromise;
-    }
-    const event = searchJobAnalyticsEvent(startupFastLane.job);
-    if (event) {
-      const analyticsPromise = saveAnalyticsEvent(env, event);
-      if (ctx?.waitUntil) ctx.waitUntil(analyticsPromise);
-      else await analyticsPromise;
-    }
-    return json({ ok: true, job: publicSearchJob(startupFastLane.job) }, 200, "no-store");
-  }
-
   const shouldRefreshCachedPair = Boolean(
     cachedPair?.chain?.found &&
     chainStepCount(cachedPair.chain) >= VISIBLE_SHORTER_CHECK_MIN_STEPS
@@ -522,7 +488,7 @@ async function handleSearchStart(request, env, ctx) {
   });
   await writeSearchJob(env, job);
   if (ctx?.waitUntil && cachedPair && shouldRefreshCachedPair) {
-    ctx.waitUntil(runSearchJob(env, job).catch((error) => {
+    ctx.waitUntil(kickSearchJobChunk(env, job.id).catch((error) => {
       console.warn(JSON.stringify({
         event: "cached_pair_refresh_failed",
         jobId: job.id,
@@ -542,7 +508,7 @@ async function handleSearchStart(request, env, ctx) {
       }));
     }));
   } else if (!cachedPair && ctx?.waitUntil) {
-    ctx.waitUntil(runSearchJob(env, job).catch((error) => {
+    ctx.waitUntil(kickSearchJobChunk(env, job.id).catch((error) => {
       console.warn(JSON.stringify({
         event: "search_start_background_failed",
         jobId: job.id,
@@ -698,18 +664,11 @@ async function handleSearchJob(url, env, ctx) {
   if (isStaleForClient(job, minExpanded, minCached)) {
     job = await readSearchJobAtLeast(env, id, minExpanded, minCached) || job;
   }
+  job = await recoverStaleSearchLease(env, id, job) || job;
   if (isActiveSearchStatus(job.status) &&
       Date.now() >= Number(job.processingUntil || 0)) {
-    const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
-    const chunkOptions = {
-      expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
-      timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
-      concurrency: cachedShorterCheck ? CACHED_SHORTER_CHECK_CONCURRENCY : SEARCH_EXPANSION_CONCURRENCY,
-    };
     if (ctx?.waitUntil) {
-      ctx.waitUntil(runSearchJobChunk(env, id, {
-        ...chunkOptions,
-      }).catch((error) => {
+      ctx.waitUntil(kickSearchJobChunk(env, id).catch((error) => {
         console.warn(JSON.stringify({
           event: "search_poll_kick_failed",
           jobId: id,
@@ -718,9 +677,33 @@ async function handleSearchJob(url, env, ctx) {
       }));
       return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
     }
-    job = await runSearchJobChunk(env, id, chunkOptions) || await readSearchJob(env, id) || job;
+    job = await kickSearchJobChunk(env, id) || await readSearchJob(env, id) || job;
   }
   return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
+}
+
+async function recoverStaleSearchLease(env, id, job) {
+  if (!job || !isActiveSearchStatus(job.status)) return job;
+  const processingUntil = Number(job.processingUntil || 0);
+  if (!processingUntil || processingUntil <= Date.now()) return job;
+  const updatedAt = Number(job.updatedAt || job.createdAt || 0);
+  if (updatedAt && Date.now() - updatedAt < SEARCH_STALE_LEASE_MS) return job;
+  return updateSearchJob(env, id, {
+    processingUntil: 0,
+    processingToken: "",
+    progress: job.progress || "Resuming search.",
+  });
+}
+
+async function kickSearchJobChunk(env, id) {
+  const job = await readSearchJob(env, id);
+  if (!job || !isActiveSearchStatus(job.status)) return job;
+  const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
+  return runSearchJobChunk(env, id, {
+    expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
+    timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
+    concurrency: cachedShorterCheck ? CACHED_SHORTER_CHECK_CONCURRENCY : SEARCH_EXPANSION_CONCURRENCY,
+  });
 }
 
 async function readSearchJobAtLeast(env, id, minExpanded, minCached) {
@@ -786,7 +769,6 @@ async function refreshCachedPairInBackground(env, cachedJob) {
 }
 
 async function runSearchJobChunk(env, id, options = {}) {
-  const chunkStartedAt = Date.now();
   const expansionBudget = Math.max(1, Math.min(SEARCH_CHUNK_EXPANSIONS, Number(options.expansionBudget) || SEARCH_CHUNK_EXPANSIONS));
   const timeBudgetMs = Math.max(1000, Math.min(SEARCH_CHUNK_TIME_MS, Number(options.timeBudgetMs) || SEARCH_CHUNK_TIME_MS));
   const ownerToken = cleanAnalyticsId(options.ownerToken) || crypto.randomUUID();
@@ -933,7 +915,7 @@ async function runSearchJobChunk(env, id, options = {}) {
       expansionBudget,
       timeBudgetMs,
       concurrency: Number(options.concurrency) || SEARCH_EXPANSION_CONCURRENCY,
-      chunkStartedAt,
+      chunkStartedAt: Date.now(),
     });
 
     if (result?.status === "running") {
@@ -1182,10 +1164,12 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     if (!batch.length) continue;
     stats.expanded += batch.length;
     processed += batch.length;
+    syncSearch();
+    await progress(`Step ${search.depth + 1}: checking ${search.activeFrontier.length} players`, { depth: search.depth });
 
     const edgeBatch = await runThrottled(batch.map((node) => async () => {
       try {
-        return { node, edges: await getEdges(node) };
+        return { node, edges: await withTimeout(getEdges(node), SEARCH_EDGE_LOOKUP_TIMEOUT_MS) };
       } catch {
         return { node, edges: { beatenByMe: new Map(), beatMe: new Map() } };
       }
@@ -1231,9 +1215,6 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
 
     if (search.activeCursor >= search.activeFrontier.length) {
       await finishLayer();
-    } else if (processed % 20 === 0) {
-      syncSearch();
-      await progress(`Step ${search.depth + 1}: checking ${search.activeFrontier.length} players`, { depth: search.depth });
     }
   }
 
@@ -1829,7 +1810,14 @@ async function readCachedGames(env, parsed, stats = null) {
 
 async function readCachedEdges(env, parsed, stats = null) {
   const key = cacheKeyFromParsed(parsed);
-  const cached = await env.GAMES_CACHE.get(edgeCacheKey(key), { type: "json", cacheTtl: 60 });
+  const raw = await env.GAMES_CACHE.get(edgeCacheKey(key), { cacheTtl: 60 });
+  if (!raw || raw.length > EDGE_CACHE_MAX_BYTES) return null;
+  let cached;
+  try {
+    cached = JSON.parse(raw);
+  } catch {
+    return null;
+  }
   const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
   if (!cached || Date.now() - cachedAt >= TTL_SECONDS * 1000) return null;
   const edges = deserializeEdges(cached.edges);
@@ -1857,7 +1845,7 @@ function serializeEdges(edges) {
 
 function serializeEdgeMap(map) {
   return [...(map instanceof Map ? map.entries() : [])]
-    .slice(0, SEARCH_VISITED_LIMIT)
+    .slice(0, SEARCH_EDGE_MAP_LIMIT)
     .map(([username, urls]) => [username, Array.isArray(urls) ? urls.slice(0, 3) : []]);
 }
 
@@ -1875,7 +1863,7 @@ function deserializeEdgeMap(rows) {
     const username = cleanUsername(row?.[0]);
     const urls = Array.isArray(row?.[1]) ? row[1].map(cleanUrl).filter(Boolean) : [];
     if (username && urls.length) map.set(username, urls);
-    if (map.size >= SEARCH_VISITED_LIMIT) break;
+    if (map.size >= SEARCH_EDGE_MAP_LIMIT) break;
   }
   return map;
 }
@@ -4319,12 +4307,26 @@ function suggestionScore(item, query) {
 
 async function fetchJSON(url) {
   for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
-    const response = await fetch(url, {
-      headers: {
-        "Accept": "application/json",
-        "User-Agent": "chess-connections-cache/1.0",
-      },
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(url, {
+        headers: {
+          "Accept": "application/json",
+          "User-Agent": "chess-connections-cache/1.0",
+        },
+        signal: controller.signal,
+      });
+    } catch (error) {
+      clearTimeout(timeout);
+      if (attempt < FETCH_RETRIES && error?.name === "AbortError") {
+        await delay(FETCH_BACKOFF_MS * (attempt + 1));
+        continue;
+      }
+      throw error;
+    }
+    clearTimeout(timeout);
     if (response.ok) {
       return response.json();
     }
@@ -4736,6 +4738,20 @@ function isMissingArchivesError(error) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout(promise, ms) {
+  let timeoutId;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error("operation timed out")), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 class UpstreamHTTPError extends Error {

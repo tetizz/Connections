@@ -1809,6 +1809,8 @@
     const svg = $("#graph");
     svg.innerHTML = "";
     svg.classList.remove("is-tree-graph");
+    delete svg.dataset.treeSignature;
+    delete svg.dataset.treeAnimationRun;
     svg.setAttribute("viewBox", "0 0 1040 420");
 
     const defs = el("defs");
@@ -1931,7 +1933,12 @@
 
   function renderTreeGraph(treeChain, options = {}) {
     const svg = $("#graph");
-    const preserveProgress = Boolean(options.preserveTreeProgress && svg.classList.contains("is-tree-graph"));
+    const nextSignature = treeGraphSignature(treeChain);
+    const preserveProgress = Boolean(
+      options.preserveTreeProgress
+      && svg.classList.contains("is-tree-graph")
+      && svg.dataset.treeSignature === nextSignature
+    );
     const now = performance.now();
     const preservedEdges = preserveProgress ? new Set(
       Array.from(svg.querySelectorAll(".tree-edge-line"))
@@ -1949,6 +1956,7 @@
     ) : new Set();
     svg.innerHTML = "";
     svg.classList.add("is-tree-graph");
+    svg.dataset.treeSignature = nextSignature;
 
     const defs = el("defs");
     const grad = el("linearGradient", { id: "edge-grad", gradientUnits: "userSpaceOnUse", x1: "0", y1: "0", x2: "1180", y2: "0" });
@@ -1980,7 +1988,7 @@
       const c2x = b.x - Math.max(42, (b.x - a.x) * .34);
       const dx = Math.max(1, b.x - a.x);
       const yDelta = b.y - a.y;
-      const bow = Math.abs(yDelta) < 8 ? Math.min(26, Math.max(12, dx * .045)) : 0;
+      const bow = Math.abs(yDelta) < 8 ? Math.min(12, Math.max(5, dx * .025)) : 0;
       const d = `M ${a.x} ${a.y} C ${c1x} ${a.y - bow} ${c2x} ${b.y - bow} ${b.x} ${b.y}`;
       const edgeKey = `${edge.from}|${edge.to}`;
       const depth = Math.max(1, Number(edge.depth || 1));
@@ -2050,6 +2058,28 @@
   }
 
   window.__connectionsDebugRenderGraph = renderGraph;
+
+  function treeGraphSignature(treeChain) {
+    const root = cleanUsernameInput(treeChain?.root || "");
+    const paths = (treeChain?.chains || [])
+      .map((chain) => (chain.path || []).map(cleanUsernameInput).filter(Boolean).join(">"))
+      .filter(Boolean)
+      .sort()
+      .join("|");
+    const raw = [
+      root,
+      treeChain?.targetCount || "",
+      treeChain?.foundSlotCount || "",
+      treeChain?.branchCount || "",
+      paths,
+    ].join("::");
+    let hash = 2166136261;
+    for (let i = 0; i < raw.length; i++) {
+      hash ^= raw.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${root}:${treeChain?.targetCount || ""}:${treeChain?.foundSlotCount || ""}:${treeChain?.branchCount || ""}:${(hash >>> 0).toString(36)}`;
+  }
 
   function buildMergedChainTree(chains) {
     const rootPath = chains.find((chain) => Array.isArray(chain.path) && chain.path.length >= 2)?.path || [];
@@ -2191,6 +2221,7 @@
 
   function animateTreeGraph(svg, options = {}) {
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const animationToken = nextTreeAnimationToken(svg);
     const preservedEdges = options.preservedEdges instanceof Set ? options.preservedEdges : new Set();
     const preservedNodes = options.preservedNodes instanceof Set ? options.preservedNodes : new Set();
     const nodes = Array.from(svg.querySelectorAll(".node"));
@@ -2246,38 +2277,51 @@
     });
 
     requestAnimationFrame(() => {
+      if (!isActiveTreeAnimation(svg, animationToken)) return;
       const root = nodes.find((node) => node.classList.contains("is-start"))?.dataset.profileUser;
       const rootEdge = lines.find((path) => String(path.dataset.treeEdge || "").startsWith(`${root}|`));
       const rootId = rootEdge ? String(rootEdge.dataset.treeEdge).split("|")[0] : null;
       const rootNode = rootId ? nodeById.get(rootId) : nodes.find((node) => node.classList.contains("is-start"));
-      revealTreeNode(rootNode, 0);
+      revealTreeNode(rootNode, 0, svg, animationToken);
       if (rootId) {
-        setTimeout(() => cascadeTreeRiders(rootId, edgesByFrom, riders, nodeById), 360);
+        setTimeout(() => cascadeTreeRiders(rootId, edgesByFrom, riders, nodeById, svg, animationToken), 360);
       } else {
         lines.forEach((path, index) => {
-          drawTreePath(path, glows[index], index * 110);
+          drawTreePath(path, glows[index], index * 110, 820, svg, animationToken);
         });
       }
     });
   }
 
-  function cascadeTreeRiders(fromId, edgesByFrom, riders, nodeById) {
+  function nextTreeAnimationToken(svg) {
+    const token = String((Number(svg.dataset.treeAnimationRun) || 0) + 1);
+    svg.dataset.treeAnimationRun = token;
+    return token;
+  }
+
+  function isActiveTreeAnimation(svg, token) {
+    return Boolean(svg && svg.dataset.treeAnimationRun === token);
+  }
+
+  function cascadeTreeRiders(fromId, edgesByFrom, riders, nodeById, svg, animationToken) {
+    if (!isActiveTreeAnimation(svg, animationToken)) return Promise.resolve();
     const edges = edgesByFrom.get(fromId) || [];
     if (!edges.length) return Promise.resolve();
     return Promise.all(edges.map((edge, branchIndex) => {
       const branchDelay = branchIndex * 54;
       const duration = 760 + Math.min(220, Number(edge.path.dataset.edgeDepth || 1) * 40);
-      drawTreePath(edge.path, edge.glow, branchDelay, duration);
-      return rideTreePath(edge.path, riders, branchDelay, duration)
+      drawTreePath(edge.path, edge.glow, branchDelay, duration, svg, animationToken);
+      return rideTreePath(edge.path, riders, branchDelay, duration, svg, animationToken)
         .then(() => {
+          if (!isActiveTreeAnimation(svg, animationToken)) return Promise.resolve();
           const reachedNode = nodeById?.get(edge.to);
-          revealTreeNode(reachedNode, 0);
+          revealTreeNode(reachedNode, 0, svg, animationToken);
           warmNodeProfileForReveal(reachedNode);
           const nextEdges = edgesByFrom.get(edge.to) || [];
           if (!nextEdges.length) return Promise.resolve();
           return new Promise((resolve) => {
             setTimeout(() => {
-              cascadeTreeRiders(edge.to, edgesByFrom, riders, nodeById).then(resolve);
+              cascadeTreeRiders(edge.to, edgesByFrom, riders, nodeById, svg, animationToken).then(resolve);
             }, 80);
           });
         });
@@ -2298,9 +2342,10 @@
     ]).then(() => refreshGraphProfileNodes(username));
   }
 
-  function revealTreeNode(node, delay = 0) {
+  function revealTreeNode(node, delay = 0, svg = null, animationToken = "") {
     if (!node || node.classList.contains("is-placed")) return;
     setTimeout(() => {
+      if (svg && !isActiveTreeAnimation(svg, animationToken)) return;
       node.style.transition = "opacity .28s ease";
       node.style.opacity = 1;
       node.classList.add("is-placed");
@@ -2308,8 +2353,9 @@
     }, delay);
   }
 
-  function drawTreePath(path, glow, delay = 0, duration = 820) {
+  function drawTreePath(path, glow, delay = 0, duration = 820, svg = null, animationToken = "") {
     if (!path) return;
+    if (svg && !isActiveTreeAnimation(svg, animationToken)) return;
     path.dataset.drawCompleteAt = String(performance.now() + delay + duration + 40);
     path.style.transition = `stroke-dashoffset ${duration}ms cubic-bezier(.2,.8,.2,1) ${delay}ms`;
     path.style.strokeDashoffset = 0;
@@ -2325,7 +2371,7 @@
     return 0.28;
   }
 
-  function rideTreePath(path, riders, delay = 0, duration = 820) {
+  function rideTreePath(path, riders, delay = 0, duration = 820, svg = null, animationToken = "") {
     if (!path || !riders) return Promise.resolve();
     const len = path.getTotalLength();
     const rider = el("text", {
@@ -2337,10 +2383,23 @@
     rider.style.opacity = 0;
     riders.appendChild(rider);
     return new Promise((resolve) => window.setTimeout(() => {
+      if (svg && !isActiveTreeAnimation(svg, animationToken)) {
+        rider.remove();
+        resolve();
+        return;
+      }
       const start = performance.now();
       let resolved = false;
       rider.style.opacity = 1;
       const step = (now) => {
+        if (svg && !isActiveTreeAnimation(svg, animationToken)) {
+          rider.remove();
+          if (!resolved) {
+            resolved = true;
+            resolve();
+          }
+          return;
+        }
         const t = Math.min(1, (now - start) / duration);
         const eased = 1 - Math.pow(1 - t, 3);
         const point = path.getPointAtLength(len * eased);

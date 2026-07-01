@@ -18,7 +18,7 @@ const KV_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const MAX_LEADERBOARD_ENTRIES = 1000;
 const MAX_SUGGESTIONS = 10;
 const TITLED_GROUPS = ["GM", "IM", "FM", "NM", "WGM", "WIM", "WFM", "CM", "WCM"];
-const ARCHIVE_CONCURRENCY = 4;
+const ARCHIVE_CONCURRENCY = 8;
 const SUBMIT_WINDOW_SECONDS = 60;
 const MAX_SUBMITS_PER_WINDOW = 30;
 const MAX_ANALYTICS_EVENTS = 120;
@@ -38,13 +38,13 @@ const SEARCH_CHUNK_EXPANSIONS = 512;
 const SEARCH_CHUNK_TIME_MS = 5000;
 const SEARCH_EXPANSION_CONCURRENCY = 64;
 const SEARCH_BACKGROUND_TIME_MS = 120000;
-const SEARCH_LEASE_MS = 10000;
+const SEARCH_LEASE_MS = 6500;
 const SEARCH_VISITED_LIMIT = 8000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 800;
 const SEARCH_CACHE_EDGE_LOOKUP_TIMEOUT_MS = 350;
 const SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS = 2500;
-const SEARCH_FRESH_EDGE_REQUEST_LIMIT = 80;
-const SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK = 12;
+const SEARCH_FRESH_EDGE_REQUEST_LIMIT = 160;
+const SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK = 24;
 const SEARCH_EDGE_MAP_LIMIT = 80;
 const EDGE_CACHE_MAX_BYTES = 45000;
 const GAME_CACHE_SEARCH_MAX_BYTES = 250000;
@@ -79,10 +79,9 @@ const COMMON_WARM_TARGETS = ["magnuscarlsen", "hikaru", "danielnaroditsky", "fab
 const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
 const RATE_LIMIT_COOLDOWN_SECONDS = 90;
 const FETCH_RETRIES = 2;
-const FETCH_BACKOFF_MS = 450;
 const FETCH_TIMEOUT_MS = 7000;
-const SEARCH_STALE_LEASE_MS = 6000;
-const SEARCH_POLL_FORCE_AFTER_MS = 18000;
+const SEARCH_STALE_LEASE_MS = 4500;
+const SEARCH_POLL_FORCE_AFTER_MS = 4500;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -692,7 +691,7 @@ async function handleSearchJob(url, env, ctx) {
         Date.now() >= Number(job.processingUntil || 0)) {
       if (activeIdleMs >= SEARCH_POLL_FORCE_AFTER_MS) {
         const beforeKick = job;
-        job = await kickSearchJobChunk(env, id, { force: true, timeBudgetMs: 3500 }) ||
+        job = await kickSearchJobChunk(env, id, { force: true, timeBudgetMs: SEARCH_CHUNK_TIME_MS }) ||
           await readSearchJob(env, id) ||
           job;
         if (isActiveSearchStatus(job.status) && !searchJobMadeProgress(beforeKick, job)) {
@@ -817,7 +816,7 @@ async function readSearchJobAtLeast(env, id, minExpanded, minCached) {
     const job = await readSearchJob(env, id);
     if (job && (!best || Number(job.stats?.expanded || 0) > Number(best.stats?.expanded || 0))) best = job;
     if (!isStaleForClient(job, minExpanded, minCached)) return job;
-    await delay(180);
+    await Promise.resolve();
   }
   return best;
 }
@@ -4594,7 +4593,6 @@ async function fetchJSON(url) {
     } catch (error) {
       clearTimeout(timeout);
       if (attempt < FETCH_RETRIES && error?.name === "AbortError") {
-        await delay(FETCH_BACKOFF_MS * (attempt + 1));
         continue;
       }
       throw error;
@@ -4613,7 +4611,7 @@ async function fetchJSON(url) {
       throw new UpstreamHTTPError(response.status, url, retryAfter);
     }
 
-    await delay(retryAfter ? retryAfter * 1000 : FETCH_BACKOFF_MS * (attempt + 1));
+    if (retryAfter) await delay(retryAfter * 1000);
   }
 
   throw new Error(`Failed to fetch ${url}`);

@@ -30,7 +30,7 @@
   const OWNER_ANALYTICS_LIMIT = 30;
   const TOP_TRACE_BATCH_LIMIT = 30;
   const TOP_TRACE_CONCURRENCY = 6;
-  const TOP_TRACE_POLL_INTERVAL_MS = 900;
+  const TOP_TRACE_POLL_INTERVAL_MS = 140;
   const TOP_TRACE_HARD_LIMIT_MS = 240000;
   const TOP_TRACE_SUBMIT_LIMIT = 30;
   const TOP_TRACE_SUBMIT_CONCURRENCY = 4;
@@ -459,8 +459,11 @@
           job: { ...job, status: "found" },
         };
       }
+      let pollAttempt = 0;
       while (["queued", "running"].includes(job.status) && performance.now() - started < TOP_TRACE_HARD_LIMIT_MS && runId === state.topTraceRunId) {
-        await new Promise((resolve) => setTimeout(resolve, TOP_TRACE_POLL_INTERVAL_MS));
+        if (pollAttempt++ > 0) {
+          await new Promise((resolve) => setTimeout(resolve, TOP_TRACE_POLL_INTERVAL_MS));
+        }
         const pollRes = await fetch(`${remoteBase}/search/job?id=${encodeURIComponent(job.id)}`, {
           headers: { "Accept": "application/json" },
         });
@@ -3177,7 +3180,7 @@
       if (logLine) logLine(job.progress || statusText(job.status));
       if (job.chain?.found && !background) return { ...job, status: "found" };
       if (["found", "not_found", "timeout", "failed"].includes(job.status)) return job;
-      await new Promise((resolve) => setTimeout(resolve, attempt < 12 ? 350 : 900));
+      await new Promise((resolve) => setTimeout(resolve, attempt < 20 ? 120 : 300));
     }
   }
 

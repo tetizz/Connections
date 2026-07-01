@@ -15,13 +15,11 @@ window.ChessChain = class ChessChain {
     this._edgesCache = new Map();  // username -> {beatenByMe, beatMe}
     this.onProgress = null;        // (msg, stats) => void
     this.stats = { fetched: 0, apiCalls: 0, cached: 0, depth: 0 };
-    // global concurrency gate for all HTTP requests — keeps us under
-    // Chess.com's rate limit no matter how many tasks are queued.
+    // global concurrency gate for all HTTP requests.
     this._inflight = 0;
-    this._maxInflight = 20;         // max concurrency — hammer Chess.com
+    this._waiters = [];
+    this._maxInflight = 20;
     this._cache = cache;            // optional shared Cloudflare GameCache
-    this._lastReqTs = 0;            // throttle: min ms between request starts
-    this._minSpacing = 10;          // ~100 req/sec theoretical, throttled by 429s
     this._maxRetries = Number.isFinite(options.maxRetries)
       ? Math.max(1, options.maxRetries)
       : 8;
@@ -33,18 +31,18 @@ window.ChessChain = class ChessChain {
       : Infinity;
   }
 
-  /** Acquire a concurrency slot AND enforce min spacing between starts. */
+  /** Acquire a concurrency slot without adding artificial request spacing. */
   async _acquire() {
-    while (this._inflight >= this._maxInflight) {
-      await new Promise(r => setTimeout(r, 20));
+    if (this._inflight >= this._maxInflight) {
+      await new Promise(resolve => this._waiters.push(resolve));
     }
-    // enforce minimum spacing between request starts
-    const wait = this._lastReqTs + this._minSpacing - Date.now();
-    if (wait > 0) await new Promise(r => setTimeout(r, wait));
-    this._lastReqTs = Date.now();
     this._inflight++;
   }
-  _release() { this._inflight--; }
+  _release() {
+    this._inflight = Math.max(0, this._inflight - 1);
+    const next = this._waiters.shift();
+    if (next) queueMicrotask(next);
+  }
 
   log(msg) {
     if (this.onProgress) this.onProgress(msg, { ...this.stats });
@@ -54,6 +52,7 @@ window.ChessChain = class ChessChain {
     this.stats.apiCalls++;
     const MAX_RETRIES = this._maxRetries;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      let retryAfterDelay = 0;
       await this._acquire();
       const controller = this._fetchTimeout ? new AbortController() : null;
       const timeout = controller
@@ -65,23 +64,29 @@ window.ChessChain = class ChessChain {
           signal: controller?.signal,
         });
         if (res.status === 429) {
-          // rate limited — short backoff then hammer again
-          const wait = 300 * Math.pow(2, attempt); // 0.3s, 0.6s, 1.2s...
-          this.log(`chess.com throttled us, pausing ${(wait/1000).toFixed(1)}s…`);
-          await new Promise(r => setTimeout(r, wait));
-          continue;
+          if (attempt === MAX_RETRIES - 1) throw new Error(`HTTP 429 on ${url}`);
+          const retryAfter = Number(res.headers.get("Retry-After"));
+          retryAfterDelay = Number.isFinite(retryAfter) && retryAfter > 0
+            ? Math.min(2000, Math.ceil(retryAfter * 1000))
+            : 0;
+          if (retryAfterDelay > 0) {
+            this.log(`chess.com throttled us, pausing ${(retryAfterDelay/1000).toFixed(1)}s`);
+          }
+        } else {
+          if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
+          return await res.json();
         }
-        if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
-        return await res.json();
       } catch (e) {
         if (e.name === "AbortError") {
           e = new Error(`Timed out waiting for ${url}`);
         }
         if (attempt === MAX_RETRIES - 1) throw e;
-        await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
       } finally {
         if (timeout) clearTimeout(timeout);
         this._release();
+      }
+      if (retryAfterDelay > 0) {
+        await new Promise(r => setTimeout(r, retryAfterDelay));
       }
     }
     throw new Error("Max retries exceeded for " + url);

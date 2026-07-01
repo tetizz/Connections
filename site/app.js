@@ -1940,6 +1940,7 @@
     grad.appendChild(el("stop", { offset: "52%", "stop-color": "#c99b4b" }));
     grad.appendChild(el("stop", { offset: "100%", "stop-color": "#7e8b83" }));
     defs.appendChild(grad);
+    appendTreeEdgeGradients(defs);
     const clip = el("clipPath", { id: "clip" });
     clip.appendChild(el("circle", { r: 28, cx: 0, cy: 0 }));
     defs.appendChild(clip);
@@ -1964,7 +1965,22 @@
       const c2x = b.x - Math.max(42, (b.x - a.x) * .34);
       const d = `M ${a.x} ${a.y} C ${c1x} ${a.y} ${c2x} ${b.y} ${b.x} ${b.y}`;
       const edgeKey = `${edge.from}|${edge.to}`;
-      edgesGroup.appendChild(el("path", { class: "edge-line tree-edge-line", d, "data-tree-edge": edgeKey, "data-edge-depth": edge.depth || 1 }));
+      const depth = Math.max(1, Number(edge.depth || 1));
+      const strokeStyle = `stroke: url(#${treeEdgeGradientId(depth)}); --tree-edge-glow: ${treeEdgeGlow(depth)};`;
+      edgesGroup.appendChild(el("path", {
+        class: "edge-glow tree-edge-glow",
+        d,
+        "data-tree-edge": edgeKey,
+        "data-edge-depth": depth,
+        style: strokeStyle,
+      }));
+      edgesGroup.appendChild(el("path", {
+        class: "edge-line tree-edge-line",
+        d,
+        "data-tree-edge": edgeKey,
+        "data-edge-depth": depth,
+        style: strokeStyle,
+      }));
     }
     svg.appendChild(edgesGroup);
 
@@ -2016,6 +2032,58 @@
 
     preloadTreeProfiles(graph.nodes);
     animateTreeGraph(svg);
+  }
+
+  window.__connectionsDebugRenderGraph = renderGraph;
+
+  const TREE_EDGE_COLORS = [
+    ["#f0c977", "#d79a38"],
+    ["#8bd66f", "#4eb46b"],
+    ["#64d2ff", "#4d80ff"],
+    ["#b992ff", "#7c65e8"],
+    ["#ff8fb3", "#e56b8f"],
+    ["#ffb86b", "#e27a35"],
+    ["#d8ff7b", "#93c759"],
+    ["#8ff0df", "#46b8be"],
+  ];
+
+  const TREE_EDGE_GLOWS = [
+    "rgba(240, 201, 119, .58)",
+    "rgba(139, 214, 111, .46)",
+    "rgba(100, 210, 255, .45)",
+    "rgba(185, 146, 255, .42)",
+    "rgba(255, 143, 179, .42)",
+    "rgba(255, 184, 107, .44)",
+    "rgba(216, 255, 123, .38)",
+    "rgba(143, 240, 223, .4)",
+  ];
+
+  function treeEdgePaletteIndex(depth) {
+    return Math.max(0, (Number(depth) || 1) - 1) % TREE_EDGE_COLORS.length;
+  }
+
+  function treeEdgeGradientId(depth) {
+    return `tree-edge-grad-${treeEdgePaletteIndex(depth)}`;
+  }
+
+  function treeEdgeGlow(depth) {
+    return TREE_EDGE_GLOWS[treeEdgePaletteIndex(depth)];
+  }
+
+  function appendTreeEdgeGradients(defs) {
+    TREE_EDGE_COLORS.forEach(([start, end], index) => {
+      const gradient = el("linearGradient", {
+        id: `tree-edge-grad-${index}`,
+        x1: "0",
+        y1: "0",
+        x2: "1",
+        y2: "0",
+      });
+      gradient.appendChild(el("stop", { offset: "0%", "stop-color": start }));
+      gradient.appendChild(el("stop", { offset: "58%", "stop-color": end }));
+      gradient.appendChild(el("stop", { offset: "100%", "stop-color": start }));
+      defs.appendChild(gradient);
+    });
   }
 
   function buildMergedChainTree(chains) {
@@ -2279,7 +2347,7 @@
     if (glow) {
       glow.style.transition = `stroke-dashoffset ${duration}ms cubic-bezier(.2,.8,.2,1) ${delay}ms, opacity .28s ease ${delay}ms`;
       glow.style.strokeDashoffset = 0;
-      glow.style.opacity = 0;
+      glow.style.opacity = 0.26;
     }
   }
 

@@ -1891,24 +1891,12 @@ html[data-theme="dark"] .node__ring {
     drop-shadow(0 4px 10px rgba(0, 0, 0, .28));
 }
 
-.tree-edge-line.is-single {
-  stroke-width: 6.1;
-  filter:
-    drop-shadow(0 0 10px rgba(201, 155, 75, .48))
-    drop-shadow(0 4px 11px rgba(0, 0, 0, .30));
-}
-
 .tree-edge-glow {
   stroke: var(--brass-2);
   stroke-width: 18;
   stroke-linecap: round;
   opacity: 0;
   filter: blur(5px);
-}
-
-.tree-edge-glow.is-single {
-  stroke-width: 22;
-  filter: blur(6px);
 }
 
 .traveller {

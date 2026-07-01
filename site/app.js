@@ -1972,7 +1972,6 @@
     svg.style.setProperty("--tree-graph-height", `${Math.min(2200, Math.max(620, viewHeight * 0.84))}px`);
 
     const edgesGroup = el("g", { class: "tree-edges" });
-    const graphNodeById = new Map(graph.nodes.map((node) => [node.id, node]));
     for (const edge of graph.edges) {
       const a = graph.positions.get(edge.from);
       const b = graph.positions.get(edge.to);
@@ -1982,16 +1981,14 @@
       const d = `M ${a.x} ${a.y} C ${c1x} ${a.y} ${c2x} ${b.y} ${b.x} ${b.y}`;
       const edgeKey = `${edge.from}|${edge.to}`;
       const depth = Math.max(1, Number(edge.depth || 1));
-      const fromNode = graphNodeById.get(edge.from);
-      const edgeClass = (fromNode?.children?.length || 0) <= 1 ? " is-single" : " is-split";
       edgesGroup.appendChild(el("path", {
-        class: `edge-glow tree-edge-glow${edgeClass}`,
+        class: "edge-glow tree-edge-glow",
         d,
         "data-tree-edge": edgeKey,
         "data-edge-depth": depth,
       }));
       edgesGroup.appendChild(el("path", {
-        class: `edge-line tree-edge-line${edgeClass}`,
+        class: "edge-line tree-edge-line",
         d,
         "data-tree-edge": edgeKey,
         "data-edge-depth": depth,
@@ -2210,7 +2207,7 @@
       const preserved = preservedEdges.has(path.dataset.treeEdge || "");
       path.style.strokeDasharray = len;
       path.style.strokeDashoffset = reduced || preserved ? 0 : len;
-      path.style.opacity = reduced ? 0.08 : preserved ? treeGlowOpacity(path) : 0;
+      path.style.opacity = reduced ? 0.08 : preserved ? treeGlowOpacity() : 0;
       path.style.transition = "none";
     });
     nodes.forEach((node) => {
@@ -2317,12 +2314,12 @@
       glow.dataset.drawCompleteAt = path.dataset.drawCompleteAt;
       glow.style.transition = `stroke-dashoffset ${duration}ms cubic-bezier(.2,.8,.2,1) ${delay}ms, opacity .28s ease ${delay}ms`;
       glow.style.strokeDashoffset = 0;
-      glow.style.opacity = treeGlowOpacity(path);
+      glow.style.opacity = treeGlowOpacity();
     }
   }
 
-  function treeGlowOpacity(path) {
-    return path?.classList?.contains("is-single") ? 0.36 : 0.28;
+  function treeGlowOpacity() {
+    return 0.28;
   }
 
   function rideTreePath(path, riders, delay = 0, duration = 820) {

@@ -1883,16 +1883,16 @@ html[data-theme="dark"] .node__ring {
 }
 
 .tree-edge-line {
-  stroke-width: 5.5;
+  stroke-width: 6.25;
   stroke-opacity: 1;
   filter:
-    drop-shadow(0 0 6px rgba(240, 201, 119, .34))
-    drop-shadow(0 4px 8px rgba(0, 0, 0, .24));
+    drop-shadow(0 0 7px rgba(240, 201, 119, .42))
+    drop-shadow(0 4px 10px rgba(0, 0, 0, .28));
 }
 
 .tree-edge-glow {
   stroke: var(--tree-edge-glow, rgba(240, 201, 119, .42));
-  stroke-width: 17;
+  stroke-width: 19;
   stroke-linecap: round;
   opacity: 0;
   filter: blur(5px);

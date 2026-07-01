@@ -2237,14 +2237,14 @@
     lines.forEach((path) => {
       const len = path.getTotalLength();
       path.style.strokeDasharray = len;
-      path.style.strokeDashoffset = reduced ? 0 : len;
+      path.style.strokeDashoffset = 0;
       path.style.transition = "none";
     });
     glows.forEach((path) => {
       const len = path.getTotalLength();
       path.style.strokeDasharray = len;
-      path.style.strokeDashoffset = reduced ? 0 : len;
-      path.style.opacity = reduced ? 0.04 : 0;
+      path.style.strokeDashoffset = 0;
+      path.style.opacity = reduced ? 0.08 : 0.18;
       path.style.transition = "none";
     });
     nodes.forEach((node) => {

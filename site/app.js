@@ -1812,7 +1812,7 @@
     svg.setAttribute("viewBox", "0 0 1040 420");
 
     const defs = el("defs");
-    const grad = el("linearGradient", { id: "edge-grad", x1: "0", y1: "0", x2: "1", y2: "0" });
+    const grad = el("linearGradient", { id: "edge-grad", gradientUnits: "userSpaceOnUse", x1: "0", y1: "0", x2: "1040", y2: "0" });
     grad.appendChild(el("stop", { offset: "0%", "stop-color": "#496a46" }));
     grad.appendChild(el("stop", { offset: "50%", "stop-color": "#b4833a" }));
     grad.appendChild(el("stop", { offset: "100%", "stop-color": "#415d75" }));
@@ -1951,7 +1951,7 @@
     svg.classList.add("is-tree-graph");
 
     const defs = el("defs");
-    const grad = el("linearGradient", { id: "edge-grad", x1: "0", y1: "0", x2: "1", y2: "0" });
+    const grad = el("linearGradient", { id: "edge-grad", gradientUnits: "userSpaceOnUse", x1: "0", y1: "0", x2: "1180", y2: "0" });
     grad.appendChild(el("stop", { offset: "0%", "stop-color": "#496a46" }));
     grad.appendChild(el("stop", { offset: "52%", "stop-color": "#c99b4b" }));
     grad.appendChild(el("stop", { offset: "100%", "stop-color": "#7e8b83" }));

@@ -1883,19 +1883,32 @@ html[data-theme="dark"] .node__ring {
 }
 
 .tree-edge-line {
-  stroke-width: 6.25;
+  stroke: url(#edge-grad);
+  stroke-width: 5.5;
   stroke-opacity: 1;
   filter:
-    drop-shadow(0 0 7px rgba(240, 201, 119, .42))
+    drop-shadow(0 0 8px rgba(201, 155, 75, .42))
     drop-shadow(0 4px 10px rgba(0, 0, 0, .28));
 }
 
+.tree-edge-line.is-single {
+  stroke-width: 6.1;
+  filter:
+    drop-shadow(0 0 10px rgba(201, 155, 75, .48))
+    drop-shadow(0 4px 11px rgba(0, 0, 0, .30));
+}
+
 .tree-edge-glow {
-  stroke: var(--tree-edge-glow, rgba(240, 201, 119, .42));
-  stroke-width: 19;
+  stroke: var(--brass-2);
+  stroke-width: 18;
   stroke-linecap: round;
   opacity: 0;
   filter: blur(5px);
+}
+
+.tree-edge-glow.is-single {
+  stroke-width: 22;
+  filter: blur(6px);
 }
 
 .traveller {

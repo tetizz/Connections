@@ -820,7 +820,7 @@
       ? `${chain.foundSlotCount || chain.branchCount}/${chain.targetCount}`
       : chain.tree ? chain.branchCount : chain.found ? chain.length : "—";
     $(".graph-length-label").textContent = chain.tree ? "found" : "recorded wins";
-    renderGraph(chain);
+    renderGraph(chain, { preserveTreeProgress: true });
     renderCards(chain);
     updateShareButton(chain);
   }
@@ -1800,10 +1800,10 @@
   }
 
   // ---------- graph ----------
-  function renderGraph(chain) {
+  function renderGraph(chain, options = {}) {
     hideGraphExplorer();
     if (chain?.tree) {
-      renderTreeGraph(chain);
+      renderTreeGraph(chain, options);
       return;
     }
     const svg = $("#graph");
@@ -1929,8 +1929,24 @@
     window.__connectionsDebugRenderGraph = renderGraph;
   }
 
-  function renderTreeGraph(treeChain) {
+  function renderTreeGraph(treeChain, options = {}) {
     const svg = $("#graph");
+    const preserveProgress = Boolean(options.preserveTreeProgress && svg.classList.contains("is-tree-graph"));
+    const now = performance.now();
+    const preservedEdges = preserveProgress ? new Set(
+      Array.from(svg.querySelectorAll(".tree-edge-line"))
+        .filter((path) => {
+          const completeAt = Number(path.dataset.drawCompleteAt || 0);
+          return completeAt > 0 && completeAt <= now;
+        })
+        .map((path) => path.dataset.treeEdge)
+        .filter(Boolean),
+    ) : new Set();
+    const preservedNodes = preserveProgress ? new Set(
+      Array.from(svg.querySelectorAll(".tree-node.is-placed"))
+        .map((node) => node.dataset.treeNodeId || node.dataset.profileUser)
+        .filter(Boolean),
+    ) : new Set();
     svg.innerHTML = "";
     svg.classList.add("is-tree-graph");
 
@@ -1940,7 +1956,6 @@
     grad.appendChild(el("stop", { offset: "52%", "stop-color": "#c99b4b" }));
     grad.appendChild(el("stop", { offset: "100%", "stop-color": "#7e8b83" }));
     defs.appendChild(grad);
-    appendTreeEdgeGradients(defs);
     const clip = el("clipPath", { id: "clip" });
     clip.appendChild(el("circle", { r: 28, cx: 0, cy: 0 }));
     defs.appendChild(clip);
@@ -1957,6 +1972,7 @@
     svg.style.setProperty("--tree-graph-height", `${Math.min(2200, Math.max(620, viewHeight * 0.84))}px`);
 
     const edgesGroup = el("g", { class: "tree-edges" });
+    const graphNodeById = new Map(graph.nodes.map((node) => [node.id, node]));
     for (const edge of graph.edges) {
       const a = graph.positions.get(edge.from);
       const b = graph.positions.get(edge.to);
@@ -1966,20 +1982,19 @@
       const d = `M ${a.x} ${a.y} C ${c1x} ${a.y} ${c2x} ${b.y} ${b.x} ${b.y}`;
       const edgeKey = `${edge.from}|${edge.to}`;
       const depth = Math.max(1, Number(edge.depth || 1));
-      const strokeStyle = `stroke: url(#${treeEdgeGradientId(depth)}); --tree-edge-glow: ${treeEdgeGlow(depth)};`;
+      const fromNode = graphNodeById.get(edge.from);
+      const edgeClass = (fromNode?.children?.length || 0) <= 1 ? " is-single" : " is-split";
       edgesGroup.appendChild(el("path", {
-        class: "edge-glow tree-edge-glow",
+        class: `edge-glow tree-edge-glow${edgeClass}`,
         d,
         "data-tree-edge": edgeKey,
         "data-edge-depth": depth,
-        style: strokeStyle,
       }));
       edgesGroup.appendChild(el("path", {
-        class: "edge-line tree-edge-line",
+        class: `edge-line tree-edge-line${edgeClass}`,
         d,
         "data-tree-edge": edgeKey,
         "data-edge-depth": depth,
-        style: strokeStyle,
       }));
     }
     svg.appendChild(edgesGroup);
@@ -2031,60 +2046,10 @@
       `${treeChain.foundSlotCount || treeChain.branchCount} of ${treeChain.targetCount || treeChain.branchCount} leaderboard targets found from ${treeChain.root}; duplicate players merge into ${treeChain.branchCount} unique branch${treeChain.branchCount === 1 ? "" : "es"}.`;
 
     preloadTreeProfiles(graph.nodes);
-    animateTreeGraph(svg);
+    animateTreeGraph(svg, { preservedEdges, preservedNodes });
   }
 
   window.__connectionsDebugRenderGraph = renderGraph;
-
-  const TREE_EDGE_COLORS = [
-    ["#f0c977", "#d79a38"],
-    ["#8bd66f", "#4eb46b"],
-    ["#64d2ff", "#4d80ff"],
-    ["#b992ff", "#7c65e8"],
-    ["#ff8fb3", "#e56b8f"],
-    ["#ffb86b", "#e27a35"],
-    ["#d8ff7b", "#93c759"],
-    ["#8ff0df", "#46b8be"],
-  ];
-
-  const TREE_EDGE_GLOWS = [
-    "rgba(240, 201, 119, .58)",
-    "rgba(139, 214, 111, .46)",
-    "rgba(100, 210, 255, .45)",
-    "rgba(185, 146, 255, .42)",
-    "rgba(255, 143, 179, .42)",
-    "rgba(255, 184, 107, .44)",
-    "rgba(216, 255, 123, .38)",
-    "rgba(143, 240, 223, .4)",
-  ];
-
-  function treeEdgePaletteIndex(depth) {
-    return Math.max(0, (Number(depth) || 1) - 1) % TREE_EDGE_COLORS.length;
-  }
-
-  function treeEdgeGradientId(depth) {
-    return `tree-edge-grad-${treeEdgePaletteIndex(depth)}`;
-  }
-
-  function treeEdgeGlow(depth) {
-    return TREE_EDGE_GLOWS[treeEdgePaletteIndex(depth)];
-  }
-
-  function appendTreeEdgeGradients(defs) {
-    TREE_EDGE_COLORS.forEach(([start, end], index) => {
-      const gradient = el("linearGradient", {
-        id: `tree-edge-grad-${index}`,
-        x1: "0",
-        y1: "0",
-        x2: "1",
-        y2: "0",
-      });
-      gradient.appendChild(el("stop", { offset: "0%", "stop-color": start }));
-      gradient.appendChild(el("stop", { offset: "58%", "stop-color": end }));
-      gradient.appendChild(el("stop", { offset: "100%", "stop-color": start }));
-      defs.appendChild(gradient);
-    });
-  }
 
   function buildMergedChainTree(chains) {
     const rootPath = chains.find((chain) => Array.isArray(chain.path) && chain.path.length >= 2)?.path || [];
@@ -2224,33 +2189,36 @@
     });
   }
 
-  function animateTreeGraph(svg) {
+  function animateTreeGraph(svg, options = {}) {
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const preservedEdges = options.preservedEdges instanceof Set ? options.preservedEdges : new Set();
+    const preservedNodes = options.preservedNodes instanceof Set ? options.preservedNodes : new Set();
     const nodes = Array.from(svg.querySelectorAll(".node"));
     const lines = Array.from(svg.querySelectorAll(".edge-line"));
     const glows = Array.from(svg.querySelectorAll(".edge-glow"));
     svg.querySelector(".tree-riders")?.remove();
-    nodes.forEach((node) => {
-      node.classList.remove("is-placed");
-    });
 
     lines.forEach((path) => {
       const len = path.getTotalLength();
+      const preserved = preservedEdges.has(path.dataset.treeEdge || "");
       path.style.strokeDasharray = len;
-      path.style.strokeDashoffset = 0;
+      path.style.strokeDashoffset = reduced || preserved ? 0 : len;
       path.style.transition = "none";
     });
     glows.forEach((path) => {
       const len = path.getTotalLength();
+      const preserved = preservedEdges.has(path.dataset.treeEdge || "");
       path.style.strokeDasharray = len;
-      path.style.strokeDashoffset = 0;
-      path.style.opacity = reduced ? 0.08 : 0.18;
+      path.style.strokeDashoffset = reduced || preserved ? 0 : len;
+      path.style.opacity = reduced ? 0.08 : preserved ? treeGlowOpacity(path) : 0;
       path.style.transition = "none";
     });
     nodes.forEach((node) => {
-      node.style.opacity = reduced ? 1 : 0;
+      const nodeId = node.dataset.treeNodeId || node.dataset.profileUser || "";
+      const preserved = preservedNodes.has(nodeId);
+      node.style.opacity = reduced || preserved ? 1 : 0;
       node.style.transition = "none";
-      if (reduced) node.classList.add("is-placed");
+      node.classList.toggle("is-placed", reduced || preserved);
     });
     if (reduced) return;
 
@@ -2297,20 +2265,20 @@
     const edges = edgesByFrom.get(fromId) || [];
     if (!edges.length) return Promise.resolve();
     return Promise.all(edges.map((edge, branchIndex) => {
-      const branchDelay = branchIndex * 140;
-      const duration = 980 + Math.min(320, Number(edge.path.dataset.edgeDepth || 1) * 55);
+      const branchDelay = branchIndex * 54;
+      const duration = 760 + Math.min(220, Number(edge.path.dataset.edgeDepth || 1) * 40);
       drawTreePath(edge.path, edge.glow, branchDelay, duration);
       return rideTreePath(edge.path, riders, branchDelay, duration)
-        .then(async () => {
+        .then(() => {
           const reachedNode = nodeById?.get(edge.to);
-          await warmNodeProfileForReveal(reachedNode);
           revealTreeNode(reachedNode, 0);
+          warmNodeProfileForReveal(reachedNode);
           const nextEdges = edgesByFrom.get(edge.to) || [];
           if (!nextEdges.length) return Promise.resolve();
           return new Promise((resolve) => {
             setTimeout(() => {
               cascadeTreeRiders(edge.to, edgesByFrom, riders, nodeById).then(resolve);
-            }, 260);
+            }, 80);
           });
         });
     }));
@@ -2342,13 +2310,19 @@
 
   function drawTreePath(path, glow, delay = 0, duration = 820) {
     if (!path) return;
+    path.dataset.drawCompleteAt = String(performance.now() + delay + duration + 40);
     path.style.transition = `stroke-dashoffset ${duration}ms cubic-bezier(.2,.8,.2,1) ${delay}ms`;
     path.style.strokeDashoffset = 0;
     if (glow) {
+      glow.dataset.drawCompleteAt = path.dataset.drawCompleteAt;
       glow.style.transition = `stroke-dashoffset ${duration}ms cubic-bezier(.2,.8,.2,1) ${delay}ms, opacity .28s ease ${delay}ms`;
       glow.style.strokeDashoffset = 0;
-      glow.style.opacity = 0.26;
+      glow.style.opacity = treeGlowOpacity(path);
     }
+  }
+
+  function treeGlowOpacity(path) {
+    return path?.classList?.contains("is-single") ? 0.36 : 0.28;
   }
 
   function rideTreePath(path, riders, delay = 0, duration = 820) {

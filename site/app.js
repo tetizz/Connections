@@ -1978,7 +1978,10 @@
       if (!a || !b) continue;
       const c1x = a.x + Math.max(42, (b.x - a.x) * .46);
       const c2x = b.x - Math.max(42, (b.x - a.x) * .34);
-      const d = `M ${a.x} ${a.y} C ${c1x} ${a.y} ${c2x} ${b.y} ${b.x} ${b.y}`;
+      const dx = Math.max(1, b.x - a.x);
+      const yDelta = b.y - a.y;
+      const bow = Math.abs(yDelta) < 8 ? Math.min(26, Math.max(12, dx * .045)) : 0;
+      const d = `M ${a.x} ${a.y} C ${c1x} ${a.y - bow} ${c2x} ${b.y - bow} ${b.x} ${b.y}`;
       const edgeKey = `${edge.from}|${edge.to}`;
       const depth = Math.max(1, Number(edge.depth || 1));
       edgesGroup.appendChild(el("path", {

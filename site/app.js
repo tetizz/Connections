@@ -3847,10 +3847,15 @@
     applyTheme(current === "dark" ? "light" : "dark");
   });
   $("#intro-start")?.addEventListener("click", completeIntroGate);
+  $("#intro-close")?.addEventListener("click", completeIntroGate);
   $("#settings-modal").addEventListener("click", (e) => {
     if (e.target.id === "settings-modal") closeSettings(); // click backdrop
   });
   document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("#intro-gate")?.hidden) {
+      completeIntroGate();
+      return;
+    }
     if (e.key === "Escape" && !$("#settings-modal").hidden) closeSettings();
   });
   $("#owner-form")?.addEventListener("submit", (e) => {

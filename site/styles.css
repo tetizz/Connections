@@ -184,6 +184,14 @@ button { -webkit-tap-highlight-color: transparent; }
   color: var(--muted);
 }
 
+.top-links .home-site-button {
+  min-height: 38px;
+  padding: 0 13px;
+  color: #20160a;
+  font-size: 13px;
+  text-decoration: none;
+}
+
 .top-links a:hover {
   color: var(--ink);
 }
@@ -3305,7 +3313,7 @@ html[data-theme="dark"] .setting__btn--gold {
     align-items: flex-start;
   }
 
-  .top-links a {
+  .top-links a:not(.home-site-button) {
     display: none;
   }
 

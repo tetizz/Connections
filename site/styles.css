@@ -185,11 +185,56 @@ button { -webkit-tap-highlight-color: transparent; }
 }
 
 .top-links .home-site-button {
+  position: relative;
   min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  overflow: hidden;
   padding: 0 13px;
   color: #20160a;
   font-size: 13px;
   text-decoration: none;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 253, 248, .34),
+    0 10px 24px rgba(201, 155, 75, .13);
+  transition: transform .18s ease, box-shadow .18s ease, filter .18s ease;
+  animation: homeButtonFloat 3.4s ease-in-out infinite;
+}
+
+.top-links .home-site-button::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 0 32%, rgba(255, 253, 248, .42) 46%, transparent 60% 100%);
+  transform: translateX(-125%);
+  animation: homeButtonSweep 4.6s ease-in-out infinite;
+}
+
+.home-site-button__spark {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: #2f7f46;
+  box-shadow: 0 0 0 3px rgba(47, 127, 70, .16);
+  transform: rotate(45deg);
+  animation: homeButtonSpark 1.9s ease-in-out infinite;
+}
+
+.top-links .home-site-button span:last-child {
+  position: relative;
+}
+
+.top-links .home-site-button:hover,
+.top-links .home-site-button:focus-visible {
+  color: #140d04;
+  filter: saturate(1.06);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 253, 248, .45),
+    0 14px 30px rgba(201, 155, 75, .22);
+  transform: translateY(-1px);
 }
 
 .top-links a:hover {
@@ -3833,6 +3878,41 @@ html[data-theme="dark"] .lb-avatar {
 
 @keyframes buttonHalo {
   to { transform: rotate(360deg); }
+}
+
+@keyframes homeButtonFloat {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-1px);
+  }
+}
+
+@keyframes homeButtonSweep {
+  0%,
+  42% {
+    transform: translateX(-125%);
+  }
+  64% {
+    transform: translateX(125%);
+  }
+  100% {
+    transform: translateX(125%);
+  }
+}
+
+@keyframes homeButtonSpark {
+  0%,
+  100% {
+    opacity: .58;
+    transform: rotate(45deg) scale(.86);
+  }
+  50% {
+    opacity: 1;
+    transform: rotate(45deg) scale(1.08);
+  }
 }
 
 @keyframes chipLift {

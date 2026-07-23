@@ -22,10 +22,10 @@ window.ChessChain = class ChessChain {
     this._cache = cache;            // optional shared Cloudflare GameCache
     this._maxRetries = Number.isFinite(options.maxRetries)
       ? Math.max(1, options.maxRetries)
-      : 8;
+      : 4;
     this._fetchTimeout = Number.isFinite(options.fetchTimeout)
       ? Math.max(1000, options.fetchTimeout)
-      : 0;
+      : 12000;
     this._archiveLimit = Number.isFinite(options.archiveLimit)
       ? Math.max(1, options.archiveLimit)
       : Infinity;
@@ -49,7 +49,6 @@ window.ChessChain = class ChessChain {
   }
 
   async fetchJSON(url) {
-    this.stats.apiCalls++;
     const MAX_RETRIES = this._maxRetries;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       let retryAfterDelay = 0;
@@ -59,28 +58,41 @@ window.ChessChain = class ChessChain {
         ? setTimeout(() => controller.abort(), this._fetchTimeout)
         : null;
       try {
+        this.stats.apiCalls++;
         const res = await fetch(url, {
           headers: { "Accept": "application/json" },
           signal: controller?.signal,
         });
         if (res.status === 429) {
-          if (attempt === MAX_RETRIES - 1) throw new Error(`HTTP 429 on ${url}`);
           const retryAfter = Number(res.headers.get("Retry-After"));
           retryAfterDelay = Number.isFinite(retryAfter) && retryAfter > 0
             ? Math.min(2000, Math.ceil(retryAfter * 1000))
             : 0;
+          if (attempt === MAX_RETRIES - 1 || retryAfterDelay === 0) {
+            const error = new Error(`HTTP 429 on ${url}`);
+            error.status = 429;
+            error.retryable = retryAfterDelay > 0;
+            throw error;
+          }
           if (retryAfterDelay > 0) {
             this.log(`chess.com throttled us, pausing ${(retryAfterDelay/1000).toFixed(1)}s`);
           }
         } else {
-          if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
+          if (!res.ok) {
+            const error = new Error(`HTTP ${res.status} on ${url}`);
+            error.status = res.status;
+            error.retryable = res.status === 408 || res.status === 425 || res.status >= 500;
+            throw error;
+          }
           return await res.json();
         }
       } catch (e) {
         if (e.name === "AbortError") {
           e = new Error(`Timed out waiting for ${url}`);
+          e.retryable = true;
         }
-        if (attempt === MAX_RETRIES - 1) throw e;
+        if (e.status == null && e.retryable == null) e.retryable = true;
+        if (!e.retryable || attempt === MAX_RETRIES - 1) throw e;
       } finally {
         if (timeout) clearTimeout(timeout);
         this._release();
@@ -146,12 +158,25 @@ window.ChessChain = class ChessChain {
     this.log(`reading ${u}'s ${this._archiveLabel()} (${selectedArchives.length}/${archives.length} archives)…`);
     const games = [];
     // fetch archives — rely on the global _maxInflight gate for throttling
-    const tasks = selectedArchives.map((a) => async () => {
-      try { return await this.fetchJSON(a); }
-      catch { return { games: [] }; }
+    const tasks = selectedArchives.map((archiveUrl) => async () => {
+      try {
+        return { ok: true, data: await this.fetchJSON(archiveUrl), archiveUrl };
+      } catch (error) {
+        return { ok: false, error, archiveUrl };
+      }
     });
     const results = await this.runThrottled(tasks, this._maxInflight);
-    for (const data of results) {
+    const failed = results.filter((result) => !result.ok);
+    if (failed.length) {
+      const error = failed[0].error || new Error("Chess.com game archive unavailable");
+      error.message =
+        `Could not read ${failed.length} of ${selectedArchives.length} game archives for ${u}: ${error.message}`;
+      // Never turn an upstream failure into an empty history: doing so creates
+      // confident but false "no connection" results and poisons the cache.
+      throw error;
+    }
+    for (const result of results) {
+      const data = result.data;
       for (const g of data.games || []) {
         if (g.rules !== "chess") continue;  // skip variants
         games.push({

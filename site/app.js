@@ -27,6 +27,11 @@
   const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
   const SUGGEST_MIN_CHARS = 2;
   const SUGGEST_LIMIT = 10;
+  const USERNAME_MAX_LENGTH = 40;
+  const REQUEST_TIMEOUT_MS = 10000;
+  const SERVER_SEARCH_HARD_LIMIT_MS = 6 * 60 * 1000;
+  const SERVER_POLL_RETRY_LIMIT = 5;
+  const TERMINAL_SEARCH_STATUSES = new Set(["found", "not_found", "timeout", "failed", "expired"]);
   const OWNER_ANALYTICS_LIMIT = 30;
   const TOP_TRACE_BATCH_LIMIT = 30;
   const TOP_TRACE_CONCURRENCY = 6;
@@ -76,6 +81,7 @@
     ownerCode: "",
     queueTimer: null,
     searchJobs: new Map(),
+    activeSearchOwner: "",
     quickTargetGroups: [],
     topTraceRunId: 0,
     topTraceResults: [],
@@ -109,10 +115,91 @@
     return p?.name || p?.username || u;
   };
   const avatarOf = (u) => state.players?.[u.toLowerCase()]?.avatar || null;
-  const cleanUsernameInput = (value) =>
-    String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  const cleanUsernameInput = (value) => {
+    let input = String(value || "").trim();
+    if (!input) return "";
+
+    const profileUrl = input.match(
+      /^(?:https?:\/\/)?(?:www\.)?chess\.com\/member\/([^/?#\s]+)(?:[/?#].*)?$/i
+    );
+    const apiUrl = input.match(
+      /^(?:https?:\/\/)?api\.chess\.com\/pub\/player\/([^/?#\s]+)(?:[/?#].*)?$/i
+    );
+    if (profileUrl || apiUrl) {
+      try {
+        input = decodeURIComponent((profileUrl || apiUrl)[1]);
+      } catch {
+        return "";
+      }
+    } else if (input.startsWith("@")) {
+      input = input.slice(1);
+    }
+
+    const username = input.trim().toLowerCase();
+    return username.length <= USERNAME_MAX_LENGTH && /^[a-z0-9_-]+$/.test(username)
+      ? username
+      : "";
+  };
+  const usernameInputError = (value, label) => {
+    const input = String(value || "").trim();
+    if (!input) return `put in ${label} first.`;
+    return `“${input.slice(0, 80)}” is not a valid Chess.com username. ` +
+      "Use the handle, @handle, or a Chess.com member link.";
+  };
   const isBlockedUsername = (username) => BLOCKED_USERNAMES.has(cleanUsernameInput(username));
   const pathHasBlockedUser = (path) => Array.isArray(path) && path.some(isBlockedUsername);
+
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function retryAfterMs(response) {
+    const value = String(response?.headers?.get("Retry-After") || "").trim();
+    if (!value) return 0;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds)) return Math.max(0, Math.min(5000, Math.ceil(seconds * 1000)));
+    const date = Date.parse(value);
+    return Number.isFinite(date) ? Math.max(0, Math.min(5000, date - Date.now())) : 0;
+  }
+
+  async function fetchJsonWithRetry(url, init = {}, options = {}) {
+    const attempts = Math.max(1, Number(options.attempts) || 1);
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs) || REQUEST_TIMEOUT_MS);
+    let lastError = null;
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { ...init, signal: controller.signal });
+        const contentType = String(response.headers.get("Content-Type") || "");
+        const data = contentType.includes("json")
+          ? await response.json().catch(() => null)
+          : null;
+        if (response.ok) return { data, response };
+
+        const error = new Error(data?.error || `HTTP ${response.status}`);
+        error.status = response.status;
+        error.retryAfterMs = retryAfterMs(response);
+        error.retryable = response.status === 408 || response.status === 425 ||
+          response.status === 429 || response.status >= 500;
+        throw error;
+      } catch (error) {
+        const normalized = error?.name === "AbortError"
+          ? Object.assign(new Error("request timed out"), { retryable: true })
+          : error;
+        if (normalized && normalized.status == null && normalized.retryable == null) {
+          normalized.retryable = true;
+        }
+        lastError = normalized;
+        if (!normalized?.retryable || attempt === attempts - 1) throw normalized;
+        const delay = normalized.retryAfterMs ||
+          Math.min(1200, 180 * (2 ** attempt));
+        await wait(delay);
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw lastError || new Error("request failed");
+  }
 
   // ---------- data load ----------
   async function loadShowcase() {
@@ -369,7 +456,8 @@
   }
 
   async function runTopPlayersTrace() {
-    const start = cleanUsernameInput($("#search-start")?.value || "");
+    const startRaw = $("#search-start")?.value || "";
+    const start = cleanUsernameInput(startRaw);
     const btn = $("#trace-top-players");
     if (!btn) return;
     if (!introComplete()) {
@@ -377,10 +465,11 @@
       return;
     }
     if (!start) {
-      showStatus("error", "input your username first.");
+      showStatus("error", usernameInputError(startRaw, "your username"));
       $("#search-start")?.focus();
       return;
     }
+    $("#search-start").value = start;
     localStorage.setItem(LS_KEY, start);
     $("#setting-username").value = start;
     const candidates = topTraceCandidates().filter((player) => player.username !== start);
@@ -672,7 +761,10 @@
     const input = $(config.input);
     if (!box || !input || !state.suggest.focused || state.suggest.field !== field || query.length < SUGGEST_MIN_CHARS) return;
     state.suggest.items = items.slice(0, SUGGEST_LIMIT);
-    state.suggest.activeIndex = state.suggest.items.length ? 0 : -1;
+    // Keep the exact typed handle selected by default. Suggestions only take
+    // over after the visitor explicitly moves through them with the arrow keys
+    // or clicks one.
+    state.suggest.activeIndex = -1;
     input.setAttribute("aria-expanded", "true");
     for (const other of ["start", "target"]) {
       if (other !== field) {
@@ -725,7 +817,12 @@
   function moveUsernameSuggest(delta) {
     if (!state.suggest.items.length) return;
     const config = suggestConfig();
-    state.suggest.activeIndex = (state.suggest.activeIndex + delta + state.suggest.items.length) % state.suggest.items.length;
+    if (state.suggest.activeIndex < 0) {
+      state.suggest.activeIndex = delta > 0 ? 0 : state.suggest.items.length - 1;
+    } else {
+      state.suggest.activeIndex =
+        (state.suggest.activeIndex + delta + state.suggest.items.length) % state.suggest.items.length;
+    }
     $(config.box)?.querySelectorAll(".username-suggest__row").forEach((row, index) => {
       const active = index === state.suggest.activeIndex;
       row.classList.toggle("is-active", active);
@@ -2802,8 +2899,77 @@
     return parts.join(" · ");
   }
 
+  async function checkSearchPlayer(username) {
+    const key = cleanUsernameInput(username);
+    if (!key) return { username: key, exists: false, profile: null };
+    const existing = state.players?.[key];
+    if (existing?.profileExists === true || existing?.profileComplete) {
+      return { username: key, exists: true, profile: existing };
+    }
+
+    try {
+      const { data } = await fetchJsonWithRetry(
+        `https://api.chess.com/pub/player/${encodeURIComponent(key)}`,
+        { headers: { "Accept": "application/json" } },
+        { attempts: 2, timeoutMs: 7000 }
+      );
+      const profile = data && typeof data === "object" ? data : null;
+      if (!profile) return { username: key, exists: null, profile: null };
+      const shaped = {
+        ...(existing || {}),
+        ...metaShape({ username: key, ...profile }),
+        profileExists: true,
+      };
+      state.players = state.players || {};
+      state.players[key] = shaped;
+      return { username: key, exists: true, profile: shaped };
+    } catch (error) {
+      if (error?.status === 404 || error?.status === 410) {
+        return { username: key, exists: false, profile: null };
+      }
+      // A rate limit or network failure must not be mistaken for a missing
+      // player. The Worker can still validate and search the handle.
+      return { username: key, exists: null, profile: null, error };
+    }
+  }
+
+  async function validateSearchPlayers(start, target) {
+    const [startResult, targetResult] = await Promise.all([
+      checkSearchPlayer(start),
+      checkSearchPlayer(target),
+    ]);
+    if (startResult.exists === false) {
+      return { valid: false, missing: start };
+    }
+    if (targetResult.exists === false) {
+      return { valid: false, missing: target };
+    }
+    return { valid: true, uncertain: startResult.exists == null || targetResult.exists == null };
+  }
+
+  async function lookupFallbackPlayer(engine, username) {
+    try {
+      return {
+        outcome: "found",
+        profile: await engine.fetchJSON(engine.API + username),
+        error: null,
+      };
+    } catch (error) {
+      if (error?.status === 404 || error?.status === 410) {
+        return { outcome: "missing", profile: null, error };
+      }
+      const timedOut = error?.name === "AbortError" ||
+        /timed out|timeout/i.test(String(error?.message || ""));
+      return {
+        outcome: timedOut ? "timeout" : "unavailable",
+        profile: null,
+        error,
+      };
+    }
+  }
+
   async function fetchProfile(username) {
-    const key = String(username || "").trim().toLowerCase();
+    const key = cleanUsernameInput(username);
     if (!key) return null;
     const existing = state.players?.[key];
     if (existing?.profileComplete) return existing;
@@ -2814,32 +2980,35 @@
       let profile = null;
       if (/^https?:\/\//.test(remoteBase)) {
         try {
-          const res = await fetch(`${remoteBase}/profile?username=${encodeURIComponent(key)}`, {
-            headers: { "Accept": "application/json" },
-          });
-          if (res.ok) {
-            const data = await res.json();
-            profile = data.profile || null;
-          }
+          const { data } = await fetchJsonWithRetry(
+            `${remoteBase}/profile?username=${encodeURIComponent(key)}`,
+            { headers: { "Accept": "application/json" } },
+            { attempts: 2, timeoutMs: 7000 }
+          );
+          profile = data?.profile || null;
         } catch {
           // fall through to Chess.com direct lookup
         }
       }
       if (!profile) {
         try {
-          const res = await fetch(`https://api.chess.com/pub/player/${encodeURIComponent(key)}`, {
-            headers: { "Accept": "application/json" },
-          });
-          if (res.ok) profile = await res.json();
+          const { data } = await fetchJsonWithRetry(
+            `https://api.chess.com/pub/player/${encodeURIComponent(key)}`,
+            { headers: { "Accept": "application/json" } },
+            { attempts: 2, timeoutMs: 7000 }
+          );
+          profile = data || null;
         } catch {
           profile = null;
         }
       }
+      if (!profile) return existing || null;
       const shaped = metaShape({ username: key, ...(profile || {}) });
       state.players = state.players || {};
       state.players[key] = {
         ...(state.players[key] || {}),
         ...shaped,
+        profileExists: true,
         profileComplete: true,
       };
       refreshGraphProfileNodes(key);
@@ -2847,7 +3016,11 @@
     })();
 
     state.profilePromises.set(key, promise);
-    return promise;
+    try {
+      return await promise;
+    } finally {
+      if (state.profilePromises.get(key) === promise) state.profilePromises.delete(key);
+    }
   }
 
   function refreshGraphProfileNodes(username) {
@@ -3040,6 +3213,7 @@
     const remoteBase = workerBase();
     if (!remoteBase) return false;
 
+    let activeJob = null;
     let lastMessage = "";
     const logLine = (msg) => {
       if (!logEl || msg === lastMessage) return;
@@ -3058,30 +3232,57 @@
       status.className = "search__status is-working";
       logEl.hidden = false;
       logEl.innerHTML = "";
+      showStatus("working", "checking both Chess.com usernames...");
+      const validation = await validateSearchPlayers(start, target);
+      if (!validation.valid) {
+        showStatus("error",
+          `couldn't find “${esc(validation.missing)}” on Chess.com. ` +
+          "Check the spelling or paste the member profile link.");
+        renderChain({
+          target,
+          display: target,
+          found: false,
+          length: null,
+          path: [],
+          hops: [],
+        });
+        recordSearchEvent("not_found", {
+          ...analyticsBase,
+          error: `player not found: ${validation.missing}`,
+        });
+        return true;
+      }
+      if (validation.uncertain) {
+        logLine("Chess.com profile lookup was slow; the search service will verify the handles");
+      }
+
       showStatus("working", "starting server search...");
       logLine(`queued ${start} -> ${target} (${mode.label})`);
 
-      const res = await fetch(`${remoteBase}/search/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({
-          start,
-          target,
-          range,
-          searchId: analyticsBase.searchId,
-          knownChain,
-        }),
-      });
-      if (!res.ok) throw new Error(`job start failed (${res.status})`);
-      const data = await res.json();
-      const job = data.job;
+      const { data } = await fetchJsonWithRetry(
+        `${remoteBase}/search/start`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({
+            start,
+            target,
+            range,
+            searchId: analyticsBase.searchId,
+            knownChain,
+          }),
+        },
+        { attempts: 3, timeoutMs: 12000 }
+      );
+      const job = data?.job;
       if (!job?.id) throw new Error("job start failed");
+      activeJob = job;
       saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId });
       renderSearchQueue(job);
       let showedInstantChain = false;
       let instantChainKey = "";
       if (job.chain?.found) {
-        if (["found", "not_found", "timeout", "failed"].includes(job.status)) {
+        if (TERMINAL_SEARCH_STATUSES.has(job.status)) {
           clearActiveJob(job.id);
           finishSearchQueue(job);
           await applyServerChain(job, analyticsBase);
@@ -3129,9 +3330,14 @@
           recordOutcome: showedInstantChain && finalChainKey === instantChainKey ? "saved" : "found",
         });
       } else {
-        const outcome = finished?.outcome || (finished?.status === "timeout" ? "timeout" : "not_found");
-        showStatus(outcome === "timeout" ? "error" : "error",
-          finished?.progress || "no connection found in this search.");
+        const rawOutcome = finished?.outcome ||
+          (finished?.status === "timeout" ? "timeout" :
+            finished?.status === "not_found" ? "not_found" : "error");
+        const outcome = ["timeout", "not_found"].includes(rawOutcome) ? rawOutcome : "error";
+        showStatus("error", finished?.progress ||
+          (finished?.status === "expired"
+            ? "This saved search expired. Start it again to get a fresh result."
+            : "no connection found in this search."));
         renderChain({
           target,
           display: target,
@@ -3153,6 +3359,12 @@
       return true;
     } catch (error) {
       logLine(`server search unavailable: ${error.message}`);
+      if (activeJob?.id) {
+        showStatus("error",
+          "The connection search is still saved, but live updates paused. " +
+          "Reload this page to resume the same search instead of starting over.");
+        return true;
+      }
       return false;
     } finally {
       btn.disabled = false;
@@ -3163,31 +3375,54 @@
     const remoteBase = workerBase();
     if (!remoteBase || !id) return null;
     let job = null;
-    for (let attempt = 0; ; attempt++) {
+    let attempt = 0;
+    let consecutiveFailures = 0;
+    const pollStartedAt = Date.now();
+    for (;;) {
+      if (Date.now() - pollStartedAt >= SERVER_SEARCH_HARD_LIMIT_MS) {
+        const error = new Error("live updates timed out while the saved search kept running");
+        error.code = "SEARCH_POLL_TIMEOUT";
+        throw error;
+      }
       const previous = state.searchJobs.get(id);
       const previousStats = previous?.stats || {};
       const params = new URLSearchParams({ id });
       if (Number(previousStats.expanded || 0) > 0) params.set("minExpanded", String(Number(previousStats.expanded || 0)));
       if (Number(previousStats.cached || 0) > 0) params.set("minCached", String(Number(previousStats.cached || 0)));
-      const res = await fetch(`${remoteBase}/search/job?${params.toString()}`, {
-        headers: { "Accept": "application/json" },
-      });
-      if (!res.ok) throw new Error(`job poll failed (${res.status})`);
-      const data = await res.json();
-      job = mergeSearchJobSnapshot(data.job);
+      let data = null;
+      try {
+        ({ data } = await fetchJsonWithRetry(
+          `${remoteBase}/search/job?${params.toString()}`,
+          { headers: { "Accept": "application/json" } },
+          { attempts: 2, timeoutMs: 12000 }
+        ));
+        consecutiveFailures = 0;
+      } catch (error) {
+        consecutiveFailures++;
+        if (!error?.retryable || consecutiveFailures > SERVER_POLL_RETRY_LIMIT) throw error;
+        const retryDelay = Math.min(3000, error.retryAfterMs || 300 * (2 ** (consecutiveFailures - 1)));
+        if (logLine) {
+          logLine(`connection hiccup; retrying saved search (${consecutiveFailures}/${SERVER_POLL_RETRY_LIMIT})`);
+        }
+        await wait(retryDelay);
+        continue;
+      }
+
+      job = mergeSearchJobSnapshot(data?.job);
       if (!job) throw new Error("job missing");
       if (!background) showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
       if (job.chain?.found && !background) return { ...job, status: "found" };
-      if (["found", "not_found", "timeout", "failed"].includes(job.status)) return job;
+      if (TERMINAL_SEARCH_STATUSES.has(job.status)) return job;
       await new Promise((resolve) => setTimeout(resolve, attempt < 20 ? 120 : 300));
+      attempt++;
     }
   }
 
   function mergeSearchJobSnapshot(job) {
     if (!job?.id) return job;
     const previous = state.searchJobs.get(job.id);
-    const terminal = new Set(["found", "not_found", "timeout", "failed"]);
+    const terminal = TERMINAL_SEARCH_STATUSES;
     if (!previous) {
       state.searchJobs.set(job.id, job);
       return job;
@@ -3270,6 +3505,18 @@
     }
   }
 
+  function resetSearchQueue() {
+    clearInterval(state.queueTimer);
+    state.queueTimer = null;
+    const panel = $("#search-queue");
+    if (panel) panel.hidden = true;
+    const log = $("#search-log");
+    if (log) {
+      log.hidden = true;
+      log.innerHTML = "";
+    }
+  }
+
   function compactJobId(id) {
     const text = String(id || "");
     return text.length > 16 ? `${text.slice(0, 8)}…${text.slice(-5)}` : text || "—";
@@ -3287,7 +3534,9 @@
       recordOutcome = "found",
       submit = true,
       scroll = true,
+      isCurrent = () => true,
     } = options;
+    if (!isCurrent()) return false;
     const chain = job.chain;
     state.players = state.players || {};
     for (const [username, profile] of Object.entries(job.players || {})) {
@@ -3302,6 +3551,7 @@
       fetchJSON: (url) => fetch(url, { headers: { "Accept": "application/json" } }).then((res) => res.json()),
       API: "https://api.chess.com/pub/player/",
     });
+    if (!isCurrent()) return false;
     if (checking) {
       showStatus("working",
         `loaded saved connection instantly — checking for a shorter route.`);
@@ -3329,6 +3579,7 @@
       quality: qualityFromChain(chain),
     });
     if (scroll) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+    return true;
   }
 
   function saveActiveJob(job) {
@@ -3360,6 +3611,13 @@
       clearActiveJob();
       return;
     }
+    const resumeSearchId = record.searchId || record.id;
+    const resumeOwner = `resume:${resumeSearchId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    state.activeSearchId = resumeSearchId;
+    state.activeSearchOwner = resumeOwner;
+    const ownsResume = () =>
+      state.activeSearchId === resumeSearchId && state.activeSearchOwner === resumeOwner;
+
     $("#search-start").value = record.start || $("#search-start").value;
     $("#search-target").value = record.target || $("#search-target").value;
     showStatus("working", "resuming search...");
@@ -3373,26 +3631,46 @@
     try {
       const job = await pollServerSearchJob(record.id, {
         analyticsBase: {
-          searchId: record.searchId || record.id,
+          searchId: resumeSearchId,
           start: record.start,
           target: record.target,
           range: record.range,
           depth: AUTO_SEARCH_DEPTH,
         },
       });
+      if (!ownsResume()) return;
       clearActiveJob(record.id);
+      if (!ownsResume()) return;
       finishSearchQueue(job);
       if (job?.chain?.found) {
         await applyServerChain(job, {
-          searchId: record.searchId || record.id,
+          searchId: resumeSearchId,
           start: record.start,
           target: record.target,
           range: record.range,
           depth: AUTO_SEARCH_DEPTH,
+        }, { isCurrent: ownsResume });
+      } else if (job) {
+        if (!ownsResume()) return;
+        showStatus("error", job.progress || "The saved search finished without a connection.");
+        if (!ownsResume()) return;
+        renderChain({
+          target: record.target,
+          display: record.target,
+          found: false,
+          length: null,
+          path: [],
+          hops: [],
         });
       }
-    } catch {
-      clearActiveJob(record.id);
+    } catch (error) {
+      if (!ownsResume()) return;
+      saveActiveJob(record);
+      if (!ownsResume()) return;
+      showStatus("error",
+        "Could not resume live updates yet. The saved search is still available; reload to try again.");
+      const message = $("#queue-message");
+      if (message) message.textContent = error?.message || "Resume temporarily unavailable.";
     }
   }
 
@@ -3415,9 +3693,16 @@
     const btn = $(".search__btn");
     const mode = parseSearchMode(range);
     const depth = AUTO_SEARCH_DEPTH;
+    resetSearchQueue();
 
-    if (!start || !target) {
-      showStatus("error", "put in both usernames first.");
+    if (!start) {
+      showStatus("error", usernameInputError(startRaw, "your username"));
+      $("#search-start")?.focus();
+      return;
+    }
+    if (!target) {
+      showStatus("error", usernameInputError(targetRaw, "the target username"));
+      $("#search-target")?.focus();
       return;
     }
     if (start === target) {
@@ -3428,9 +3713,12 @@
       showStatus("error", "that player is not available.");
       return;
     }
+    $("#search-start").value = start;
+    $("#search-target").value = target;
     const searchStartedAt = performance.now();
     const analyticsBase = { searchId: newSearchEventId(), start, target, depth, range };
     state.activeSearchId = analyticsBase.searchId;
+    state.activeSearchOwner = `search:${analyticsBase.searchId}`;
     recordSearchEvent("started", analyticsBase);
 
     // remember the username for next time
@@ -3541,23 +3829,51 @@
 
     try {
       // check both players exist + grab their info for the display
-      const [startMeta, targetMeta] = await Promise.all([
-        engine.fetchJSON(engine.API + start).catch(() => null),
-        engine.fetchJSON(engine.API + target).catch(() => null),
+      const [startLookup, targetLookup] = await Promise.all([
+        lookupFallbackPlayer(engine, start),
+        lookupFallbackPlayer(engine, target),
       ]);
-      if (!startMeta) {
-        showStatus("error", `couldn't find "${esc(start)}" on chess.com — check the spelling?`);
-        recordSearchEvent("not_found", {
+      const lookupFailure = [startLookup, targetLookup].find((lookup) => lookup.outcome !== "found");
+      if (lookupFailure) {
+        const username = lookupFailure === startLookup ? start : target;
+        if (lookupFailure.outcome === "missing") {
+          showStatus("error", `couldn't find "${esc(username)}" on Chess.com — check the spelling?`);
+          recordSearchEvent("not_found", {
+            ...analyticsBase,
+            durationMs: performance.now() - searchStartedAt,
+            error: lookupFailure.error?.message || "player not found",
+          });
+          return;
+        }
+        if (lookupFailure.outcome === "timeout") {
+          showStatus("error",
+            `Chess.com timed out while checking "${esc(username)}". ` +
+            "No missing-player result was saved; try the search again.");
+          recordSearchEvent("timeout", {
+            ...analyticsBase,
+            durationMs: performance.now() - searchStartedAt,
+            error: lookupFailure.error?.message || "profile lookup timed out",
+          });
+          return;
+        }
+        showStatus("error",
+          `Chess.com player lookup is temporarily unavailable for "${esc(username)}". ` +
+          "No missing-player result was saved; try again in a moment.");
+        recordSearchEvent("error", {
           ...analyticsBase,
           durationMs: performance.now() - searchStartedAt,
+          error: lookupFailure.error?.message || "profile lookup unavailable",
         });
         return;
       }
-      if (!targetMeta) {
-        showStatus("error", `couldn't find "${esc(target)}" on chess.com — check the spelling?`);
-        recordSearchEvent("not_found", {
+      const startMeta = startLookup.profile;
+      const targetMeta = targetLookup.profile;
+      if (!startMeta || !targetMeta) {
+        showStatus("error", "Chess.com player lookup returned an incomplete response. Try again.");
+        recordSearchEvent("error", {
           ...analyticsBase,
           durationMs: performance.now() - searchStartedAt,
+          error: "profile lookup returned no profile",
         });
         return;
       }

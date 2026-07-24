@@ -238,7 +238,9 @@ def get_std_games(username, deadline=None):
     """All standard-chess games for a user. Cached on disk + in memory.
 
     Each game is a slim dict. A refresh is only committed if the archive list
-    and every monthly archive are fetched successfully.
+    and every available monthly archive are fetched successfully. Chess.com's
+    archive index can retain entries whose monthly resource was removed; a
+    definitive 404/410 for one of those entries is treated as an empty month.
     """
     u = username.lower()
     now = time.time()
@@ -291,6 +293,17 @@ def get_std_games(username, deadline=None):
                 raise ValueError("monthly archive has no games list")
         except SearchIncompleteError:
             raise
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (404, 410):
+                raise GameDataRefreshError(
+                    f"incomplete game history for {u}: failed archive {arch}"
+                ) from exc
+            # The public archive index sometimes points at a month that the
+            # API itself reports as permanently absent (for example,
+            # danielnaroditsky/2020/12). There is no public game payload to
+            # merge in that case, so continue with an authoritative empty
+            # month instead of making every scheduled refresh fail forever.
+            monthly_games = []
         except Exception as exc:
             raise GameDataRefreshError(
                 f"incomplete game history for {u}: failed archive {arch}"

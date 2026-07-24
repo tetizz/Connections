@@ -152,6 +152,61 @@ class GameCacheTests(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             self.assertEqual(json.load(f), original)
 
+    def test_missing_month_listed_by_api_is_treated_as_empty(self):
+        for status in (404, 410):
+            with self.subTest(status=status):
+                username = f"alice{status}"
+                missing_month = urllib.error.HTTPError(
+                    "https://archive/missing",
+                    status,
+                    "not found",
+                    {},
+                    None,
+                )
+                self.addCleanup(missing_month.close)
+
+                def fake_fetch(url):
+                    if url.endswith("/games/archives"):
+                        return {
+                            "archives": [
+                                "https://archive/available",
+                                "https://archive/missing",
+                            ]
+                        }
+                    if url.endswith("/available"):
+                        return {"games": [sample_game()]}
+                    raise missing_month
+
+                with mock.patch.object(chain, "fetch", side_effect=fake_fetch):
+                    games = chain.get_std_games(username)
+
+                self.assertEqual(len(games), 1)
+                self.assertEqual(games[0]["white"], "alice")
+
+    def test_server_error_for_listed_month_is_not_treated_as_empty(self):
+        unavailable_month = urllib.error.HTTPError(
+            "https://archive/unavailable",
+            503,
+            "service unavailable",
+            {},
+            None,
+        )
+        self.addCleanup(unavailable_month.close)
+
+        def fake_fetch(url):
+            if url.endswith("/games/archives"):
+                return {"archives": ["https://archive/unavailable"]}
+            raise unavailable_month
+
+        with mock.patch.object(chain, "fetch", side_effect=fake_fetch):
+            with self.assertRaisesRegex(
+                chain.GameDataRefreshError,
+                "failed archive https://archive/unavailable",
+            ):
+                chain.get_std_games("alice")
+
+        self.assertFalse(os.path.exists(chain.cache_path("alice")))
+
     def test_prefetch_propagates_refresh_failures(self):
         with mock.patch.object(
             chain, "get_std_games",

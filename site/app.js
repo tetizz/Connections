@@ -27,7 +27,7 @@
   const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
   const SUGGEST_MIN_CHARS = 2;
   const SUGGEST_LIMIT = 10;
-  const USERNAME_MAX_LENGTH = 40;
+  const USERNAME_MAX_LENGTH = 50;
   const REQUEST_TIMEOUT_MS = 10000;
   const SERVER_SEARCH_HARD_LIMIT_MS = 6 * 60 * 1000;
   const SERVER_POLL_RETRY_LIMIT = 5;
@@ -843,7 +843,7 @@
       $("#search-target").value = value;
       setActiveChip(value);
       hideUsernameSuggest();
-      $(".search__btn")?.focus();
+      $("#trace-chain")?.focus();
       return;
     }
     $("#search-start").value = value;
@@ -1306,10 +1306,22 @@
     }
   }
 
-  function submitLeaderboardChain(start, target, chain) {
+  function submitLeaderboardChain(
+    start,
+    target,
+    chain,
+    range = $("#search-range")?.value || "auto",
+  ) {
     if (!window.Leaderboard || !chain?.found || !Array.isArray(chain.path)) return;
     if (isBlockedUsername(start) || isBlockedUsername(target) || pathHasBlockedUser(chain.path)) return;
-    window.Leaderboard.submit(start, target, connectionCount(chain.path), chain.path, chain.hops || [])
+    window.Leaderboard.submit(
+      start,
+      target,
+      connectionCount(chain.path),
+      chain.path,
+      chain.hops || [],
+      range,
+    )
       .then(() => window.Leaderboard && window.Leaderboard.load());
   }
 
@@ -1379,7 +1391,14 @@
         const item = queue[cursor++];
         state.topTraceSubmittedKeys.add(item.key);
         try {
-          await window.Leaderboard.submit(start, item.target, connectionCount(item.path), item.path, item.branch.hops || []);
+          await window.Leaderboard.submit(
+            start,
+            item.target,
+            connectionCount(item.path),
+            item.path,
+            item.branch.hops || [],
+            "auto",
+          );
           submitted++;
         } catch {
           state.topTraceSubmittedKeys.delete(item.key);
@@ -3212,6 +3231,8 @@
   async function runServerSearchFlow({ start, target, range, analyticsBase, mode, btn, status, logEl, knownChain = null }) {
     const remoteBase = workerBase();
     if (!remoteBase) return false;
+    const searchOwner = `search:${analyticsBase.searchId}`;
+    const isCurrent = () => state.activeSearchOwner === searchOwner;
 
     let activeJob = null;
     let lastMessage = "";
@@ -3234,6 +3255,7 @@
       logEl.innerHTML = "";
       showStatus("working", "checking both Chess.com usernames...");
       const validation = await validateSearchPlayers(start, target);
+      if (!isCurrent()) return true;
       if (!validation.valid) {
         showStatus("error",
           `couldn't find “${esc(validation.missing)}” on Chess.com. ` +
@@ -3274,6 +3296,7 @@
         },
         { attempts: 3, timeoutMs: 12000 }
       );
+      if (!isCurrent()) return true;
       const job = data?.job;
       if (!job?.id) throw new Error("job start failed");
       activeJob = job;
@@ -3285,7 +3308,7 @@
         if (TERMINAL_SEARCH_STATUSES.has(job.status)) {
           clearActiveJob(job.id);
           finishSearchQueue(job);
-          await applyServerChain(job, analyticsBase);
+          await applyServerChain(job, analyticsBase, { isCurrent });
           return true;
         }
         showedInstantChain = true;
@@ -3294,22 +3317,29 @@
           checking: false,
           recordOutcome: "saved",
           submit: true,
+          isCurrent,
         });
         logLine("loaded saved connection instantly; checking for a shorter route");
         showStatus("done",
           `✓ loaded saved connection — ${esc(start)} connects to ${esc(target)} in ` +
           `${stepText((job.chain.path || []).length - 1)}. Checking for a shorter route in the background.`);
         btn.disabled = false;
-        pollServerSearchJob(job.id, { analyticsBase, logLine, background: true })
+        pollServerSearchJob(job.id, {
+          analyticsBase,
+          logLine,
+          background: true,
+          isCurrent,
+        })
           .then(async (finished) => {
+            if (!isCurrent()) return;
             clearActiveJob(job.id);
-            if (state.activeSearchId !== analyticsBase.searchId) return;
             finishSearchQueue(finished);
             if (finished?.chain?.found) {
               const finalChainKey = chainKey(finished.chain.path || []);
               await applyServerChain(finished, analyticsBase, {
                 recordOutcome: finalChainKey === instantChainKey ? "saved" : "found",
                 scroll: finalChainKey !== instantChainKey,
+                isCurrent,
               });
             }
           })
@@ -3317,17 +3347,23 @@
             logLine(`shorter-route check paused: ${error.message}`);
           })
           .finally(() => {
-            if (state.activeSearchId === analyticsBase.searchId) btn.disabled = false;
+            if (isCurrent()) btn.disabled = false;
           });
         return true;
       }
-      const finished = await pollServerSearchJob(job.id, { analyticsBase, logLine });
+      const finished = await pollServerSearchJob(job.id, {
+        analyticsBase,
+        logLine,
+        isCurrent,
+      });
+      if (!isCurrent()) return true;
       clearActiveJob(job.id);
       finishSearchQueue(finished);
       if (finished?.chain?.found) {
         const finalChainKey = chainKey(finished.chain.path || []);
         await applyServerChain(finished, analyticsBase, {
           recordOutcome: showedInstantChain && finalChainKey === instantChainKey ? "saved" : "found",
+          isCurrent,
         });
       } else {
         const rawOutcome = finished?.outcome ||
@@ -3358,6 +3394,8 @@
       }
       return true;
     } catch (error) {
+      if (error?.code === "SEARCH_SUPERSEDED") return true;
+      if (!isCurrent()) return true;
       logLine(`server search unavailable: ${error.message}`);
       if (activeJob?.id) {
         showStatus("error",
@@ -3367,11 +3405,16 @@
       }
       return false;
     } finally {
-      btn.disabled = false;
+      if (isCurrent()) btn.disabled = false;
     }
   }
 
-  async function pollServerSearchJob(id, { analyticsBase = null, logLine = null, background = false } = {}) {
+  async function pollServerSearchJob(id, {
+    analyticsBase = null,
+    logLine = null,
+    background = false,
+    isCurrent = () => true,
+  } = {}) {
     const remoteBase = workerBase();
     if (!remoteBase || !id) return null;
     let job = null;
@@ -3379,6 +3422,11 @@
     let consecutiveFailures = 0;
     const pollStartedAt = Date.now();
     for (;;) {
+      if (!isCurrent()) {
+        const error = new Error("search was replaced by a newer request");
+        error.code = "SEARCH_SUPERSEDED";
+        throw error;
+      }
       if (Date.now() - pollStartedAt >= SERVER_SEARCH_HARD_LIMIT_MS) {
         const error = new Error("live updates timed out while the saved search kept running");
         error.code = "SEARCH_POLL_TIMEOUT";
@@ -3396,6 +3444,11 @@
           { headers: { "Accept": "application/json" } },
           { attempts: 2, timeoutMs: 12000 }
         ));
+        if (!isCurrent()) {
+          const superseded = new Error("search was replaced by a newer request");
+          superseded.code = "SEARCH_SUPERSEDED";
+          throw superseded;
+        }
         consecutiveFailures = 0;
       } catch (error) {
         consecutiveFailures++;
@@ -3412,9 +3465,8 @@
       if (!job) throw new Error("job missing");
       if (!background) showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
-      if (job.chain?.found && !background) return { ...job, status: "found" };
       if (TERMINAL_SEARCH_STATUSES.has(job.status)) return job;
-      await new Promise((resolve) => setTimeout(resolve, attempt < 20 ? 120 : 300));
+      await wait(attempt < 5 ? 350 : Math.min(1500, 500 + attempt * 75));
       attempt++;
     }
   }
@@ -3564,7 +3616,7 @@
     }
     setActiveChip(job.target);
     renderChain(chain);
-    if (submit) submitLeaderboardChain(job.start, job.target, chain);
+    if (submit) submitLeaderboardChain(job.start, job.target, chain, job.range || analyticsBase?.range || "auto");
     recordSearchEvent(recordOutcome, {
       ...analyticsBase,
       jobId: job.id,
@@ -3637,6 +3689,7 @@
           range: record.range,
           depth: AUTO_SEARCH_DEPTH,
         },
+        isCurrent: ownsResume,
       });
       if (!ownsResume()) return;
       clearActiveJob(record.id);
@@ -3690,7 +3743,7 @@
     const target = cleanUsernameInput(targetRaw);
     const status = $("#search-status");
     const logEl = $("#search-log");
-    const btn = $(".search__btn");
+    const btn = $("#trace-chain");
     const mode = parseSearchMode(range);
     const depth = AUTO_SEARCH_DEPTH;
     resetSearchQueue();

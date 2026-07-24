@@ -13,6 +13,7 @@ on:
     paths:
       - "config.yml"
       - "scripts/**"
+      - "tests/**"
       - ".github/workflows/compute-chains.yml"
   workflow_dispatch: # manual "Run workflow" button in the Actions tab
 
@@ -35,6 +36,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -p "test_*.py"
 
       - name: Cache chess game data
         uses: actions/cache@v4

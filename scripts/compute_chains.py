@@ -14,16 +14,14 @@ The GitHub Action does the same thing on schedule.
 import json
 import os
 import sys
+import tempfile
 import time
-import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 
-from chess_beaten_chain import find_chain, fetch, edges  # noqa: E402
-
-HEADERS = {"User-Agent": "chess-connections/1.0 (github.com/tetizz/Connections)"}
+from chess_beaten_chain import find_chain, fetch  # noqa: E402
 
 
 def load_config():
@@ -50,7 +48,7 @@ def load_config():
     return cfg
 
 
-def player_meta(username):
+def player_meta(username, previous=None):
     """Fetch avatar / title / name / url for nicer cards. Best-effort."""
     try:
         p = fetch(
@@ -65,15 +63,119 @@ def player_meta(username):
             if p.get("country") else None,
         }
     except Exception:
+        if isinstance(previous, dict):
+            return dict(previous)
         return {"username": username, "avatar": None, "title": None,
                 "name": None, "url": None, "country": None}
 
 
+def _stage_json(path, payload):
+    """Serialize JSON beside its destination and return the staged path."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp",
+        dir=os.path.dirname(path), text=True
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        return tmp_path
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _restore_file(path, content):
+    if content is None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".rollback",
+        dir=os.path.dirname(path)
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def write_json_batch_atomic(outputs):
+    """Replace a related set of JSON files, rolling back on any failure."""
+    originals = {}
+    staged = []
+    replaced = []
+    try:
+        for path, payload in outputs:
+            try:
+                with open(path, "rb") as f:
+                    originals[path] = f.read()
+            except FileNotFoundError:
+                originals[path] = None
+            staged.append((path, _stage_json(path, payload)))
+
+        for path, tmp_path in staged:
+            os.replace(tmp_path, path)
+            replaced.append(path)
+    except Exception as exc:
+        rollback_errors = []
+        for path in reversed(replaced):
+            try:
+                _restore_file(path, originals[path])
+            except Exception as rollback_exc:  # noqa: BLE001
+                rollback_errors.append(rollback_exc)
+        if rollback_errors:
+            raise RuntimeError(
+                "JSON publication failed and rollback was incomplete"
+            ) from exc
+        raise
+    finally:
+        for _, tmp_path in staged:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
 def main():
     cfg = load_config()
-    start = cfg["start"]
+    start = (cfg["start"] or "").strip().lower()
     max_depth = cfg["max_depth"]
-    targets = cfg["targets"]
+    targets = [
+        {
+            **target,
+            "username": target["username"].strip().lower(),
+        }
+        for target in cfg["targets"]
+    ]
+    if not start:
+        raise ValueError("config.yml must define a start username")
+    if any(not target["username"] for target in targets):
+        raise ValueError("every configured target must have a username")
+    target_names = [target["username"] for target in targets]
+    if len(target_names) != len(set(target_names)):
+        raise ValueError("configured target usernames must be unique")
+
     print(f"Config: start={start}  max_depth={max_depth}  "
           f"targets={[t['username'] for t in targets]}")
 
@@ -82,50 +184,30 @@ def main():
     chains_path = os.path.join(data_dir, "chains.json")
     players_path = os.path.join(data_dir, "players.json")
 
-    # resume support: load any previously-computed data so we can skip
-    # targets already done and merge player metadata incrementally.
-    try:
-        prev = json.load(open(chains_path))
-        chains = prev.get("chains", [])
-    except Exception:
-        prev = {}
-        chains = []
-    try:
-        players = json.load(open(players_path))
-    except Exception:
-        players = {}
-
-    def save():
-        out = {
-            "start": start,
-            "start_display": players.get(start.lower(), {}).get("name", start),
-            "max_depth": max_depth,
-            "computed_at": int(time.time()),
-            "chains": chains,
-        }
-        json.dump(out, open(chains_path, "w"), indent=2)
-        json.dump(players, open(players_path, "w"), indent=2)
+    # Previous metadata is only a fallback for a transient profile lookup.
+    # Chains are always rebuilt from the current config so removed targets and
+    # start/depth changes cannot leak into a scheduled refresh.
+    previous_players = load_json(players_path, {})
+    chains = []
+    players = {}
+    refreshed_players = set()
 
     def ensure_player(u):
         u = u.lower()
-        if u in players:
+        if u in refreshed_players:
             return
-        players[u] = player_meta(u)
+        players[u] = player_meta(u, previous_players.get(u))
+        refreshed_players.add(u)
         print(f"    player meta: {u}: "
               f"{players[u].get('title','')} {players[u].get('name','')}")
 
-    # always refresh the start + target metadata (cheap, keeps avatars fresh)
+    # Refresh every currently-relevant profile once per run.
     ensure_player(start)
     for t in targets:
         ensure_player(t["username"])
 
-    done_targets = {c["target"] for c in chains}
-
     for t in targets:
         target = t["username"]
-        if target in done_targets:
-            print(f"\n[skip] {target} already computed")
-            continue
         print("\n" + "#" * 64)
         print(f"# {start}  ->  {target}   ({t.get('display', target)})")
         print("#" * 64)
@@ -159,9 +241,21 @@ def main():
                 "path": [],
                 "hops": [],
             })
-        # save after EACH target so a kill doesn't lose work
-        save()
-        print(f"  (saved progress: {len(chains)}/{len(targets)} targets)")
+        print(f"  (computed: {len(chains)}/{len(targets)} targets)")
+
+    out = {
+        "start": start,
+        "start_display": players.get(start, {}).get("name") or start,
+        "max_depth": max_depth,
+        "computed_at": int(time.time()),
+        "chains": chains,
+    }
+    # Publish only after every target completed. A transient or partial Chess.com
+    # failure leaves the prior known-good site data untouched.
+    write_json_batch_atomic([
+        (chains_path, out),
+        (players_path, players),
+    ])
 
     print(f"\nDone. {len(chains)} chains written to {chains_path}")
 

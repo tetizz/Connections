@@ -1,0 +1,59 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "worker/**"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/test.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - "worker/**"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Worker dependencies
+        working-directory: worker
+        run: npm ci
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check site/app.js
+          node --check site/engine.js
+          node --check site/leaderboard.js
+          node --check worker/src/index.js
+
+      - name: Run Worker tests
+        working-directory: worker
+        run: npm test
+
+      - name: Run Python tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -p "test_*.py"

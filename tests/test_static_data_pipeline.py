@@ -160,6 +160,187 @@ class GameCacheTests(unittest.TestCase):
             with self.assertRaises(chain.GameDataRefreshError):
                 chain.prefetch(["alice"], log=lambda _message: None, workers=1)
 
+    def test_fetch_honors_retry_after_with_global_cooldown(self):
+        limited = urllib.error.HTTPError(
+            "https://api.chess.com/test",
+            429,
+            "rate limited",
+            {"Retry-After": "7"},
+            None,
+        )
+        self.addCleanup(limited.close)
+
+        class JsonResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return b'{"ok": true}'
+
+        with (
+            mock.patch.object(chain, "_reserve_request_slot"),
+            mock.patch.object(chain, "_defer_requests") as defer_mock,
+            mock.patch.object(
+                chain.urllib.request,
+                "urlopen",
+                side_effect=[limited, JsonResponse()],
+            ),
+        ):
+            self.assertEqual(
+                chain.fetch("https://api.chess.com/test", retries=2),
+                {"ok": True},
+            )
+
+        defer_mock.assert_called_once_with(7.0)
+
+    def test_waiting_request_rechecks_a_later_global_cooldown(self):
+        clock = {"monotonic": 0.0, "epoch": 100.0}
+        sleeps = []
+        chain._NEXT_REQUEST_AT = 1.0
+        self.addCleanup(setattr, chain, "_NEXT_REQUEST_AT", 0.0)
+
+        def fake_sleep(delay):
+            sleeps.append(delay)
+            clock["monotonic"] += delay
+            clock["epoch"] += delay
+            if len(sleeps) == 1:
+                chain._defer_requests(7.0)
+
+        with (
+            mock.patch.object(
+                chain.time, "monotonic",
+                side_effect=lambda: clock["monotonic"],
+            ),
+            mock.patch.object(
+                chain.time, "time",
+                side_effect=lambda: clock["epoch"],
+            ),
+            mock.patch.object(chain.time, "sleep", side_effect=fake_sleep),
+            mock.patch.object(chain, "REQUEST_MIN_INTERVAL_SECONDS", 0.1),
+        ):
+            chain._reserve_request_slot(deadline=120.0)
+
+        self.assertEqual(sleeps, [1.0, 7.0])
+        self.assertAlmostEqual(chain._NEXT_REQUEST_AT, 8.1)
+
+    def test_search_checks_frontier_in_small_batches_and_stops_after_hit(self):
+        opponents = {
+            "first": ["https://www.chess.com/game/live/1"],
+            **{
+                f"unused-{index}": [
+                    f"https://www.chess.com/game/live/{index + 2}"
+                ]
+                for index in range(1_031)
+            },
+        }
+        edge_map = {
+            "target": ({}, {
+                "bridge": ["https://www.chess.com/game/live/500"],
+            }),
+            "start": (opponents, {}),
+            "first": ({
+                "bridge": ["https://www.chess.com/game/live/501"],
+            }, {}),
+        }
+        prefetched = []
+
+        def fake_edges(username):
+            if username not in edge_map:
+                self.fail(f"search fetched unnecessary frontier node {username}")
+            return edge_map[username]
+
+        def fake_prefetch(usernames, *_args, **_kwargs):
+            prefetched.extend(usernames)
+
+        with (
+            mock.patch.object(chain, "edges", side_effect=fake_edges),
+            mock.patch.object(chain, "prefetch", side_effect=fake_prefetch),
+        ):
+            path, _hops = chain.find_chain(
+                "start",
+                "target",
+                max_depth=4,
+                log=lambda _message: None,
+                prefetch_workers=1,
+            )
+
+        self.assertEqual(path, ["start", "first", "bridge", "target"])
+        self.assertEqual(prefetched, ["start", "first"])
+
+    def test_previous_route_is_prioritized_within_the_frontier(self):
+        edge_map = {
+            "target": ({}, {
+                "bridge": ["https://www.chess.com/game/live/500"],
+            }),
+            "start": ({
+                "decoy": ["https://www.chess.com/game/live/1"],
+                "preferred": ["https://www.chess.com/game/live/2"],
+            }, {}),
+            "preferred": ({
+                "bridge": ["https://www.chess.com/game/live/501"],
+            }, {}),
+        }
+        prefetched = []
+
+        def fake_edges(username):
+            if username not in edge_map:
+                self.fail(f"search fetched decoy node {username}")
+            return edge_map[username]
+
+        def fake_prefetch(usernames, *_args, **_kwargs):
+            prefetched.extend(usernames)
+
+        with (
+            mock.patch.object(chain, "edges", side_effect=fake_edges),
+            mock.patch.object(chain, "prefetch", side_effect=fake_prefetch),
+        ):
+            path, _hops = chain.find_chain(
+                "start",
+                "target",
+                max_depth=4,
+                log=lambda _message: None,
+                prefetch_workers=1,
+                preferred_path=["start", "preferred", "bridge", "target"],
+            )
+
+        self.assertEqual(path, ["start", "preferred", "bridge", "target"])
+        self.assertEqual(prefetched, ["start", "preferred"])
+
+    def test_search_never_returns_a_shortcut_beyond_max_depth(self):
+        edge_map = {
+            "target": ({}, {
+                "bridge": ["https://www.chess.com/game/live/500"],
+            }),
+            "start": ({
+                "one": ["https://www.chess.com/game/live/1"],
+            }, {}),
+            "one": ({
+                "two": ["https://www.chess.com/game/live/2"],
+            }, {}),
+            "two": ({
+                "bridge": ["https://www.chess.com/game/live/3"],
+            }, {}),
+        }
+
+        with (
+            mock.patch.object(chain, "edges", side_effect=lambda u: edge_map[u]),
+            mock.patch.object(chain, "prefetch"),
+        ):
+            path, hops = chain.find_chain(
+                "start",
+                "target",
+                max_depth=3,
+                log=lambda _message: None,
+                prefetch_workers=1,
+            )
+
+        self.assertIsNone(path)
+        self.assertIsNone(hops)
+
     def test_deadline_abort_is_not_reported_as_not_found(self):
         with (
             mock.patch.object(chain, "edges", return_value=({}, {})),
@@ -318,6 +499,185 @@ class ComputeRefreshTests(unittest.TestCase):
             self.assertEqual(json.load(f), old_chains)
         with open(self.data_path("players.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f), old_players)
+
+    def test_incomplete_negative_refresh_preserves_known_negative_without_path(self):
+        old_chains = {
+            "start": "start",
+            "max_depth": 4,
+            "computed_at": 123,
+            "chains": [{
+                "target": "target",
+                "display": "Old target",
+                "found": False,
+                "length": None,
+                "path": [],
+                "hops": [],
+            }],
+        }
+        self.write_data("chains.json", old_chains)
+        self.write_data("players.json", {
+            "start": self.metadata("start"),
+            "target": self.metadata("target"),
+        })
+        config = {
+            "start": "start",
+            "max_depth": 4,
+            "targets": [{"username": "target", "display": "Target"}],
+        }
+
+        with (
+            mock.patch.object(compute, "load_config", return_value=config),
+            mock.patch.object(compute, "player_meta", side_effect=self.metadata),
+            mock.patch.object(
+                compute, "find_chain",
+                side_effect=chain.SearchIncompleteError("deadline exceeded"),
+            ),
+            mock.patch.object(compute.time, "time", return_value=1_000),
+        ):
+            compute.main()
+
+        with open(self.data_path("chains.json"), encoding="utf-8") as f:
+            result = json.load(f)
+        preserved = result["chains"][0]
+        self.assertFalse(preserved["found"])
+        self.assertEqual(preserved["path"], [])
+        self.assertEqual(preserved["hops"], [])
+        self.assertEqual(preserved["refresh_status"], "preserved")
+        self.assertEqual(preserved["computed_at"], 123)
+        self.assertFalse(result["fully_refreshed"])
+
+    def test_incomplete_found_refresh_never_republishes_unverified_path(self):
+        old_chains = {
+            "start": "start",
+            "max_depth": 4,
+            "computed_at": 123,
+            "chains": [{
+                "target": "target",
+                "display": "Target",
+                "found": True,
+                "length": 2,
+                "path": ["start", "bridge", "target"],
+                "hops": [
+                    {"from": "start", "to": "bridge", "url": "https://1"},
+                    {"from": "bridge", "to": "target", "url": "https://2"},
+                ],
+            }],
+        }
+        old_players = {"start": self.metadata("start")}
+        self.write_data("chains.json", old_chains)
+        self.write_data("players.json", old_players)
+        config = {
+            "start": "start",
+            "max_depth": 4,
+            "targets": [{"username": "target", "display": "Target"}],
+        }
+
+        with (
+            mock.patch.object(compute, "load_config", return_value=config),
+            mock.patch.object(compute, "player_meta", side_effect=self.metadata),
+            mock.patch.object(
+                compute, "find_chain",
+                side_effect=chain.GameDataRefreshError("rate limited"),
+            ),
+        ):
+            with self.assertRaises(chain.GameDataRefreshError):
+                compute.main()
+
+        with open(self.data_path("chains.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), old_chains)
+        with open(self.data_path("players.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), old_players)
+
+    def test_previous_found_path_is_passed_as_search_priority(self):
+        self.write_data(
+            "chains.json",
+            {
+                "start": "start",
+                "max_depth": 4,
+                "chains": [{
+                    "target": "target",
+                    "display": "Target",
+                    "found": True,
+                    "length": 3,
+                    "path": ["start", "preferred", "bridge", "target"],
+                    "hops": [],
+                }],
+            },
+        )
+        self.write_data("players.json", {})
+        config = {
+            "start": "start",
+            "max_depth": 4,
+            "targets": [{"username": "target", "display": "Target"}],
+        }
+
+        with (
+            mock.patch.object(compute, "load_config", return_value=config),
+            mock.patch.object(compute, "player_meta", side_effect=self.metadata),
+            mock.patch.object(
+                compute, "find_chain",
+                return_value=(
+                    ["start", "preferred", "bridge", "target"],
+                    [
+                        {"from": "start", "to": "preferred", "url": "https://1"},
+                        {"from": "preferred", "to": "bridge", "url": "https://2"},
+                        {"from": "bridge", "to": "target", "url": "https://3"},
+                    ],
+                ),
+            ) as find_mock,
+        ):
+            compute.main()
+
+        self.assertEqual(
+            find_mock.call_args.kwargs["preferred_path"],
+            ["start", "preferred", "bridge", "target"],
+        )
+
+    def test_target_deadline_uses_configured_five_minute_budget(self):
+        self.assertEqual(compute.TARGET_SEARCH_SECONDS, 300.0)
+        # Every configured target can consume the full default and still leave
+        # five minutes inside the workflow's 45-minute timeout.
+        repository_config = os.path.join(
+            os.path.dirname(compute.HERE),
+            "config.yml",
+        )
+        with open(repository_config, encoding="utf-8") as config_file:
+            target_count = sum(
+                line.strip().startswith("- username:")
+                for line in config_file
+            )
+        self.assertLessEqual(
+            target_count * compute.TARGET_SEARCH_SECONDS,
+            40 * 60,
+        )
+
+        self.write_data("chains.json", {})
+        self.write_data("players.json", {})
+        config = {
+            "start": "start",
+            "max_depth": 4,
+            "targets": [{"username": "target", "display": "Target"}],
+        }
+
+        with (
+            mock.patch.object(compute, "load_config", return_value=config),
+            mock.patch.object(compute, "player_meta", side_effect=self.metadata),
+            mock.patch.object(
+                compute, "find_chain",
+                return_value=(
+                    ["start", "target"],
+                    [{
+                        "from": "start",
+                        "to": "target",
+                        "url": "https://game",
+                    }],
+                ),
+            ) as find_mock,
+            mock.patch.object(compute.time, "time", return_value=1_000.0),
+        ):
+            compute.main()
+
+        self.assertEqual(find_mock.call_args.kwargs["deadline"], 1_300.0)
 
     def test_second_output_failure_rolls_back_first_output(self):
         old_chains = {"start": "old", "max_depth": 2, "chains": []}

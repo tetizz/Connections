@@ -21,7 +21,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 
-from chess_beaten_chain import find_chain, fetch  # noqa: E402
+from chess_beaten_chain import (  # noqa: E402
+    GameDataRefreshError,
+    SearchIncompleteError,
+    fetch,
+    find_chain,
+)
+
+TARGET_SEARCH_SECONDS = max(
+    1.0,
+    float(os.environ.get("CONNECTIONS_TARGET_SEARCH_SECONDS", "300")),
+)
 
 
 def load_config():
@@ -185,12 +195,30 @@ def main():
     players_path = os.path.join(data_dir, "players.json")
 
     # Previous metadata is only a fallback for a transient profile lookup.
-    # Chains are always rebuilt from the current config so removed targets and
-    # start/depth changes cannot leak into a scheduled refresh.
+    # Previous chains are accepted only for the exact current start/depth and
+    # configured target; found paths are ordering hints, while pathless
+    # negatives may be retained with their old timestamp after an incomplete
+    # refresh. Removed targets can never leak into the new output.
+    previous_output = load_json(chains_path, {})
     previous_players = load_json(players_path, {})
+    previous_matches_search = (
+        isinstance(previous_output, dict)
+        and previous_output.get("start") == start
+        and previous_output.get("max_depth") == max_depth
+        and isinstance(previous_output.get("chains"), list)
+    )
+    previous_chains = {
+        item.get("target"): item
+        for item in previous_output.get("chains", [])
+        if previous_matches_search
+        and isinstance(item, dict)
+        and isinstance(item.get("target"), str)
+    }
+    previous_computed_at = previous_output.get("computed_at")
     chains = []
     players = {}
     refreshed_players = set()
+    fully_refreshed = True
 
     def ensure_player(u):
         u = u.lower()
@@ -208,15 +236,57 @@ def main():
 
     for t in targets:
         target = t["username"]
+        previous_chain = previous_chains.get(target)
         print("\n" + "#" * 64)
         print(f"# {start}  ->  {target}   ({t.get('display', target)})")
         print("#" * 64)
         t0 = time.time()
-        # give each target at most ~3 minutes so one hard target can't
-        # block the whole batch run
-        deadline = time.time() + 180
-        path, hops = find_chain(start, target, max_depth, deadline=deadline)
+        # Keep one hard target from blocking the batch. With the current eight
+        # configured targets, the default caps searches at 40 minutes total,
+        # leaving five minutes inside the workflow timeout for setup and I/O.
+        deadline = time.time() + TARGET_SEARCH_SECONDS
+        search_options = {"deadline": deadline}
+        if (
+            isinstance(previous_chain, dict)
+            and previous_chain.get("found") is True
+            and isinstance(previous_chain.get("path"), list)
+        ):
+            search_options["preferred_path"] = previous_chain["path"]
+        try:
+            path, hops = find_chain(
+                start,
+                target,
+                max_depth,
+                **search_options,
+            )
+        except (GameDataRefreshError, SearchIncompleteError) as exc:
+            # A known negative has no proof path that could be poisoned by a
+            # partial refresh. Preserve its original timestamp instead of
+            # turning an incomplete search into a newly-computed "not found."
+            can_preserve_negative = (
+                isinstance(previous_chain, dict)
+                and previous_chain.get("found") is False
+                and previous_chain.get("path") == []
+                and previous_chain.get("hops") == []
+            )
+            if not can_preserve_negative:
+                raise
+            fully_refreshed = False
+            preserved = dict(previous_chain)
+            preserved["display"] = t.get("display", target)
+            preserved["refresh_status"] = "preserved"
+            preserved["computed_at"] = preserved.get(
+                "computed_at", previous_computed_at
+            )
+            chains.append(preserved)
+            print(
+                "\nPRESERVED prior no-chain result; refresh was incomplete: "
+                f"{exc}"
+            )
+            print(f"  (computed: {len(chains)}/{len(targets)} targets)")
+            continue
         elapsed = time.time() - t0
+        chain_computed_at = int(time.time())
         if path:
             print(f"\nFOUND length {len(path)-1} in {elapsed:.0f}s")
             for h in hops:
@@ -230,6 +300,8 @@ def main():
                 "length": len(path) - 1,
                 "path": path,
                 "hops": hops,
+                "refresh_status": "verified",
+                "computed_at": chain_computed_at,
             })
         else:
             print(f"\nNO CHAIN within depth {max_depth} ({elapsed:.0f}s)")
@@ -240,6 +312,8 @@ def main():
                 "length": None,
                 "path": [],
                 "hops": [],
+                "refresh_status": "verified",
+                "computed_at": chain_computed_at,
             })
         print(f"  (computed: {len(chains)}/{len(targets)} targets)")
 
@@ -248,6 +322,7 @@ def main():
         "start_display": players.get(start, {}).get("name") or start,
         "max_depth": max_depth,
         "computed_at": int(time.time()),
+        "fully_refreshed": fully_refreshed,
         "chains": chains,
     }
     # Publish only after every target completed. A transient or partial Chess.com

@@ -26,6 +26,8 @@ import time
 import os
 import sys
 import tempfile
+import threading
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HEADERS = {
@@ -44,9 +46,18 @@ CACHE_SCHEMA_VERSION = 1
 CACHE_MAX_AGE_SECONDS = int(
     os.environ.get("CONNECTIONS_CACHE_TTL_SECONDS", 5 * 24 * 60 * 60)
 )
+PREFETCH_WORKERS = max(
+    1, int(os.environ.get("CONNECTIONS_PREFETCH_WORKERS", "1"))
+)
+REQUEST_MIN_INTERVAL_SECONDS = max(
+    0.0,
+    float(os.environ.get("CONNECTIONS_REQUEST_INTERVAL_SECONDS", "0.1")),
+)
 
 _MEM_GAMES = {}   # username_lower -> {"fetched_at": float, "games": list[dict]}
 _MEM_EDGES = {}   # username_lower -> (beaten_by_me, beat_me)
+_REQUEST_LOCK = threading.Lock()
+_NEXT_REQUEST_AT = 0.0
 
 
 class GameDataRefreshError(RuntimeError):
@@ -57,13 +68,74 @@ class SearchIncompleteError(RuntimeError):
     """Raised when resource limits prevent a trustworthy not-found result."""
 
 
-def fetch(url, retries=5):
-    """GET JSON with exponential backoff for 429/server errors."""
+def _seconds_until_deadline(deadline):
+    if deadline is None:
+        return None
+    return deadline - time.time()
+
+
+def _reserve_request_slot(deadline=None):
+    """Globally space request starts, even when callers opt into concurrency."""
+    global _NEXT_REQUEST_AT
+    while True:
+        with _REQUEST_LOCK:
+            now = time.monotonic()
+            wait = max(0.0, _NEXT_REQUEST_AT - now)
+            remaining = _seconds_until_deadline(deadline)
+            if remaining is not None and wait >= remaining:
+                raise SearchIncompleteError(
+                    "search deadline exceeded while waiting for Chess.com"
+                )
+            if wait == 0:
+                _NEXT_REQUEST_AT = now + REQUEST_MIN_INTERVAL_SECONDS
+                return
+
+        # Recheck after every wait instead of reserving a future slot. A 429
+        # received by another worker may extend _NEXT_REQUEST_AT while this
+        # worker sleeps, and that server-requested cooldown must win.
+        time.sleep(wait)
+
+
+def _defer_requests(delay):
+    """Apply one server-requested cooldown to every worker."""
+    global _NEXT_REQUEST_AT
+    with _REQUEST_LOCK:
+        _NEXT_REQUEST_AT = max(
+            _NEXT_REQUEST_AT,
+            time.monotonic() + max(0.0, delay),
+        )
+
+
+def _retry_after_seconds(error):
+    value = error.headers.get("Retry-After") if error.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                return None
+            return max(0.0, retry_at.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def fetch(url, retries=8, deadline=None):
+    """GET JSON with globally coordinated backoff for 429/server errors."""
     last = None
     for attempt in range(retries):
+        _reserve_request_slot(deadline)
+        remaining = _seconds_until_deadline(deadline)
+        if remaining is not None and remaining <= 0:
+            raise SearchIncompleteError(
+                "search deadline exceeded before Chess.com request"
+            )
         try:
             req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=60) as r:
+            timeout = 60 if remaining is None else max(1, min(60, remaining))
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             # Retrying rate limits and server errors is useful; retrying a
@@ -71,10 +143,15 @@ def fetch(url, retries=5):
             if 400 <= e.code < 500 and e.code != 429:
                 raise
             last = e
-            time.sleep(min(2 ** attempt, 16))
+            delay = min(2 ** attempt, 32)
+            if e.code == 429:
+                retry_after = _retry_after_seconds(e)
+                if retry_after is not None:
+                    delay = max(delay, retry_after)
+            _defer_requests(delay)
         except Exception as e:  # noqa: BLE001
             last = e
-            time.sleep(min(2 ** attempt, 16))
+            _defer_requests(min(2 ** attempt, 32))
     raise last
 
 
@@ -151,7 +228,13 @@ def _cache_is_fresh(record, now):
     )
 
 
-def get_std_games(username):
+def _fetch_for_search(url, deadline):
+    if deadline is None:
+        return fetch(url)
+    return fetch(url, deadline=deadline)
+
+
+def get_std_games(username, deadline=None):
     """All standard-chess games for a user. Cached on disk + in memory.
 
     Each game is a slim dict. A refresh is only committed if the archive list
@@ -176,12 +259,15 @@ def get_std_games(username):
         return disk_record["games"]
 
     try:
-        archive_payload = fetch(
-            f"https://api.chess.com/pub/player/{u}/games/archives"
+        archive_payload = _fetch_for_search(
+            f"https://api.chess.com/pub/player/{u}/games/archives",
+            deadline,
         )
         archives = archive_payload.get("archives")
         if not isinstance(archives, list):
             raise ValueError("archive response has no archives list")
+    except SearchIncompleteError:
+        raise
     except urllib.error.HTTPError as exc:
         if exc.code not in (404, 410):
             raise GameDataRefreshError(
@@ -199,10 +285,12 @@ def get_std_games(username):
     games = []
     for arch in archives:
         try:
-            data = fetch(arch)
+            data = _fetch_for_search(arch, deadline)
             monthly_games = data.get("games")
             if not isinstance(monthly_games, list):
                 raise ValueError("monthly archive has no games list")
+        except SearchIncompleteError:
+            raise
         except Exception as exc:
             raise GameDataRefreshError(
                 f"incomplete game history for {u}: failed archive {arch}"
@@ -227,7 +315,7 @@ def get_std_games(username):
     return games
 
 
-def edges(username):
+def edges(username, deadline=None):
     """Return (beaten_by_me, beat_me) dicts for a user.
 
     beaten_by_me[opp] = [urls...]   games where `username` won
@@ -238,7 +326,7 @@ def edges(username):
     u = username.lower()
     if u in _MEM_EDGES:
         return _MEM_EDGES[u]
-    games = get_std_games(u)
+    games = get_std_games(u, deadline=deadline)
     beaten_by_me, beat_me = {}, {}
     for g in games:
         if g.get("time_class") == "daily":  # no correspondence
@@ -258,20 +346,34 @@ def edges(username):
     return beaten_by_me, beat_me
 
 
-def prefetch(usernames, log=print, workers=20):
-    """Cache game histories for all usernames in parallel."""
+def _edges_for_search(username, deadline):
+    if deadline is None:
+        return edges(username)
+    return edges(username, deadline=deadline)
+
+
+def prefetch(usernames, log=print, workers=None, deadline=None):
+    """Cache complete game histories with bounded, deadline-aware concurrency."""
     todo = list(dict.fromkeys(u.lower() for u in usernames))
     if not todo:
         return
+    workers = PREFETCH_WORKERS if workers is None else max(1, workers)
     log(f"    prefetching {len(todo)} players ({workers} parallel)...")
     start = time.time()
     done = 0
     failures = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(get_std_games, u): u for u in todo}
+        futs = {
+            ex.submit(get_std_games, u, deadline=deadline): u
+            for u in todo
+        }
         for f in as_completed(futs):
             try:
                 f.result()
+            except SearchIncompleteError:
+                for pending in futs:
+                    pending.cancel()
+                raise
             except Exception as e:  # noqa: BLE001
                 log(f"      [err {futs[f]}: {str(e)[:40]}]")
                 failures.append((futs[f], e))
@@ -287,7 +389,7 @@ def prefetch(usernames, log=print, workers=20):
 
 
 def find_chain(start, target, max_depth=4, log=print, frontier_cap=2000,
-               deadline=None):
+               deadline=None, prefetch_workers=None, preferred_path=None):
     """BFS shortest beaten-chain from start to target.
 
     Returns (path_list, hops) where hops is a list of
@@ -298,20 +400,43 @@ def find_chain(start, target, max_depth=4, log=print, frontier_cap=2000,
         explosively. Prevents a capped search from being reported as a
         trustworthy "not found."
     deadline: optional epoch seconds; if exceeded, raises SearchIncompleteError.
+    prefetch_workers: maximum simultaneous player histories to refresh.
+    preferred_path: a previously published path to try first. It is only an
+        ordering hint; every returned edge is rediscovered from refreshed,
+        complete game histories.
     """
     start, target = start.lower(), target.lower()
+    if start == target:
+        return [start], []
+
+    if isinstance(preferred_path, list):
+        preferred_path = [
+            value.strip().lower()
+            for value in preferred_path
+            if isinstance(value, str) and value.strip()
+        ]
+    if (
+        not preferred_path
+        or preferred_path[0] != start
+        or preferred_path[-1] != target
+        or len(preferred_path) - 1 > max_depth
+    ):
+        preferred_path = None
 
     log(f"Loading backward set: who has beaten {target}...")
-    _, beat_target = edges(target)
+    _, beat_target = _edges_for_search(target, deadline)
     log(f"  {len(beat_target)} players have beaten {target}")
 
     log(f"Loading start: who {start} has beaten...")
-    beaten_start, _ = edges(start)
+    beaten_start, _ = _edges_for_search(start, deadline)
     log(f"  {start} has beaten {len(beaten_start)} players")
 
     visited = {start}
     # frontier: (node, path_list, hops_list)
     frontier = [(start, [start], [])]
+    workers = PREFETCH_WORKERS if prefetch_workers is None else max(
+        1, prefetch_workers
+    )
 
     for depth in range(max_depth):
         if not frontier:
@@ -321,50 +446,95 @@ def find_chain(start, target, max_depth=4, log=print, frontier_cap=2000,
             raise SearchIncompleteError("search deadline exceeded")
         log(f"\n== Depth {depth}: {len(frontier)} nodes to expand ==")
 
-        prefetch([n for n, _, _ in frontier], log)
-        node_beaten = {n: edges(n)[0] for n, _, _ in frontier}
+        if preferred_path:
+            frontier.sort(
+                key=lambda item: (
+                    item[1] != preferred_path[:len(item[1])],
+                )
+            )
 
-        # Pass 1 - direct hit: a frontier node beat TARGET (length depth+1)
+        # target's complete history already proves every direct final edge, so
+        # direct hits can be checked without fetching any frontier histories.
         for node, path, hops in frontier:
-            if target in node_beaten[node]:
+            if node in beat_target:
                 full = path + [target]
                 full_hops = hops + [{"from": node, "to": target,
-                                     "url": node_beaten[node][target][0]}]
+                                     "url": beat_target[node][0]}]
                 return full, full_hops
 
-        # Pass 2 - shortcut: frontier node beat someone who beat TARGET
-        for node, path, hops in frontier:
-            inter = set(node_beaten[node]) & set(beat_target)
-            if inter:
-                mid = next(iter(inter))
-                full = path + [mid, target]
-                full_hops = hops + [
-                    {"from": node, "to": mid,
-                     "url": node_beaten[node][mid][0]},
-                    {"from": mid, "to": target,
-                     "url": beat_target[mid][0]},
-                ]
-                return full, full_hops
+        # A shortcut or another expansion from the final frontier would exceed
+        # max_depth. The direct-hit check above is the last admissible route.
+        if depth + 1 >= max_depth:
+            break
 
-        # Pass 3 - expand frontier by one 'beat' hop
+        # Load the frontier in small batches. Check each completed batch for a
+        # shortest-path shortcut before requesting the rest; this is the key
+        # difference from the old 1,000-player all-at-once prefetch.
         nxt = []
-        for node, path, hops in frontier:
+        frontier_overflow = False
+        for offset in range(0, len(frontier), workers):
             if deadline and time.time() > deadline:
                 raise SearchIncompleteError(
-                    "search deadline exceeded while expanding frontier"
+                    "search deadline exceeded while loading frontier"
                 )
-            for opp, urls in node_beaten[node].items():
-                if opp not in visited:
+            batch = frontier[offset:offset + workers]
+            prefetch(
+                [node for node, _, _ in batch],
+                log,
+                workers=workers,
+                deadline=deadline,
+            )
+            node_beaten = {
+                node: edges(node)[0]
+                for node, _, _ in batch
+            }
+
+            for node, path, hops in batch:
+                candidates = [
+                    opponent
+                    for opponent in node_beaten[node]
+                    if opponent in beat_target
+                ]
+                if candidates:
+                    preferred_mid = (
+                        preferred_path[len(path)]
+                        if preferred_path and len(preferred_path) > len(path)
+                        else None
+                    )
+                    mid = (
+                        preferred_mid
+                        if preferred_mid in candidates
+                        else candidates[0]
+                    )
+                    full = path + [mid, target]
+                    full_hops = hops + [
+                        {"from": node, "to": mid,
+                         "url": node_beaten[node][mid][0]},
+                        {"from": mid, "to": target,
+                         "url": beat_target[mid][0]},
+                    ]
+                    return full, full_hops
+
+            # Keep checking later current-depth nodes for a route even after
+            # the next frontier exceeds its safety cap. Otherwise a capped
+            # partial expansion could hide a valid shortest path.
+            for node, path, hops in batch:
+                for opp, urls in node_beaten[node].items():
+                    if opp in visited:
+                        continue
                     visited.add(opp)
-                    nxt.append((opp, path + [opp],
-                                hops + [{"from": node, "to": opp,
-                                         "url": urls[0]}]))
-                    if len(nxt) >= frontier_cap:
-                        break
-            if len(nxt) >= frontier_cap:
-                break
+                    if len(nxt) < frontier_cap:
+                        nxt.append((
+                            opp,
+                            path + [opp],
+                            hops + [{"from": node, "to": opp,
+                                     "url": urls[0]}],
+                        ))
+                    else:
+                        frontier_overflow = True
+
         frontier = nxt
-        if len(frontier) >= frontier_cap:
+        if frontier_overflow or len(frontier) >= frontier_cap:
             raise SearchIncompleteError(
                 f"frontier cap ({frontier_cap}) hit at depth {depth + 1}"
             )

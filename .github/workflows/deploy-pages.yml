@@ -11,6 +11,9 @@ on:
       - "site/**"
       - "data/**"
       - ".github/workflows/deploy-pages.yml"
+  workflow_run:
+    workflows: ["Compute Chains"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +27,11 @@ concurrency:
 
 jobs:
   build:
+    # A failed compute must never publish partially refreshed data. Push and
+    # manual runs do not have a workflow_run payload, so they proceed normally.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

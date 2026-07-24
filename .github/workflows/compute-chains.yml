@@ -59,6 +59,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore: refresh chess connection chains [skip ci]"
+            git commit -m "chore: refresh chess connection chains"
             git push
           fi

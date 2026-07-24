@@ -16,6 +16,12 @@ import chess_beaten_chain as chain  # noqa: E402
 import compute_chains as compute  # noqa: E402
 
 
+def workflow_text(name):
+    path = os.path.join(ROOT, ".github", "workflows", name)
+    with open(path, encoding="utf-8") as workflow_file:
+        return workflow_file.read()
+
+
 def sample_game(white="alice", black="bob"):
     return {
         "white": {"username": white, "result": "win"},
@@ -787,6 +793,28 @@ class ComputeRefreshTests(unittest.TestCase):
         previous = {"username": "alice", "name": "Known Alice", "avatar": "old"}
         with mock.patch.object(compute, "fetch", side_effect=OSError("temporary")):
             self.assertEqual(compute.player_meta("alice", previous), previous)
+
+
+class WorkflowHandoffTests(unittest.TestCase):
+    def test_compute_completion_triggers_pages_without_recursive_compute(self):
+        compute_workflow = workflow_text("compute-chains.yml")
+        deploy_workflow = workflow_text("deploy-pages.yml")
+
+        self.assertNotIn("[skip ci]", compute_workflow.lower())
+        self.assertNotIn('- "data/**"', compute_workflow)
+        self.assertIn("workflow_run:", deploy_workflow)
+        self.assertIn('workflows: ["Compute Chains"]', deploy_workflow)
+        self.assertIn(
+            "github.event.workflow_run.conclusion == 'success'",
+            deploy_workflow,
+        )
+
+    def test_all_workflow_changes_run_the_static_contract_tests(self):
+        test_workflow = workflow_text("test.yml")
+        self.assertGreaterEqual(
+            test_workflow.count('- ".github/workflows/**"'),
+            2,
+        )
 
 
 if __name__ == "__main__":

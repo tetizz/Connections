@@ -8,14 +8,14 @@ on:
       - "worker/**"
       - "scripts/**"
       - "tests/**"
-      - ".github/workflows/test.yml"
+      - ".github/workflows/**"
   pull_request:
     paths:
       - "site/**"
       - "worker/**"
       - "scripts/**"
       - "tests/**"
-      - ".github/workflows/test.yml"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:

@@ -209,7 +209,7 @@ test("search-start rate limits expose the JSON retry delay as Retry-After", asyn
   assert.ok(body.retryAfter >= 1);
 });
 
-test("health identifies the deployed reliability release", async () => {
+test("health identifies the deployed verified graph fast-path release", async () => {
   const result = await worker.fetch(
     new Request("https://worker.test/health"),
     { GAMES_CACHE: new MemoryKV() },
@@ -218,7 +218,7 @@ test("health identifies the deployed reliability release", async () => {
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-07-24-exact-proof-v3");
+  assert.equal(body.release, "2026-07-24-verified-graph-fastpath-v4");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {
@@ -473,6 +473,344 @@ test("direct wins beat longer exact fast-lane routes", async () => {
 
   assert.notEqual(result.source, "exact-fast-lane");
   assert.deepEqual(result.chain.path, ["alpha", "omega"]);
+});
+
+test("a range-verified graph hint avoids a wide live crawl and remains an upper bound", async () => {
+  const kv = new MemoryKV();
+  const now = Date.now();
+  const endTime = Math.floor(now / 1000) - 60;
+  const proofMonth = new Date(endTime * 1000);
+  const archiveUrl = (username) =>
+    `https://api.chess.com/pub/player/${username}/games/${proofMonth.getUTCFullYear()}/` +
+    `${String(proofMonth.getUTCMonth() + 1).padStart(2, "0")}`;
+  await kv.put("games:alpha:recent:6", JSON.stringify({
+    schema: 2,
+    ts: now,
+    games: [{
+      white: "alpha",
+      black: "connector",
+      whiteResult: "win",
+      blackResult: "resigned",
+      url: "https://www.chess.com/game/live/100",
+      timeClass: "rapid",
+      endTime,
+    }],
+  }));
+  await kv.put("graph:index:v2", JSON.stringify({
+    version: 1,
+    updatedAt: now,
+    nodes: {
+      connector: {
+        w: [["middle", "https://www.chess.com/game/live/101"]],
+        l: [],
+        ts: now,
+      },
+      middle: {
+        w: [["omega", "https://www.chess.com/game/live/102"]],
+        l: [["connector", "https://www.chess.com/game/live/101"]],
+        ts: now,
+      },
+      omega: {
+        w: [],
+        l: [["middle", "https://www.chess.com/game/live/102"]],
+        ts: now,
+      },
+    },
+  }));
+
+  const requested = [];
+  const proofPlayers = {
+    101: ["connector", "middle"],
+    102: ["middle", "omega"],
+  };
+  globalThis.fetch = async (url) => {
+    const text = String(url);
+    requested.push(text);
+    if (text.endsWith("/games/archives")) {
+      const username = text.split("/player/")[1].split("/games/")[0];
+      return response({ archives: [archiveUrl(username)] });
+    }
+    const id = Number(text.split("/callback/live/game/")[1]);
+    const [winner, loser] = proofPlayers[id] || [];
+    assert.ok(winner && loser, text);
+    return response({
+      game: {
+        id,
+        isLiveGame: true,
+        isFinished: true,
+        type: "chess",
+        colorOfWinner: "white",
+        endTime,
+        typeName: "Rapid",
+        pgnHeaders: {
+          White: winner,
+          Black: loser,
+          Result: "1-0",
+        },
+      },
+      players: {
+        top: { username: winner, color: "white", isComputer: false },
+        bottom: { username: loser, color: "black", isComputer: false },
+      },
+    });
+  };
+  const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+  const result = await __test.tryFastLaneConnection(
+    { GAMES_CACHE: kv },
+    {
+      start: "alpha",
+      target: "omega",
+      range: "auto",
+      chain: null,
+    },
+    stats,
+  );
+
+  assert.equal(result.source, "verified-graph-hint");
+  assert.deepEqual(result.chain.path, ["alpha", "connector", "middle", "omega"]);
+  assert.equal(result.chain.hops.length, 3);
+  assert.equal(stats.requests, 4);
+  assert.equal(requested.length, 4);
+  assert.ok(stats.requests <= 5, `expected <=5 proof requests, got ${stats.requests}`);
+  assert.equal(__test.shouldKeepCheckingFastLane(result), true);
+  assert.equal(__test.shouldKeepCheckingFastLane({
+    source: result.source,
+    chain: {
+      path: ["alpha", "connector", "omega"],
+      hops: result.chain.hops.slice(0, 2),
+    },
+  }), false);
+});
+
+test("a graph hint fails closed when an exact game proves the wrong winner", async () => {
+  const kv = new MemoryKV();
+  const now = Date.now();
+  const endTime = Math.floor(now / 1000) - 60;
+  const requested = [];
+  await kv.put("graph:index:v2", JSON.stringify({
+    version: 1,
+    updatedAt: now,
+    nodes: {
+      connector: {
+        w: [["middle", "https://www.chess.com/game/live/201"]],
+        l: [],
+        ts: now,
+      },
+      middle: {
+        w: [["omega", "https://www.chess.com/game/live/202"]],
+        l: [["connector", "https://www.chess.com/game/live/201"]],
+        ts: now,
+      },
+      omega: {
+        w: [],
+        l: [["middle", "https://www.chess.com/game/live/202"]],
+        ts: now,
+      },
+    },
+  }));
+  globalThis.fetch = async (url) => {
+    const text = String(url);
+    requested.push(text);
+    if (text.endsWith("/games/archives")) {
+      return response({
+        archives: ["https://api.chess.com/pub/player/connector/games/2026/07"],
+      });
+    }
+    const id = Number(text.split("/callback/live/game/")[1]);
+    return response({
+      game: {
+        id,
+        isLiveGame: true,
+        isFinished: true,
+        type: "chess",
+        colorOfWinner: "black",
+        endTime,
+        typeName: "Rapid",
+        pgnHeaders: { White: "connector", Black: "middle", Result: "0-1" },
+      },
+      players: {
+        top: { username: "connector", color: "white", isComputer: false },
+        bottom: { username: "middle", color: "black", isComputer: false },
+      },
+    });
+  };
+
+  const result = await __test.tryVerifiedGraphRouteHint(
+    { GAMES_CACHE: kv },
+    {
+      job: { start: "alpha", target: "omega", range: "auto" },
+      stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+      startEdges: {
+        beatenByMe: new Map([[
+          "connector",
+          ["https://www.chess.com/game/live/200"],
+        ]]),
+        beatMe: new Map(),
+      },
+      startGames: [],
+      savedStepLimit: Number.POSITIVE_INFINITY,
+    },
+  );
+
+  assert.equal(result, null);
+  assert.equal(
+    requested.some((url) => /\/games\/\d{4}\/\d{2}$/.test(url)),
+    false,
+    "a rejected graph hint must not fan out into monthly archive downloads",
+  );
+});
+
+test("concurrent edge fills preserve the proof graph until one deterministic rebuild", async () => {
+  const kv = new MemoryKV();
+  const now = Date.now();
+  const originalGraph = {
+    version: 1,
+    updatedAt: now,
+    nodes: {
+      warmed: {
+        w: [["target", "https://www.chess.com/game/live/900"]],
+        l: [],
+        ts: now,
+      },
+    },
+  };
+  const edges = (opponent, gameId) => ({
+    beatenByMe: new Map([[opponent, [`https://www.chess.com/game/live/${gameId}`]]]),
+    beatMe: new Map(),
+  });
+  await kv.put("graph:index:v2", JSON.stringify(originalGraph));
+
+  await Promise.all([
+    __test.putEdgesCache(
+      kv,
+      "alpha:recent:6",
+      { username: "alpha", archiveLimit: 6 },
+      edges("alpha-recent", 901),
+      now + 1,
+    ),
+    __test.putEdgesCache(
+      kv,
+      "beta:recent:2",
+      { username: "beta", archiveLimit: 2 },
+      edges("beta-recent", 902),
+      now + 2,
+    ),
+    __test.putEdgesCache(
+      kv,
+      "beta:all",
+      { username: "beta", archiveLimit: Number.POSITIVE_INFINITY },
+      edges("beta-all", 903),
+      now + 3,
+    ),
+  ]);
+
+  assert.deepEqual(
+    JSON.parse(await kv.get("graph:index:v2")),
+    originalGraph,
+    "independent live cache fills must not overwrite the scheduled graph snapshot",
+  );
+
+  const count = await __test.rebuildGraphIndex({ GAMES_CACHE: kv });
+  const rebuilt = JSON.parse(await kv.get("graph:index:v2"));
+
+  assert.equal(count, 2);
+  assert.deepEqual(Object.keys(rebuilt.nodes).sort(), ["alpha", "beta"]);
+  assert.deepEqual(rebuilt.nodes.alpha.w, [
+    ["alpha-recent", "https://www.chess.com/game/live/901"],
+  ]);
+  assert.deepEqual(rebuilt.nodes.beta.w, [
+    ["beta-all", "https://www.chess.com/game/live/903"],
+  ]);
+});
+
+test("graph rebuild selection is not trapped in the first 900 lexicographic keys", () => {
+  const edgeKeys = Array.from({ length: 900 }, (_, index) => ({
+    name: `edges:a${String(index).padStart(4, "0")}:recent:6`,
+  }));
+  edgeKeys.push({
+    name: "edges:hikaru:recent:2",
+    metadata: { ts: Date.now() },
+  });
+
+  const plans = __test.selectGraphCachePlans(edgeKeys, []);
+
+  assert.equal(plans.length, 900);
+  assert.equal(plans.some((plan) => plan.username === "hikaru"), true);
+});
+
+test("a longer graph hint is skipped when a shorter verified lane is already loaded", async () => {
+  const kv = new MemoryKV();
+  const now = Date.now();
+  await kv.put("fastlane:v2:auto:omega", JSON.stringify({
+    target: "omega",
+    range: "auto",
+    updatedAt: now,
+    fragments: [{
+      target: "omega",
+      range: "auto",
+      path: ["alpha", "saved-one", "saved-two", "omega"],
+      hops: [
+        { from: "alpha", to: "saved-one", url: "https://www.chess.com/game/live/301" },
+        { from: "saved-one", to: "saved-two", url: "https://www.chess.com/game/live/302" },
+        { from: "saved-two", to: "omega", url: "https://www.chess.com/game/live/303" },
+      ],
+      length: 3,
+      savedAt: now,
+    }],
+  }));
+  await kv.put("games:alpha:recent:6", JSON.stringify({
+    schema: 2,
+    ts: now,
+    games: [{
+      white: "alpha",
+      black: "connector",
+      whiteResult: "win",
+      blackResult: "resigned",
+      url: "https://www.chess.com/game/live/310",
+      timeClass: "rapid",
+      endTime: Math.floor(now / 1000) - 60,
+    }],
+  }));
+  await kv.put("graph:index:v2", JSON.stringify({
+    version: 1,
+    updatedAt: now,
+    nodes: {
+      connector: {
+        w: [["middle-one", "https://www.chess.com/game/live/311"]],
+        l: [],
+        ts: now,
+      },
+      "middle-one": {
+        w: [["middle-two", "https://www.chess.com/game/live/312"]],
+        l: [["connector", "https://www.chess.com/game/live/311"]],
+        ts: now,
+      },
+      "middle-two": {
+        w: [["omega", "https://www.chess.com/game/live/313"]],
+        l: [["middle-one", "https://www.chess.com/game/live/312"]],
+        ts: now,
+      },
+      omega: {
+        w: [],
+        l: [["middle-two", "https://www.chess.com/game/live/313"]],
+        ts: now,
+      },
+    },
+  }));
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    throw new Error("a non-improving graph route must not be verified");
+  };
+
+  const result = await __test.tryFastLaneConnection(
+    { GAMES_CACHE: kv },
+    { start: "alpha", target: "omega", range: "auto", chain: null },
+    { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+  );
+
+  assert.deepEqual(result.chain.path, ["alpha", "saved-one", "saved-two", "omega"]);
+  assert.equal(requests, 0);
 });
 
 test("exact live-game proofs verify winners without scanning monthly archives", async () => {

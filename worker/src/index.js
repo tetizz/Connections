@@ -12,7 +12,7 @@
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-07-24-exact-proof-v3";
+const WORKER_RELEASE = "2026-07-24-verified-graph-fastpath-v4";
 const CACHE_SCHEMA_VERSION = 2;
 const TTL_SECONDS = 7 * 24 * 60 * 60;
 const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -31,7 +31,7 @@ const CHESS_RATE_LIMIT_KEY = "games:ratelimit:chesscom";
 const GRAPH_INDEX_KEY = "graph:index:v2";
 const GRAPH_INDEX_NODE_LIMIT = 900;
 const GRAPH_INDEX_EDGE_LIMIT = 64;
-const GRAPH_INDEX_WARM_KEY_LIMIT = 900;
+const GRAPH_INDEX_WARM_KEY_SCAN_LIMIT = 10000;
 const GRAPH_BRIDGE_CONNECTOR_LIMIT = 600;
 const SEARCH_MAX_DEPTH = 63;
 const SEARCH_MAX_EXPANSIONS = Number.MAX_SAFE_INTEGER;
@@ -62,6 +62,7 @@ const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
 const CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS = 24;
 const CACHED_SHORTER_CHECK_CONCURRENCY = 16;
 const CACHED_SHORTER_CHECK_TIME_MS = 4500;
+const RECENTLY_VERIFIED_ROUTE_MS = 60 * 1000;
 const VISIBLE_SHORTER_CHECK_MIN_STEPS = 4;
 const STARTUP_CACHE_BFS_EXPANSIONS = 600;
 const STARTUP_CACHE_BFS_TIME_MS = 1600;
@@ -965,36 +966,54 @@ async function runSearchJobChunk(env, id, options = {}) {
             return readSearchJob(env, id);
           }
         } else {
-        const players = {};
-        await runThrottled(fastLane.chain.path.map((username) => async () => {
-          const profile = await readOrFetchProfile(env, username);
-          if (profile) players[username] = profile;
-        }), 3);
-        const targetProfile = players[job.target] || await readOrFetchProfile(env, job.target) || {};
-        const chain = {
-          target: job.target,
-          display: targetProfile.name || targetProfile.username || job.target,
-          found: true,
-          length: Math.max(0, fastLane.chain.path.length - 1),
-          path: fastLane.chain.path,
-          hops: fastLane.chain.hops,
-          quality: routeQuality(fastLane.chain, stats, fastLane.source),
-        };
-        await completeSearchJob(env, job, {
-          status: "found",
-          outcome: "found",
-          progress: fastLane.source === "direct-recent-win"
-            ? `Found a direct recent win from ${job.start} to ${job.target}.`
-            : `Found ${job.start} to ${job.target} through a warmed route.`,
-          chain,
-          players,
-          stats,
-          search,
-          processingUntil: 0,
-          processingToken: "",
-          durationMs: Date.now() - startedAt,
-        }, ownerToken);
-        return readSearchJob(env, id);
+          const players = {};
+          await runThrottled(fastLane.chain.path.map((username) => async () => {
+            const profile = await readOrFetchProfile(env, username);
+            if (profile) players[username] = profile;
+          }), 3);
+          const targetProfile = players[job.target] || await readOrFetchProfile(env, job.target) || {};
+          const chain = {
+            target: job.target,
+            display: targetProfile.name || targetProfile.username || job.target,
+            found: true,
+            length: Math.max(0, fastLane.chain.path.length - 1),
+            path: fastLane.chain.path,
+            hops: fastLane.chain.hops,
+            quality: routeQuality(fastLane.chain, stats, fastLane.source),
+          };
+          const keepCheckingShorter = shouldKeepCheckingFastLane(fastLane);
+          if (keepCheckingShorter) {
+            const updated = await updateOwnedSearchJob(env, id, ownerToken, {
+              status: "running",
+              progress: "Verified a graph route; checking cached proof data for a shorter one.",
+              chain,
+              players,
+              stats,
+              search,
+              refreshCached: true,
+              cachedAt: Date.now(),
+              processingUntil: Date.now() + SEARCH_LEASE_MS,
+              startedAt,
+            });
+            if (!updated) throw new Error("search lease lost");
+            job = updated;
+          } else {
+            await completeSearchJob(env, job, {
+              status: "found",
+              outcome: "found",
+              progress: fastLane.source === "direct-recent-win"
+                ? `Found a direct recent win from ${job.start} to ${job.target}.`
+                : `Found ${job.start} to ${job.target} through a warmed route.`,
+              chain,
+              players,
+              stats,
+              search,
+              processingUntil: 0,
+              processingToken: "",
+              durationMs: Date.now() - startedAt,
+            }, ownerToken);
+            return readSearchJob(env, id);
+          }
         }
       }
       if (job.chain?.found) {
@@ -1244,10 +1263,13 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
     const key = username.toLowerCase();
     if (edgesCache.has(key)) return edgesCache.get(key);
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
+    const routeWasJustVerified = cachedShorterCheck &&
+      Date.now() - Number(job.cachedAt || 0) < RECENTLY_VERIFIED_ROUTE_MS;
     const refreshArchiveLimit = cachedShorterCheck
       ? Math.min(2, Number.isFinite(archiveLimit) ? archiveLimit : 2)
       : archiveLimit;
     const mayRefreshKnownRoute = cachedShorterCheck &&
+      !routeWasJustVerified &&
       Number(stats.requests || 0) < CACHED_SHORTER_CHECK_REQUESTS &&
       (key === job.start || key === job.target);
     try {
@@ -1671,11 +1693,77 @@ async function tryFastLaneConnection(env, job, stats) {
     };
     if (!best || candidate.chain.path.length < best.chain.path.length) best = candidate;
   }
+  if (best?.chain?.path?.length === 3) return best;
+  const graphStepLimit = Math.min(
+    savedStepLimit,
+    best?.chain?.path?.length ? chainStepCount(best.chain) : Number.POSITIVE_INFINITY,
+  );
+  const graphHint = await tryVerifiedGraphRouteHint(env, {
+    job,
+    stats,
+    startEdges: edges,
+    startGames,
+    savedStepLimit: graphStepLimit,
+  }).catch(() => null);
+  if (graphHint && (!best || graphHint.chain.path.length < best.chain.path.length)) {
+    best = graphHint;
+  }
+  if (graphHint) return best;
   const hinted = await tryLeaderboardRouteHint(env, job, stats);
   if (hinted?.path?.length && (!best || hinted.path.length < best.chain.path.length)) {
     return { source: "known-route", chain: hinted };
   }
   return best;
+}
+
+function shouldKeepCheckingFastLane(fastLane) {
+  return fastLane?.source === "verified-graph-hint" &&
+    chainStepCount(fastLane.chain) > 2;
+}
+
+async function tryVerifiedGraphRouteHint(env, {
+  job,
+  stats,
+  startEdges,
+  startGames,
+  savedStepLimit,
+}) {
+  const hinted = await tryGraphIndexBridgeFromStart(env, {
+    start: job.start,
+    target: job.target,
+    range: job.range,
+    startEdges,
+    startGames,
+    savedStepLimit,
+  });
+  const path = Array.isArray(hinted?.chain?.path)
+    ? hinted.chain.path.map(cleanUsername).filter(Boolean)
+    : [];
+  if (
+    path.length < 3 ||
+    path[0] !== job.start ||
+    path[path.length - 1] !== job.target ||
+    new Set(path).size !== path.length ||
+    path.length - 1 >= savedStepLimit
+  ) {
+    return null;
+  }
+  const hops = await verifyPathHops(
+    env,
+    path,
+    archiveLimitForRange(job.range),
+    stats,
+    {
+      allowDeep: job.range === "all",
+      exactProofOnly: true,
+      proofHops: hinted.chain.hops,
+    },
+  );
+  if (hops?.length !== path.length - 1) return null;
+  return {
+    source: "verified-graph-hint",
+    chain: { path, hops },
+  };
 }
 
 async function tryCachedRouteLanes(env, job, stats, savedStepLimit) {
@@ -1761,12 +1849,13 @@ async function tryGraphIndexBridgeFromStart(env, { start, target, range, startEd
 
   const graph = graphIndexShape(await env.GAMES_CACHE.get(GRAPH_INDEX_KEY, { type: "json" }));
   if (!graph.nodes?.[cleanTarget]) return null;
+  const reverseTree = graphIndexReverseTree(graph, cleanTarget);
   let best = null;
   let scanned = 0;
   for (const [connector, urls] of startEdges.beatenByMe) {
     if (scanned++ >= GRAPH_BRIDGE_CONNECTOR_LIMIT) break;
-    if (connector === cleanStart || connector === cleanTarget || !graph.nodes?.[connector]) continue;
-    const tail = graphIndexBfs(graph, connector, cleanTarget);
+    if (connector === cleanStart || connector === cleanTarget) continue;
+    const tail = graphIndexPathFromReverseTree(reverseTree, connector, cleanTarget);
     if (!tail?.path?.length) continue;
     const path = [cleanStart, ...tail.path];
     if (new Set(path).size !== path.length) continue;
@@ -1785,6 +1874,53 @@ async function tryGraphIndexBridgeFromStart(env, { start, target, range, startEd
     if (best && best.chain.path.length <= 3) break;
   }
   return best;
+}
+
+function graphIndexReverseTree(graph, target) {
+  const nodes = graph?.nodes || {};
+  const cleanTarget = cleanUsername(target);
+  const tree = new Map();
+  if (!cleanTarget || !nodes[cleanTarget]) return tree;
+  tree.set(cleanTarget, { next: null, hopUrl: null, depth: 0 });
+  let frontier = [cleanTarget];
+  for (let depth = 0; depth < SEARCH_MAX_DEPTH && frontier.length; depth++) {
+    const nextFrontier = [];
+    for (const node of frontier) {
+      for (const row of Array.isArray(nodes[node]?.l) ? nodes[node].l : []) {
+        const predecessor = cleanUsername(row?.[0]);
+        const hopUrl = cleanUrl(row?.[1]);
+        if (!predecessor || !hopUrl || tree.has(predecessor)) continue;
+        tree.set(predecessor, { next: node, hopUrl, depth: depth + 1 });
+        nextFrontier.push(predecessor);
+        if (tree.size >= SEARCH_VISITED_LIMIT) break;
+      }
+      if (tree.size >= SEARCH_VISITED_LIMIT) break;
+    }
+    frontier = uniqueUsernameList(nextFrontier, SEARCH_NEXT_FRONTIER_LIMIT);
+    if (tree.size >= SEARCH_VISITED_LIMIT) break;
+  }
+  return tree;
+}
+
+function graphIndexPathFromReverseTree(tree, start, target) {
+  const cleanStart = cleanUsername(start);
+  const cleanTarget = cleanUsername(target);
+  if (!cleanStart || !cleanTarget || !tree?.has(cleanStart)) return null;
+  const path = [cleanStart];
+  const hops = [];
+  const seen = new Set(path);
+  let current = cleanStart;
+  while (current !== cleanTarget && hops.length < SEARCH_MAX_DEPTH) {
+    const row = tree.get(current);
+    const next = cleanUsername(row?.next);
+    const url = cleanUrl(row?.hopUrl);
+    if (!next || !url || seen.has(next)) return null;
+    hops.push({ from: current, to: next, url });
+    path.push(next);
+    seen.add(next);
+    current = next;
+  }
+  return current === cleanTarget ? { path, hops } : null;
 }
 
 function edgeMapSize(map) {
@@ -1863,6 +1999,7 @@ async function verifyPathHops(env, path, archiveLimit, stats = null, options = {
         const verifiedProof = await verifyLiveGameProof(env, suppliedProof, exactArchiveLimit, stats);
         if (verifiedProof) return verifiedProof;
       }
+      if (options.exactProofOnly) return null;
       const games = await readOrFetchGames(env, { username: from, archiveLimit: limit }, stats);
       const urls = edgesFromGames(from, games).beatenByMe.get(to);
       if (urls?.length) return (await enrichHopsFromGames([{ from, to, url: urls[0] }], games))[0] || null;
@@ -2439,35 +2576,6 @@ function graphRowsFromMap(map) {
   return rows;
 }
 
-async function upsertGraphIndex(envOrKv, username, edges, ts = Date.now()) {
-  const kv = envOrKv?.GAMES_CACHE || envOrKv;
-  const clean = cleanUsername(username);
-  if (!kv || !clean || !edges) return;
-  try {
-    const graph = graphIndexShape(await kv.get(GRAPH_INDEX_KEY, { type: "json" }));
-    graph.nodes[clean] = {
-      w: graphRowsFromMap(edges.beatenByMe),
-      l: graphRowsFromMap(edges.beatMe),
-      ts,
-    };
-    trimGraphIndex(graph);
-    await kv.put(GRAPH_INDEX_KEY, JSON.stringify({
-      version: 1,
-      updatedAt: Date.now(),
-      nodes: graph.nodes,
-    }), {
-      expirationTtl: KV_RETENTION_SECONDS,
-      metadata: { type: "graph-index" },
-    });
-  } catch (error) {
-    console.warn(JSON.stringify({
-      event: "graph_index_update_failed",
-      username: clean,
-      message: error?.message || String(error),
-    }));
-  }
-}
-
 function trimGraphIndex(graph) {
   const entries = Object.entries(graph.nodes || {});
   if (entries.length <= GRAPH_INDEX_NODE_LIMIT) return;
@@ -2481,41 +2589,48 @@ function trimGraphIndex(graph) {
 
 async function rebuildGraphIndex(env) {
   const [edgeKeys, gameKeys] = await Promise.all([
-    listKvKeys(env, "edges:", GRAPH_INDEX_WARM_KEY_LIMIT),
-    listKvKeys(env, "games:", GRAPH_INDEX_WARM_KEY_LIMIT),
+    listKvKeys(env, "edges:", GRAPH_INDEX_WARM_KEY_SCAN_LIMIT),
+    listKvKeys(env, "games:", GRAPH_INDEX_WARM_KEY_SCAN_LIMIT),
   ]);
-  const nodes = {};
-  await runThrottled(edgeKeys.map((key) => async () => {
-    const cached = await env.GAMES_CACHE.get(key.name, { type: "json", cacheTtl: 60 });
-    const username = cleanUsername(key.name.replace(/^edges:/, "").split(":")[0]);
-    const edges = cached?.schema === CACHE_SCHEMA_VERSION
-      ? deserializeEdges(cached?.edges)
-      : null;
-    if (!username || !edges) return;
-    nodes[username] = {
-      w: graphRowsFromMap(edges.beatenByMe),
-      l: graphRowsFromMap(edges.beatMe),
-      ts: Number.isFinite(cached?.ts) ? cached.ts : Date.now(),
-    };
+  const plans = selectGraphCachePlans(edgeKeys, gameKeys);
+  const candidates = await runThrottled(plans.map((plan) => async () => {
+    for (const candidate of [plan.primary, plan.fallback].filter(Boolean)) {
+      const cached = await env.GAMES_CACHE.get(candidate.name, { type: "json", cacheTtl: 60 });
+      const cachedTs = Number.isFinite(cached?.ts) ? cached.ts : candidate.ts || Date.now();
+      if (candidate.source === "edges") {
+        const edges = cached?.schema === CACHE_SCHEMA_VERSION
+          ? deserializeEdges(cached?.edges)
+          : null;
+        if (!edges) continue;
+        return {
+          username: plan.username,
+          w: graphRowsFromMap(edges.beatenByMe),
+          l: graphRowsFromMap(edges.beatMe),
+          ts: cachedTs,
+        };
+      }
+      const games = cached?.schema === CACHE_SCHEMA_VERSION && Array.isArray(cached?.games)
+        ? cached.games
+        : null;
+      if (!games) continue;
+      const edges = edgesFromGames(plan.username, games);
+      await putEdgesCache(env.GAMES_CACHE, candidate.cacheName, {
+        username: plan.username,
+        archiveLimit: archiveLimitFromCacheName(candidate.cacheName),
+      }, edges, cachedTs);
+      return {
+        username: plan.username,
+        w: graphRowsFromMap(edges.beatenByMe),
+        l: graphRowsFromMap(edges.beatMe),
+        ts: cachedTs,
+      };
+    }
+    return null;
   }), 12);
-  await runThrottled(gameKeys.map((key) => async () => {
-    const cacheName = key.name.replace(/^games:/, "");
-    const username = cleanUsername(cacheName.split(":")[0]);
-    if (!username || nodes[username]) return;
-    const cached = await env.GAMES_CACHE.get(key.name, { type: "json", cacheTtl: 60 });
-    const games = cached?.schema === CACHE_SCHEMA_VERSION && Array.isArray(cached?.games)
-      ? cached.games
-      : null;
-    if (!games) return;
-    const edges = edgesFromGames(username, games);
-    const ts = Number.isFinite(cached?.ts) ? cached.ts : Date.now();
-    await putEdgesCache(env.GAMES_CACHE, cacheName, { username, archiveLimit: archiveLimitFromCacheName(cacheName) }, edges, ts, false);
-    nodes[username] = {
-      w: graphRowsFromMap(edges.beatenByMe),
-      l: graphRowsFromMap(edges.beatMe),
-      ts,
-    };
-  }), 12);
+  const nodes = Object.fromEntries(candidates.filter(Boolean).map((candidate) => [
+    candidate.username,
+    { w: candidate.w, l: candidate.l, ts: candidate.ts },
+  ]));
   const graph = graphIndexShape({ version: 1, updatedAt: Date.now(), nodes });
   trimGraphIndex(graph);
   await env.GAMES_CACHE.put(GRAPH_INDEX_KEY, JSON.stringify({
@@ -2527,6 +2642,76 @@ async function rebuildGraphIndex(env) {
     metadata: { type: "graph-index" },
   });
   return Object.keys(graph.nodes).length;
+}
+
+function selectGraphCachePlans(edgeKeys, gameKeys) {
+  const byUsername = new Map();
+  for (const [source, keys] of [["edges", edgeKeys], ["games", gameKeys]]) {
+    for (const key of Array.isArray(keys) ? keys : []) {
+      const candidate = graphCacheKeyCandidate(key, source);
+      if (!candidate) continue;
+      const group = byUsername.get(candidate.username) || [];
+      group.push(candidate);
+      byUsername.set(candidate.username, group);
+    }
+  }
+  return [...byUsername.entries()]
+    .map(([username, candidates]) => {
+      candidates.sort(compareGraphCacheCandidates);
+      return {
+        username,
+        primary: candidates[0],
+        fallback: candidates.find((candidate) => candidate.source !== candidates[0]?.source) || null,
+      };
+    })
+    .sort((a, b) => {
+      const warmPriority = warmTargetPriority(a.username) - warmTargetPriority(b.username);
+      if (warmPriority) return warmPriority;
+      const fresh = Number(b.primary?.ts || 0) - Number(a.primary?.ts || 0);
+      if (fresh) return fresh;
+      return graphUsernameOrder(a.username) - graphUsernameOrder(b.username);
+    })
+    .slice(0, GRAPH_INDEX_NODE_LIMIT);
+}
+
+function graphCacheKeyCandidate(key, source) {
+  const name = String(key?.name || "");
+  const expectedPrefix = `${source}:`;
+  if (!name.startsWith(expectedPrefix)) return null;
+  const cacheName = name.slice(expectedPrefix.length);
+  const username = cleanUsername(cacheName.split(":")[0]);
+  if (!username) return null;
+  return {
+    name,
+    cacheName,
+    username,
+    source,
+    priority: graphCacheRangePriority(cacheName),
+    ts: Number(key?.metadata?.ts || 0),
+  };
+}
+
+function compareGraphCacheCandidates(a, b) {
+  if (a.priority !== b.priority) return b.priority - a.priority;
+  if (a.source !== b.source) return a.source === "edges" ? -1 : 1;
+  return Number(b.ts || 0) - Number(a.ts || 0);
+}
+
+function graphUsernameOrder(username) {
+  let hash = 2166136261;
+  for (const char of String(username || "")) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function graphCacheRangePriority(cacheName) {
+  const value = String(cacheName || "");
+  if (value.endsWith(":all")) return Number.POSITIVE_INFINITY;
+  const match = value.match(/:recent:(\d+)$/);
+  const months = Number(match?.[1]);
+  return Number.isFinite(months) ? months : 0;
 }
 
 async function readGraphIndexNodeCount(env) {
@@ -2581,6 +2766,7 @@ async function handleWarm(url, request, env, ctx) {
     const graphNodes = await rebuildGraphIndex(env);
     await env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify({
       ...(status || {}),
+      release: WORKER_RELEASE,
       status: "ready",
       updatedAt: Date.now(),
       graphNodes,
@@ -2591,14 +2777,16 @@ async function handleWarm(url, request, env, ctx) {
     return json({ error: "unauthorized" }, 401, "no-store");
   }
   const age = Date.now() - (Number.isFinite(status?.updatedAt) ? status.updatedAt : 0);
-  if (!force && status?.status === "queued" && age < 5 * 60 * 1000) {
+  const currentRelease = status?.release === WORKER_RELEASE;
+  if (!force && currentRelease && status?.status === "queued" && age < 5 * 60 * 1000) {
     return json({ ok: true, status: publicWarmStatus(status), skipped: true }, 200, "no-store");
   }
-  if (!force && status?.status === "ready" && age < WARM_INTERVAL_SECONDS * 1000) {
+  if (!force && currentRelease && status?.status === "ready" && age < WARM_INTERVAL_SECONDS * 1000) {
     return json({ ok: true, status: publicWarmStatus(status), skipped: true }, 200, "no-store");
   }
 
   const next = {
+    release: WORKER_RELEASE,
     status: "queued",
     updatedAt: Date.now(),
     warmed: Number.isFinite(status?.warmed) ? status.warmed : 0,
@@ -2617,6 +2805,7 @@ async function handleWarm(url, request, env, ctx) {
       message: error?.message || String(error),
     }));
     return env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify({
+      release: WORKER_RELEASE,
       status: "failed",
       updatedAt: Date.now(),
       error: error?.message || String(error),
@@ -2672,6 +2861,7 @@ async function warmLeaderboardTargets(env) {
   });
 
   await env.GAMES_CACHE.put(WARM_STATUS_KEY, JSON.stringify({
+    release: WORKER_RELEASE,
     status: "ready",
     updatedAt: Date.now(),
     startedAt,
@@ -5376,6 +5566,7 @@ async function putGamesCache(kv, kvKey, parsed, games) {
       metadata: {
         username: parsed.username,
         range: Number.isFinite(parsed.archiveLimit) ? `recent:${parsed.archiveLimit}` : "all",
+        ts,
       },
     });
     await putEdgesCache(kv, cacheKeyFromParsed(parsed), parsed, edgesFromGames(parsed.username, games), ts);
@@ -5388,7 +5579,7 @@ async function putGamesCache(kv, kvKey, parsed, games) {
   }
 }
 
-async function putEdgesCache(kv, key, parsed, edges, ts = Date.now(), updateIndex = true) {
+async function putEdgesCache(kv, key, parsed, edges, ts = Date.now()) {
   try {
     await kv.put(edgeCacheKey(key), JSON.stringify({
       schema: CACHE_SCHEMA_VERSION,
@@ -5400,9 +5591,9 @@ async function putEdgesCache(kv, key, parsed, edges, ts = Date.now(), updateInde
         username: parsed.username,
         range: Number.isFinite(parsed.archiveLimit) ? `recent:${parsed.archiveLimit}` : "all",
         type: "edges",
+        ts,
       },
     });
-    if (updateIndex) await upsertGraphIndex(kv, parsed.username, edges, ts);
   } catch (error) {
     console.warn(JSON.stringify({
       event: "edges_cache_write_failed",
@@ -5529,13 +5720,20 @@ export const __test = Object.freeze({
   advanceServerSearch,
   cleanUsername,
   fetchGames,
+  graphIndexPathFromReverseTree,
+  graphIndexReverseTree,
   initialSearchState,
   legacyPairWarmRoutes,
+  putEdgesCache,
   readOrFetchProfile,
+  rebuildGraphIndex,
   recoverStaleSearchLease,
   searchPauseUntil,
   searchJobShape,
+  selectGraphCachePlans,
+  shouldKeepCheckingFastLane,
   tryFastLaneConnection,
+  tryVerifiedGraphRouteHint,
   verifyLiveGameProof,
   verifyPathHops,
   warmVerificationRoutes,

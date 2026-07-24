@@ -12,7 +12,7 @@
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-07-24-random-search-v2";
+const WORKER_RELEASE = "2026-07-24-exact-proof-v3";
 const CACHE_SCHEMA_VERSION = 2;
 const TTL_SECONDS = 7 * 24 * 60 * 60;
 const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -53,6 +53,9 @@ const SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK = 3;
 const SEARCH_EDGE_MAP_LIMIT = 800;
 const EDGE_CACHE_MAX_BYTES = 600000;
 const GAME_CACHE_SEARCH_MAX_BYTES = 2000000;
+const GAME_PROOF_MAX_BYTES = 256000;
+const GAME_PROOF_CACHE_TTL_SECONDS = 90 * 24 * 60 * 60;
+const ARCHIVE_LIST_CACHE_TTL_SECONDS = 24 * 60 * 60;
 const MAX_CHAIN_NODES = 64;
 const CACHED_SHORTER_CHECK_REQUESTS = 12;
 const CACHED_SHORTER_CHECK_EXPANSIONS = 96;
@@ -1799,7 +1802,13 @@ async function tryLeaderboardRouteHint(env, job, stats) {
     .sort((a, b) => a.steps - b.steps || b.ts - a.ts)
     .slice(0, 3);
   for (const entry of candidates) {
-    const verifiedHops = await verifyPathHops(env, entry.path, archiveLimitForRange(job.range), stats);
+    const verifiedHops = await verifyPathHops(
+      env,
+      entry.path,
+      archiveLimitForRange(job.range),
+      stats,
+      { proofHops: entry.hops },
+    );
     if (verifiedHops?.length === entry.path.length - 1) {
       const chain = {
         target: entry.target,
@@ -1842,11 +1851,18 @@ async function verifyPathHops(env, path, archiveLimit, stats = null, options = {
   if (cleanPath.length < 2 || new Set(cleanPath).size !== cleanPath.length) return null;
   const exactArchiveLimit = Number.isFinite(archiveLimit) ? archiveLimit : Infinity;
   const limit = Math.min(Number.isFinite(archiveLimit) ? archiveLimit : 12, 12);
+  const proofHops = new Map(cleanHopList(options.proofHops)
+    .map((hop) => [`${hop.from}>${hop.to}`, hop]));
   const hops = await runThrottled(cleanPath.slice(0, -1).map((from, index) => async () => {
     const to = cleanPath[index + 1];
     try {
       const cachedHop = await findCachedHop(env, from, to, exactArchiveLimit);
       if (cachedHop) return cachedHop;
+      const suppliedProof = proofHops.get(`${from}>${to}`);
+      if (suppliedProof && String(env.EXACT_GAME_PROOF_ENABLED || "true") !== "false") {
+        const verifiedProof = await verifyLiveGameProof(env, suppliedProof, exactArchiveLimit, stats);
+        if (verifiedProof) return verifiedProof;
+      }
       const games = await readOrFetchGames(env, { username: from, archiveLimit: limit }, stats);
       const urls = edgesFromGames(from, games).beatenByMe.get(to);
       if (urls?.length) return (await enrichHopsFromGames([{ from, to, url: urls[0] }], games))[0] || null;
@@ -1855,8 +1871,234 @@ async function verifyPathHops(env, path, archiveLimit, stats = null, options = {
     } catch {
       return null;
     }
-  }), 3);
+  }), 2);
   return hops.every(Boolean) ? cleanHopList(hops) : null;
+}
+
+async function verifyLiveGameProof(env, hop, archiveLimit, stats = null) {
+  const from = cleanUsername(hop?.from);
+  const to = cleanUsername(hop?.to);
+  const proofUrl = cleanUrl(hop?.url);
+  const gameId = liveGameIdFromProofUrl(proofUrl);
+  if (!env?.GAMES_CACHE || !from || !to || from === to || !gameId) return null;
+
+  const cacheKey = `proof:game:v1:${gameId}`;
+  let fact = await env.GAMES_CACHE.get(cacheKey, { type: "json", cacheTtl: 60 }).catch(() => null);
+  if (!validGameProofFact(fact, gameId)) {
+    fact = await fetchLiveGameProofFact(gameId, stats);
+    if (!fact) return null;
+    await env.GAMES_CACHE.put(cacheKey, JSON.stringify(fact), {
+      expirationTtl: GAME_PROOF_CACHE_TTL_SECONDS,
+      metadata: { type: "game-proof", gameId },
+    }).catch(() => {});
+  }
+
+  const fromPlayer = fact.players.find((player) => player.username === from);
+  const toPlayer = fact.players.find((player) => player.username === to);
+  if (!fromPlayer || !toPlayer || fromPlayer.color === toPlayer.color ||
+      fromPlayer.color !== fact.winnerColor) {
+    return null;
+  }
+  if (!await proofTimestampInArchiveRange(env, from, fact.endTime, archiveLimit, stats)) {
+    return null;
+  }
+  return {
+    from,
+    to,
+    url: `https://www.chess.com/game/live/${gameId}`,
+    timeClass: fact.timeClass,
+    endTime: fact.endTime,
+    result: "win",
+    color: fromPlayer.color,
+    opening: fact.opening,
+  };
+}
+
+function liveGameIdFromProofUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value || ""));
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "www.chess.com" ||
+      url.port || url.username || url.password || url.search || url.hash) {
+    return null;
+  }
+  const match = url.pathname.match(/^\/game\/live\/([1-9]\d*)$/);
+  if (!match) return null;
+  const gameId = Number(match[1]);
+  return Number.isSafeInteger(gameId) && gameId > 0 ? gameId : null;
+}
+
+async function fetchLiveGameProofFact(gameId, stats = null) {
+  const callbackUrl = `https://www.chess.com/callback/live/game/${gameId}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.min(FETCH_TIMEOUT_MS, 5000));
+  let response;
+  let text;
+  try {
+    if (stats) stats.requests = Number(stats.requests || 0) + 1;
+    response = await fetch(callbackUrl, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "chess-connections-cache/2.0 (+https://github.com/tetizz/Connections/issues)",
+      },
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    if (!response.ok || response.status >= 300 && response.status < 400) return null;
+    text = await readLimitedResponseText(response, GAME_PROOF_MAX_BYTES);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (text == null) return null;
+
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const game = payload?.game;
+  if (Number(game?.id) !== gameId || game?.isLiveGame !== true ||
+      game?.isFinished !== true || game?.type !== "chess") {
+    return null;
+  }
+  const winnerColor = String(game?.colorOfWinner || "").toLowerCase();
+  const endTime = cleanProofTimestamp(game?.endTime);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const rawPlayers = [payload?.players?.top, payload?.players?.bottom];
+  const players = rawPlayers.map((player) => ({
+    username: cleanUsername(player?.username),
+    color: String(player?.color || "").toLowerCase(),
+    isComputer: player?.isComputer,
+  }));
+  if (!["white", "black"].includes(winnerColor) || !endTime ||
+      endTime > nowSeconds + 24 * 60 * 60 ||
+      players.length !== 2 ||
+      players.some((player) =>
+        !player.username ||
+        !["white", "black"].includes(player.color) ||
+        player.isComputer !== false) ||
+      players[0].username === players[1].username ||
+      players[0].color === players[1].color) {
+    return null;
+  }
+  const headers = game?.pgnHeaders && typeof game.pgnHeaders === "object" &&
+    !Array.isArray(game.pgnHeaders)
+    ? game.pgnHeaders
+    : null;
+  if (!headers) return null;
+  const white = players.find((player) => player.color === "white");
+  const black = players.find((player) => player.color === "black");
+  const headerWhite = cleanUsername(headers.White);
+  const headerBlack = cleanUsername(headers.Black);
+  const headerResult = String(headers.Result || "");
+  const expectedResult = winnerColor === "white" ? "1-0" : "0-1";
+  if (headerWhite !== white.username ||
+      headerBlack !== black.username ||
+      headerResult !== expectedResult) {
+    return null;
+  }
+  if (stats) stats.fetched = Number(stats.fetched || 0) + 1;
+  const typeName = String(game?.typeName || "").toLowerCase();
+  const fact = {
+    schema: 1,
+    gameId,
+    endTime,
+    winnerColor,
+    players,
+    timeClass: ["rapid", "blitz", "bullet"].find((type) => typeName.includes(type)) || "",
+    opening: String(headers.Opening || headers.ECOUrl || "").slice(0, 90),
+  };
+  return validGameProofFact(fact, gameId) ? fact : null;
+}
+
+function validGameProofFact(value, gameId) {
+  const players = Array.isArray(value?.players) ? value.players : [];
+  return value?.schema === 1 &&
+    value.gameId === gameId &&
+    cleanProofTimestamp(value.endTime) === value.endTime &&
+    value.endTime <= Math.floor(Date.now() / 1000) + 24 * 60 * 60 &&
+    ["white", "black"].includes(value.winnerColor) &&
+    players.length === 2 &&
+    players[0].username !== players[1].username &&
+    players[0].color !== players[1].color &&
+    players.some((player) => player.color === value.winnerColor) &&
+    players.every((player) =>
+      cleanUsername(player.username) === player.username &&
+      ["white", "black"].includes(player.color) &&
+      player.isComputer === false);
+}
+
+async function proofTimestampInArchiveRange(env, username, endTime, archiveLimit, stats = null) {
+  if (!Number.isFinite(archiveLimit)) return true;
+  const months = Math.max(1, Math.floor(archiveLimit));
+  const cacheKey = `archives:v1:${cleanUsername(username)}`;
+  let record = await env.GAMES_CACHE.get(cacheKey, { type: "json", cacheTtl: 60 }).catch(() => null);
+  if (!record || !Array.isArray(record.months) ||
+      Date.now() - Number(record.ts || 0) >= ARCHIVE_LIST_CACHE_TTL_SECONDS * 1000) {
+    try {
+      if (stats) stats.requests = Number(stats.requests || 0) + 1;
+      const data = await fetchJSON(`${CHESS_API}${cleanUsername(username)}/games/archives`);
+      const archiveMonths = Array.isArray(data?.archives)
+        ? data.archives.map(archiveMonthFromUrl).filter(Boolean)
+        : [];
+      record = { schema: 1, ts: Date.now(), months: [...new Set(archiveMonths)] };
+      if (stats) stats.fetched = Number(stats.fetched || 0) + 1;
+      await env.GAMES_CACHE.put(cacheKey, JSON.stringify(record), {
+        expirationTtl: GAME_PROOF_CACHE_TTL_SECONDS,
+        metadata: { type: "archive-list", username: cleanUsername(username) },
+      }).catch(() => {});
+    } catch {
+      return false;
+    }
+  }
+  const proofDate = new Date(endTime * 1000);
+  const proofMonth =
+    `${proofDate.getUTCFullYear()}/${String(proofDate.getUTCMonth() + 1).padStart(2, "0")}`;
+  return record.months.slice(-months).includes(proofMonth);
+}
+
+function archiveMonthFromUrl(value) {
+  const match = String(value || "").match(/\/games\/(\d{4})\/(\d{2})\/?$/);
+  return match ? `${match[1]}/${match[2]}` : "";
+}
+
+async function readLimitedResponseText(response, maxBytes) {
+  const declaredLength = Number(response.headers.get("Content-Length") || 0);
+  if (declaredLength > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!response.body?.getReader) {
+    const text = await response.text();
+    return new TextEncoder().encode(text).byteLength <= maxBytes ? text : null;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } catch {
+    await reader.cancel().catch(() => {});
+    return null;
+  }
 }
 
 async function verifyPathHopsFromCache(env, path) {
@@ -2481,15 +2723,21 @@ async function warmFastLaneFragments(env) {
   }), 3);
   const unverifiedRoutes = await warmVerificationRoutes(env);
   const verifyDeadline = Date.now() + WARM_VERIFY_TIME_MS;
+  const verifiedPairs = new Set();
   for (const entry of unverifiedRoutes) {
     if (Date.now() >= verifyDeadline) break;
+    const pairKey = `${entry.start}|${entry.target}|${entry.range}`;
+    if (verifiedPairs.has(pairKey)) continue;
     const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
     const hops = await verifyPathHops(
       env,
       entry.path,
       archiveLimitForRange(entry.range),
       stats,
-      { allowDeep: entry.range === "all" },
+      {
+        allowDeep: entry.range === "all",
+        proofHops: entry.hops,
+      },
     );
     if (hops?.length !== entry.path.length - 1) continue;
     const shaped = searchJobShape({
@@ -2512,6 +2760,7 @@ async function warmFastLaneFragments(env) {
     if (shaped?.chain?.found) {
       await writePairChain(env, shaped);
       await writeFastLaneFragments(env, shaped);
+      verifiedPairs.add(pairKey);
       fragments += Math.max(0, shaped.chain.path.length - 1);
     }
   }
@@ -2520,12 +2769,12 @@ async function warmFastLaneFragments(env) {
 
 async function warmVerificationRoutes(env) {
   const leaderboardRoutes = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || [])
-    .filter((entry) => cleanHopList(entry.hops).length !== entry.path.length - 1)
     .map((entry) => ({
       source: "leaderboard",
       start: entry.start,
       target: entry.target,
       path: entry.path,
+      hops: entry.hops,
       steps: entry.steps,
       range: entry.range,
       ts: entry.ts,
@@ -2535,8 +2784,7 @@ async function warmVerificationRoutes(env) {
     .filter((event) =>
       ["found", "saved"].includes(event.outcome) &&
       Array.isArray(event.path) &&
-      event.path.length >= 2 &&
-      cleanHopList(event.hops).length !== event.path.length - 1)
+      event.path.length >= 2)
     .map((event) => {
       const path = normalizePath(event.start, event.target, event.path);
       return {
@@ -2544,24 +2792,102 @@ async function warmVerificationRoutes(env) {
         start: event.start,
         target: event.target,
         path,
+        hops: event.hops,
         steps: Math.max(0, path.length - 1),
         range: cleanRange(event.range) || "auto",
         ts: event.ts,
         pathKey: chainKey(path),
       };
     });
-  const byPair = new Map();
-  for (const route of [...leaderboardRoutes, ...analyticsRoutes]) {
+  const legacyRoutes = await legacyPairWarmRoutes(env);
+  const byPath = new Map();
+  for (const route of [...legacyRoutes, ...leaderboardRoutes, ...analyticsRoutes]) {
     if (!route.start || !route.target || !Array.isArray(route.path) || route.path.length < 2) continue;
-    const key = `${route.start}|${route.target}|${route.range}`;
-    const current = byPair.get(key);
-    if (!current || route.steps < current.steps || (route.steps === current.steps && route.ts > current.ts)) {
-      byPair.set(key, route);
+    const key = `${route.start}|${route.target}|${route.range}|${route.pathKey}`;
+    const current = byPath.get(key);
+    if (!current ||
+        warmRouteSourcePriority(route.source) < warmRouteSourcePriority(current.source) ||
+        (route.source === current.source && route.ts > current.ts)) {
+      byPath.set(key, route);
     }
   }
-  return [...byPair.values()]
-    .sort((a, b) => a.steps - b.steps || b.ts - a.ts)
-    .slice(0, WARM_VERIFY_ROUTE_LIMIT);
+  const pairCounts = new Map();
+  return [...byPath.values()]
+    .sort((a, b) =>
+      warmTargetPriority(a.target) - warmTargetPriority(b.target) ||
+      warmRouteSourcePriority(a.source) - warmRouteSourcePriority(b.source) ||
+      a.steps - b.steps ||
+      b.ts - a.ts)
+    .filter((route) => {
+      const pairKey = `${route.start}|${route.target}|${route.range}`;
+      const count = pairCounts.get(pairKey) || 0;
+      pairCounts.set(pairKey, count + 1);
+      return count < 3;
+    })
+    .slice(0, WARM_VERIFY_ROUTE_LIMIT * 3);
+}
+
+async function legacyPairWarmRoutes(env) {
+  const [legacyKeys, currentKeys] = await Promise.all([
+    listKvKeys(env, "search:pair:", WARM_ROUTE_LIMIT),
+    listKvKeys(env, "search:pair:v2:", WARM_ROUTE_LIMIT),
+  ]);
+  const currentPairs = new Set(currentKeys.map((item) => item.name));
+  const selected = legacyKeys
+    .map((item) => item.name)
+    .filter((key) => !key.startsWith("search:pair:v2:"))
+    .map((key) => ({ key, parts: legacyPairKeyParts(key) }))
+    .filter((item) =>
+      item.parts &&
+      !currentPairs.has(pairChainKey(
+        item.parts.start,
+        item.parts.target,
+        item.parts.range,
+      )))
+    .sort((a, b) =>
+      warmTargetPriority(a.parts.target) - warmTargetPriority(b.parts.target) ||
+      a.key.localeCompare(b.key))
+    .slice(0, WARM_VERIFY_ROUTE_LIMIT * 4);
+  const records = await runThrottled(selected.map((item) => async () => {
+    const raw = await env.GAMES_CACHE.get(item.key, { type: "json", cacheTtl: 60 });
+    return pairChainShape(
+      raw,
+      item.parts.start,
+      item.parts.target,
+      item.parts.range,
+    );
+  }), 3);
+  return records.filter(Boolean).map((record) => ({
+    source: "legacy-pair",
+    start: record.start,
+    target: record.target,
+    path: record.chain.path,
+    hops: record.chain.hops,
+    steps: Math.max(0, record.chain.path.length - 1),
+    range: record.range,
+    ts: record.savedAt || 0,
+    pathKey: chainKey(record.chain.path),
+  }));
+}
+
+function legacyPairKeyParts(key) {
+  const match = String(key || "").match(/^search:pair:([^:]+):([^:]+):(auto|instant|6|12|all)$/);
+  if (!match) return null;
+  const start = cleanUsername(match[1]);
+  const target = cleanUsername(match[2]);
+  const range = cleanRange(match[3]) || "auto";
+  return start && target && start !== target ? { start, target, range } : null;
+}
+
+function warmTargetPriority(target) {
+  const index = COMMON_WARM_TARGETS.indexOf(cleanUsername(target));
+  return index >= 0 ? index : COMMON_WARM_TARGETS.length;
+}
+
+function warmRouteSourcePriority(source) {
+  if (source === "legacy-pair") return 0;
+  if (source === "leaderboard") return 1;
+  return 2;
 }
 
 async function listKvKeys(env, prefix, max) {
@@ -2775,13 +3101,28 @@ async function handleSubmit(request, env) {
   if (isBlockedUsername(start) || isBlockedUsername(target) || pathHasBlockedUser(normalizedPath)) {
     return json({ ok: true, skipped: true }, 200, "no-store");
   }
+  const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
+  if (submitWindow.count >= MAX_SUBMITS_PER_WINDOW) {
+    return json({
+      error: "too many submissions, wait a moment",
+      retryAfter: Math.max(1, SUBMIT_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
+    }, 429);
+  }
+  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
+    startedAt: submitWindow.startedAt,
+    count: submitWindow.count + 1,
+  }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
+
   const verificationStats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
   const verifiedHops = await verifyPathHops(
     env,
     normalizedPath,
     archiveLimitForRange(range),
     verificationStats,
-    { allowDeep: range === "all" },
+    {
+      allowDeep: range === "all",
+      proofHops: submittedHops,
+    },
   );
   if (verifiedHops?.length !== normalizedPath.length - 1) {
     return json({
@@ -2834,14 +3175,6 @@ async function handleSubmit(request, env) {
     }, 200, "no-store");
   }
 
-  const submitWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
-  if (submitWindow.count >= MAX_SUBMITS_PER_WINDOW) {
-    return json({
-      error: "too many submissions, wait a moment",
-      retryAfter: Math.max(1, SUBMIT_WINDOW_SECONDS - Math.floor((Date.now() - submitWindow.startedAt) / 1000)),
-    }, 429);
-  }
-
   const replaced = samePairEntries.length;
   const nextEntries = entries.filter((item) =>
     `${item.start}|${item.target}|${item.range}` !== key);
@@ -2851,10 +3184,6 @@ async function handleSubmit(request, env) {
   if (nextEntries.length > MAX_LEADERBOARD_ENTRIES) nextEntries.length = MAX_LEADERBOARD_ENTRIES;
 
   await env.GAMES_CACHE.put("leaderboard:entries", JSON.stringify(nextEntries));
-  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
-    startedAt: submitWindow.startedAt,
-    count: submitWindow.count + 1,
-  }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
 
   await cacheSubmittedRoute(env, start, target, range, normalizedPath, hops, steps, pathKey);
 
@@ -2882,7 +3211,10 @@ async function cacheSubmittedRoute(env, start, target, range, path, hops, steps,
     path,
     archiveLimitForRange(range),
     stats,
-    { allowDeep: range === "all" },
+    {
+      allowDeep: range === "all",
+      proofHops: hops,
+    },
   );
   if (verifiedHops?.length !== path.length - 1) return false;
   const chain = {
@@ -3387,7 +3719,10 @@ async function readExactAnalyticsPair(env, start, target, range) {
       path,
       archiveLimitForRange(range),
       stats,
-      { allowDeep: cleanRange(range) === "all" },
+      {
+        allowDeep: cleanRange(range) === "all",
+        proofHops: event.hops,
+      },
     );
     if (hops?.length !== path.length - 1) continue;
     const chain = {
@@ -5195,11 +5530,15 @@ export const __test = Object.freeze({
   cleanUsername,
   fetchGames,
   initialSearchState,
+  legacyPairWarmRoutes,
   readOrFetchProfile,
   recoverStaleSearchLease,
   searchPauseUntil,
   searchJobShape,
   tryFastLaneConnection,
+  verifyLiveGameProof,
+  verifyPathHops,
+  warmVerificationRoutes,
 });
 
 function json(body, status = 200, cacheControl = null, extraHeaders = {}) {

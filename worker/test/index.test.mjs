@@ -35,8 +35,15 @@ class MemoryKV {
     this.values.delete(key);
   }
 
-  async list() {
-    return { keys: [], cursor: "" };
+  async list(options = {}) {
+    const prefix = String(options.prefix || "");
+    const limit = Math.max(1, Number(options.limit || 1000));
+    const keys = [...this.values.keys()]
+      .filter((key) => key.startsWith(prefix))
+      .sort()
+      .slice(0, limit)
+      .map((name) => ({ name }));
+    return { keys, cursor: "", list_complete: true };
   }
 }
 
@@ -211,7 +218,7 @@ test("health identifies the deployed reliability release", async () => {
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-07-24-random-search-v2");
+  assert.equal(body.release, "2026-07-24-exact-proof-v3");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {
@@ -466,6 +473,397 @@ test("direct wins beat longer exact fast-lane routes", async () => {
 
   assert.notEqual(result.source, "exact-fast-lane");
   assert.deepEqual(result.chain.path, ["alpha", "omega"]);
+});
+
+test("exact live-game proofs verify winners without scanning monthly archives", async () => {
+  const endTime = Math.floor(Date.now() / 1000) - 60;
+  const month = new Date(endTime * 1000);
+  const archiveUrl =
+    `https://api.chess.com/pub/player/alpha/games/${month.getUTCFullYear()}/` +
+    `${String(month.getUTCMonth() + 1).padStart(2, "0")}`;
+  const requestedUrls = [];
+  globalThis.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    if (String(url).endsWith("/games/archives")) {
+      return response({ archives: [archiveUrl] });
+    }
+    assert.equal(String(url), "https://www.chess.com/callback/live/game/123456");
+    return response({
+      game: {
+        id: 123456,
+        isLiveGame: true,
+        isFinished: true,
+        type: "chess",
+        colorOfWinner: "black",
+        endTime,
+        typeName: "Rapid",
+        pgnHeaders: {
+          White: "Omega",
+          Black: "Alpha",
+          Result: "0-1",
+          Opening: "Scotch Game",
+        },
+      },
+      players: {
+        top: { username: "Alpha", color: "black", isComputer: false },
+        bottom: { username: "Omega", color: "white", isComputer: false },
+      },
+    });
+  };
+  const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+
+  const verified = await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, {
+    from: "alpha",
+    to: "omega",
+    url: "https://www.chess.com/game/live/123456",
+  }, 6, stats);
+
+  assert.deepEqual(verified, {
+    from: "alpha",
+    to: "omega",
+    url: "https://www.chess.com/game/live/123456",
+    timeClass: "rapid",
+    endTime,
+    result: "win",
+    color: "black",
+    opening: "Scotch Game",
+  });
+  assert.equal(stats.requests, 2);
+  assert.equal(stats.fetched, 2);
+  assert.equal(requestedUrls.some((url) => /\/games\/\d{4}\/\d{2}/.test(url)), false);
+});
+
+test("live-game proof verification rejects unsafe, losing, stale, and unfinished claims", async () => {
+  const gameId = 123456;
+  const basePayload = {
+    game: {
+      id: gameId,
+      isLiveGame: true,
+      isFinished: true,
+      type: "chess",
+      colorOfWinner: "white",
+      endTime: Math.floor(Date.now() / 1000) - 60,
+      typeName: "Blitz",
+      pgnHeaders: {
+        White: "omega",
+        Black: "alpha",
+        Result: "1-0",
+      },
+    },
+    players: {
+      top: { username: "alpha", color: "black", isComputer: false },
+      bottom: { username: "omega", color: "white", isComputer: false },
+    },
+  };
+  let payload = basePayload;
+  globalThis.fetch = async () => response(payload);
+
+  assert.equal(await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, {
+    from: "alpha",
+    to: "omega",
+    url: "https://evil.example/game/live/123456",
+  }, 6), null);
+  assert.equal(await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, {
+    from: "alpha",
+    to: "omega",
+    url: "https://www.chess.com/game/daily/123456",
+  }, 6), null);
+  assert.equal(await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, {
+    from: "alpha",
+    to: "omega",
+    url: "https://www.chess.com/game/live/123456",
+  }, 6), null);
+
+  payload = {
+    ...basePayload,
+    game: { ...basePayload.game, colorOfWinner: "black", isFinished: false },
+  };
+  assert.equal(await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, {
+    from: "alpha",
+    to: "omega",
+    url: "https://www.chess.com/game/live/123456",
+  }, 6), null);
+
+  payload = {
+    ...basePayload,
+    game: {
+      ...basePayload.game,
+      colorOfWinner: "black",
+      endTime: 1167609600,
+      pgnHeaders: {
+        White: "omega",
+        Black: "alpha",
+        Result: "0-1",
+      },
+    },
+  };
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/games/archives")) {
+      return response({
+        archives: ["https://api.chess.com/pub/player/alpha/games/2026/07"],
+      });
+    }
+    return response(payload);
+  };
+  assert.equal(await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, {
+    from: "alpha",
+    to: "omega",
+    url: "https://www.chess.com/game/live/123456",
+  }, 2), null);
+});
+
+test("live-game proof URL parsing cannot be used for outbound request forgery", async () => {
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return response({});
+  };
+  const unsafeUrls = [
+    "http://www.chess.com/game/live/123456",
+    "https://user@www.chess.com/game/live/123456",
+    "https://www.chess.com:444/game/live/123456",
+    "https://www.chess.com.evil.example/game/live/123456",
+    "https://www.chess.com/callback/live/game/123456",
+    "https://www.chess.com/game/daily/123456",
+    "https://www.chess.com/game/live/123456/extra",
+    "https://www.chess.com/game/live/123456?redirect=https://evil.example",
+    "https://www.chess.com/game/live/123456#fragment",
+    "https://www.chess.com/game/live/%2F123456",
+    "https://www.chess.com/game/live/0",
+    "https://www.chess.com/game/live/999999999999999999999999",
+  ];
+
+  for (const url of unsafeUrls) {
+    assert.equal(await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, {
+      from: "alpha",
+      to: "omega",
+      url,
+    }, Infinity), null, url);
+  }
+  assert.equal(requests, 0);
+});
+
+test("invalid exact-game responses fail closed and archive verification remains the fallback", async () => {
+  const env = { GAMES_CACHE: new MemoryKV() };
+  const proof = {
+    from: "alpha",
+    to: "omega",
+    url: "https://www.chess.com/game/live/123456",
+  };
+  const basePayload = {
+    game: {
+      id: 123456,
+      isLiveGame: true,
+      isFinished: true,
+      type: "chess",
+      colorOfWinner: "black",
+      endTime: Math.floor(Date.now() / 1000) - 60,
+      typeName: "Rapid",
+      pgnHeaders: { White: "omega", Black: "alpha", Result: "0-1" },
+    },
+    players: {
+      top: { username: "alpha", color: "black", isComputer: false },
+      bottom: { username: "omega", color: "white", isComputer: false },
+    },
+  };
+  const invalidPayloads = [
+    { ...basePayload, game: { ...basePayload.game, id: 999999 } },
+    { ...basePayload, game: { ...basePayload.game, type: "chess960" } },
+    { ...basePayload, game: { ...basePayload.game, pgnHeaders: undefined } },
+    {
+      ...basePayload,
+      game: {
+        ...basePayload.game,
+        pgnHeaders: { White: "omega", Black: "alpha" },
+      },
+    },
+    {
+      ...basePayload,
+      players: {
+        ...basePayload.players,
+        top: { ...basePayload.players.top, isComputer: true },
+      },
+    },
+    {
+      ...basePayload,
+      players: {
+        top: { username: "alpha", color: "black" },
+        bottom: { username: "omega", color: "white", isComputer: false },
+      },
+    },
+    {
+      ...basePayload,
+      game: {
+        ...basePayload.game,
+        pgnHeaders: { White: "alpha", Black: "omega", Result: "0-1" },
+      },
+    },
+  ];
+  for (const payload of invalidPayloads) {
+    globalThis.fetch = async () => response(payload);
+    assert.equal(
+      await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, proof, Infinity),
+      null,
+    );
+  }
+  globalThis.fetch = async () => new Response("x".repeat(256001), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+  assert.equal(
+    await __test.verifyLiveGameProof({ GAMES_CACHE: new MemoryKV() }, proof, Infinity),
+    null,
+  );
+
+  const requested = [];
+  globalThis.fetch = async (url) => {
+    requested.push(String(url));
+    if (String(url).includes("/callback/live/game/")) {
+      return response({ error: "unavailable" }, 503);
+    }
+    if (String(url).endsWith("/games/archives")) {
+      return response({
+        archives: ["https://api.chess.com/pub/player/alpha/games/2026/07"],
+      });
+    }
+    return response({
+      games: [{
+        rules: "chess",
+        white: { username: "omega", result: "resigned" },
+        black: { username: "alpha", result: "win" },
+        url: proof.url,
+        time_class: "rapid",
+        end_time: Math.floor(Date.now() / 1000) - 60,
+      }],
+    });
+  };
+  const verified = await __test.verifyPathHops(
+    env,
+    ["alpha", "omega"],
+    6,
+    { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+    { proofHops: [proof] },
+  );
+  assert.deepEqual(verified.map((hop) => [hop.from, hop.to]), [["alpha", "omega"]]);
+  assert.equal(requested.some((url) => url.includes("/callback/live/game/")), true);
+  assert.equal(requested.some((url) => /\/games\/\d{4}\/\d{2}/.test(url)), true);
+});
+
+test("submit rate limiting happens before any supplied proof fetch", async () => {
+  const kv = new MemoryKV();
+  await kv.put("leaderboard:ratelimit:unknown", JSON.stringify({
+    startedAt: Date.now(),
+    count: 30,
+  }));
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return response({});
+  };
+
+  const submitted = await worker.fetch(
+    new Request("https://worker.test/submit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        start: "alpha",
+        target: "omega",
+        range: "auto",
+        length: 0,
+        path: ["alpha", "omega"],
+        hops: [{
+          from: "alpha",
+          to: "omega",
+          url: "https://www.chess.com/game/live/123456",
+        }],
+      }),
+    }),
+    { GAMES_CACHE: kv },
+    {},
+  );
+
+  assert.equal(submitted.status, 429);
+  assert.equal(requests, 0);
+});
+
+test("legacy pair routes are selected for verified background migration", async () => {
+  const kv = new MemoryKV();
+  const now = Date.now();
+  await kv.put("search:pair:alpha:magnuscarlsen:auto", JSON.stringify({
+    start: "alpha",
+    target: "magnuscarlsen",
+    range: "auto",
+    chain: {
+      target: "magnuscarlsen",
+      found: true,
+      length: 1,
+      path: ["alpha", "magnuscarlsen"],
+      hops: [{
+        from: "alpha",
+        to: "magnuscarlsen",
+        url: "https://www.chess.com/game/live/123456",
+      }],
+    },
+    savedAt: now,
+  }));
+
+  const routes = await __test.legacyPairWarmRoutes({ GAMES_CACHE: kv });
+
+  assert.equal(routes.length, 1);
+  assert.equal(routes[0].source, "legacy-pair");
+  assert.deepEqual(routes[0].path, ["alpha", "magnuscarlsen"]);
+  assert.equal(routes[0].hops[0].url, "https://www.chess.com/game/live/123456");
+});
+
+test("unverified analytics shortcuts cannot suppress legacy warm candidates", async () => {
+  const kv = new MemoryKV();
+  const now = Date.now();
+  await kv.put("search:pair:alpha:magnuscarlsen:auto", JSON.stringify({
+    start: "alpha",
+    target: "magnuscarlsen",
+    range: "auto",
+    chain: {
+      target: "magnuscarlsen",
+      found: true,
+      length: 2,
+      path: ["alpha", "beta", "magnuscarlsen"],
+      hops: [
+        {
+          from: "alpha",
+          to: "beta",
+          url: "https://www.chess.com/game/live/123456",
+        },
+        {
+          from: "beta",
+          to: "magnuscarlsen",
+          url: "https://www.chess.com/game/live/123457",
+        },
+      ],
+    },
+    savedAt: now,
+  }));
+  await kv.put("analytics:events", JSON.stringify([{
+    id: "unverified-shortcut",
+    ts: now + 1,
+    outcome: "found",
+    start: "alpha",
+    target: "magnuscarlsen",
+    range: "auto",
+    path: ["alpha", "magnuscarlsen"],
+    hops: [{
+      from: "alpha",
+      to: "magnuscarlsen",
+      url: "https://www.chess.com/game/live/999999",
+    }],
+  }]));
+
+  const routes = (await __test.warmVerificationRoutes({ GAMES_CACHE: kv }))
+    .filter((route) => route.start === "alpha" && route.target === "magnuscarlsen");
+
+  assert.equal(routes.length, 2);
+  assert.equal(routes[0].source, "legacy-pair");
+  assert.equal(routes[1].source, "analytics");
+  assert.deepEqual(routes[0].path, ["alpha", "beta", "magnuscarlsen"]);
 });
 
 test("all-history analytics routes are isolated from instant searches", async () => {

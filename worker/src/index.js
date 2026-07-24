@@ -12,7 +12,7 @@
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-07-24-verified-graph-fastpath-v4";
+const WORKER_RELEASE = "2026-07-24-continuous-search-v5";
 const CACHE_SCHEMA_VERSION = 2;
 const TTL_SECONDS = 7 * 24 * 60 * 60;
 const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -39,7 +39,9 @@ const SEARCH_FRONTIER_LIMIT = 1000;
 const SEARCH_CHUNK_EXPANSIONS = 512;
 const SEARCH_CHUNK_TIME_MS = 5000;
 const SEARCH_EXPANSION_CONCURRENCY = 2;
-const SEARCH_BACKGROUND_TIME_MS = 120000;
+// Each invocation does a short burst, then the job's Durable Object alarm
+// continues it without relying on a browser poll.
+const SEARCH_BACKGROUND_TIME_MS = 10000;
 const SEARCH_LEASE_MS = 24000;
 const SEARCH_STALE_LEASE_MS = SEARCH_LEASE_MS + 2000;
 const SEARCH_POLL_FORCE_AFTER_MS = SEARCH_STALE_LEASE_MS;
@@ -47,7 +49,7 @@ const SEARCH_MAX_STALLED_CHUNKS = 3;
 const SEARCH_VISITED_LIMIT = 8000;
 const SEARCH_NEXT_FRONTIER_LIMIT = 800;
 const SEARCH_CACHE_EDGE_LOOKUP_TIMEOUT_MS = 350;
-const SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS = 6500;
+const SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS = 12000;
 const SEARCH_FRESH_EDGE_REQUEST_LIMIT = 160;
 const SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK = 3;
 const SEARCH_EDGE_MAP_LIMIT = 800;
@@ -113,35 +115,42 @@ export class SearchJobObject {
         body = {};
       }
     }
-    if (url.pathname === "/read") {
-      return json({ job: await this.readJob() }, 200, "no-store");
+    const result = await this.applyAction(url.pathname.slice(1), body);
+    return json(result.body, result.status, "no-store");
+  }
+
+  async applyAction(action, body = {}) {
+    if (action === "read") {
+      return { status: 200, body: { job: await this.readJob() } };
     }
-    if (url.pathname === "/write") {
+    if (action === "write") {
       const shaped = searchJobShape(body.job);
-      if (!shaped) return json({ error: "invalid job" }, 400, "no-store");
+      if (!shaped) return { status: 400, body: { error: "invalid job" } };
       await this.writeJob(shaped);
-      return json({ job: shaped }, 200, "no-store");
+      return { status: 200, body: { job: shaped } };
     }
-    if (url.pathname === "/update") {
+    if (action === "update") {
       const current = await this.readJob();
-      if (!current) return json({ job: null }, 200, "no-store");
+      if (!current) return { status: 200, body: { job: null } };
       const next = searchJobShape({
         ...current,
         ...(body.patch || {}),
         stats: body.patch?.stats || current.stats,
         updatedAt: Date.now(),
       });
-      if (!next) return json({ job: null }, 200, "no-store");
+      if (!next) return { status: 200, body: { job: null } };
       await this.writeJob(next);
-      return json({ job: next }, 200, "no-store");
+      return { status: 200, body: { job: next } };
     }
-    if (url.pathname === "/claim") {
+    if (action === "claim") {
       const current = await this.readJob();
-      if (!current || !isActiveSearchStatus(current.status)) return json({ job: null }, 200, "no-store");
+      if (!current || !isActiveSearchStatus(current.status)) {
+        return { status: 200, body: { job: null } };
+      }
       const token = cleanAnalyticsId(body.token);
-      if (!token) return json({ job: current }, 200, "no-store");
+      if (!token) return { status: 200, body: { job: current } };
       if (Number(current.processingUntil || 0) > Date.now() && current.processingToken !== token) {
-        return json({ job: current }, 200, "no-store");
+        return { status: 200, body: { job: current } };
       }
       const next = searchJobShape({
         ...current,
@@ -151,12 +160,14 @@ export class SearchJobObject {
         updatedAt: Date.now(),
       });
       await this.writeJob(next);
-      return json({ job: next }, 200, "no-store");
+      return { status: 200, body: { job: next } };
     }
-    if (url.pathname === "/update-owned") {
+    if (action === "update-owned") {
       const current = await this.readJob();
       const token = cleanAnalyticsId(body.token);
-      if (!current || current.processingToken !== token) return json({ job: null }, 200, "no-store");
+      if (!current || current.processingToken !== token) {
+        return { status: 200, body: { job: null } };
+      }
       const patch = body.patch || {};
       const next = searchJobShape({
         ...current,
@@ -165,11 +176,11 @@ export class SearchJobObject {
         stats: patch.stats || current.stats,
         updatedAt: Date.now(),
       });
-      if (!next) return json({ job: null }, 200, "no-store");
+      if (!next) return { status: 200, body: { job: null } };
       await this.writeJob(next);
-      return json({ job: next }, 200, "no-store");
+      return { status: 200, body: { job: next } };
     }
-    return json({ error: "not found" }, 404, "no-store");
+    return { status: 404, body: { error: "not found" } };
   }
 
   async readJob() {
@@ -184,14 +195,47 @@ export class SearchJobObject {
 
   async writeJob(job) {
     await this.state.storage.put("job", job);
+    await this.scheduleAlarm(job);
+  }
+
+  async scheduleAlarm(job) {
     if (typeof this.state.storage.setAlarm === "function") {
       const expiresAt = Number(job.createdAt || Date.now()) + SEARCH_JOB_TTL_SECONDS * 1000;
-      await this.state.storage.setAlarm(Math.max(Date.now() + 1000, expiresAt));
+      const processingUntil = Number(job.processingUntil || 0);
+      const resumeAt = isActiveSearchStatus(job.status)
+        ? Math.max(Date.now() + 1000, processingUntil)
+        : expiresAt;
+      await this.state.storage.setAlarm(Math.min(expiresAt, resumeAt));
     }
   }
 
   async alarm() {
-    await this.state.storage.deleteAll();
+    const job = await this.readJob();
+    if (!job) return;
+    if (!isActiveSearchStatus(job.status)) {
+      await this.scheduleAlarm(job);
+      return;
+    }
+    if (Number(job.processingUntil || 0) > Date.now()) {
+      await this.scheduleAlarm(job);
+      return;
+    }
+
+    const localEnv = Object.assign(Object.create(this.env), {
+      __SEARCH_JOB_LOCAL: { id: job.id, object: this },
+    });
+    try {
+      await runSearchJob(localEnv, job);
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: "search_alarm_failed",
+        jobId: job.id,
+        message: error?.message || String(error),
+      }));
+    } finally {
+      const latest = await this.readJob();
+      if (latest) await this.scheduleAlarm(latest);
+    }
   }
 }
 
@@ -569,7 +613,7 @@ async function handleSearchStart(request, env, ctx) {
       }));
     }));
   } else if (!cachedPair && ctx?.waitUntil) {
-    ctx.waitUntil(kickSearchJobChunk(env, job.id).catch((error) => {
+    ctx.waitUntil(runSearchJob(env, job).catch((error) => {
       console.warn(JSON.stringify({
         event: "search_start_background_failed",
         jobId: job.id,
@@ -753,7 +797,7 @@ async function handleSearchJob(url, env, ctx) {
         return json({ ok: true, job: publicSearchJob(job) }, 200, "no-store");
       }
       if (ctx?.waitUntil) {
-        ctx.waitUntil(kickSearchJobChunk(env, id).catch((error) => {
+        ctx.waitUntil(runSearchJob(env, job).catch((error) => {
           console.warn(JSON.stringify({
             event: "search_poll_kick_failed",
             jobId: id,
@@ -835,6 +879,7 @@ async function runSearchJob(env, queuedJob) {
       expansionBudget: cachedShorterCheck ? CACHED_SHORTER_CHECK_CHUNK_EXPANSIONS : SEARCH_CHUNK_EXPANSIONS,
       timeBudgetMs: cachedShorterCheck ? CACHED_SHORTER_CHECK_TIME_MS : SEARCH_CHUNK_TIME_MS,
       concurrency: cachedShorterCheck ? CACHED_SHORTER_CHECK_CONCURRENCY : SEARCH_EXPANSION_CONCURRENCY,
+      invocationDeadline: deadline,
     });
     if (!nextJob || Number(nextJob.processingUntil || 0) > Date.now()) break;
     job = nextJob;
@@ -905,14 +950,36 @@ async function runSearchJobChunk(env, id, options = {}) {
     if (!nextJob) throw new Error("search lease lost");
     job = nextJob;
   };
+  const invocationWindowElapsed = () =>
+    Number(options.invocationDeadline || 0) > 0 &&
+    Date.now() >= Number(options.invocationDeadline);
+  const yieldInvocation = (message) => updateOwnedSearchJob(env, id, ownerToken, {
+    status: "running",
+    progress: message,
+    stats,
+    search,
+    processingUntil: 0,
+    processingToken: "",
+    startedAt,
+  });
 
   await progress(job.progress || "Checking players");
   try {
     if (!search.profileChecked) {
-      const [startProfile, targetProfile] = await Promise.all([
-        readOrFetchProfile(env, job.start, { strict: true }),
-        readOrFetchProfile(env, job.target, { strict: true }),
-      ]);
+      let startProfile;
+      let targetProfile;
+      try {
+        [startProfile, targetProfile] = await withAbortTimeout(
+          (signal) => Promise.all([
+            readOrFetchProfile(env, job.start, { strict: true, signal }),
+            readOrFetchProfile(env, job.target, { strict: true, signal }),
+          ]),
+          SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS,
+        );
+      } catch (error) {
+        if (error?.name !== "AbortError") throw error;
+        return yieldInvocation("Profile lookup timed out; retrying automatically.");
+      }
       if (!startProfile || !targetProfile) {
         await completeSearchJob(env, job, {
           status: "not_found",
@@ -928,10 +995,22 @@ async function runSearchJobChunk(env, id, options = {}) {
       }
       search.profileChecked = true;
       await progress("Searching recent wins");
+      if (invocationWindowElapsed()) {
+        return yieldInvocation("Players verified; continuing the search automatically.");
+      }
     }
 
     if (!search.fastLaneChecked) {
-      const fastLane = await tryFastLaneConnection(env, job, stats);
+      let fastLane;
+      try {
+        fastLane = await withAbortTimeout(
+          (signal) => tryFastLaneConnection(env, job, stats, signal),
+          SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS,
+        );
+      } catch (error) {
+        if (error?.name !== "AbortError") throw error;
+        return yieldInvocation("Recent-game lookup timed out; retrying automatically.");
+      }
       search.fastLaneChecked = true;
       if (fastLane?.notFound) {
         await completeSearchJob(env, job, {
@@ -966,12 +1045,14 @@ async function runSearchJobChunk(env, id, options = {}) {
             return readSearchJob(env, id);
           }
         } else {
-          const players = {};
-          await runThrottled(fastLane.chain.path.map((username) => async () => {
-            const profile = await readOrFetchProfile(env, username);
-            if (profile) players[username] = profile;
-          }), 3);
-          const targetProfile = players[job.target] || await readOrFetchProfile(env, job.target) || {};
+          const players = invocationWindowElapsed()
+            ? {}
+            : await readProfilesWithin(
+              env,
+              fastLane.chain.path,
+              SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS,
+            );
+          const targetProfile = players[job.target] || await readCachedProfile(env, job.target) || {};
           const chain = {
             target: job.target,
             display: targetProfile.name || targetProfile.username || job.target,
@@ -1035,6 +1116,9 @@ async function runSearchJobChunk(env, id, options = {}) {
         await progress("Saved route loaded. Searching wider graph for a shorter route.", { search });
       } else {
         await progress("Fast lanes checked. Searching wider graph.", { search });
+      }
+      if (invocationWindowElapsed()) {
+        return yieldInvocation("Fast lanes checked; continuing the wider search automatically.");
       }
     }
 
@@ -1177,12 +1261,14 @@ async function runSearchJobChunk(env, id, options = {}) {
       return readSearchJob(env, id);
     }
 
-    const players = {};
-    await runThrottled(chainResult.path.map((username) => async () => {
-      const profile = await readOrFetchProfile(env, username);
-      if (profile) players[username] = profile;
-    }), 3);
-    const targetProfile = players[job.target] || await readOrFetchProfile(env, job.target) || {};
+    const players = invocationWindowElapsed()
+      ? {}
+      : await readProfilesWithin(
+        env,
+        chainResult.path,
+        SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS,
+      );
+    const targetProfile = players[job.target] || await readCachedProfile(env, job.target) || {};
 
     const cachedChain = job.chain?.found ? job.chain : null;
     const chain = {
@@ -1259,7 +1345,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
       meetingLength = steps;
     }
   };
-  const getEdges = async (username) => {
+  const getEdges = async (username, signal = null) => {
     const key = username.toLowerCase();
     if (edgesCache.has(key)) return edgesCache.get(key);
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
@@ -1279,6 +1365,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
           username: key,
           archiveLimit: refreshArchiveLimit,
           forceFresh: true,
+          signal,
         }, stats);
       } else {
         const cached = await readCachedExpansionEdges(env, { username: key, archiveLimit }, stats);
@@ -1291,7 +1378,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
             return { deferred: true, reason: "chunk-request-limit" };
           }
           freshRequestsThisChunk++;
-          edges = await readOrFetchEdges(env, { username: key, archiveLimit }, stats);
+          edges = await readOrFetchEdges(env, { username: key, archiveLimit, signal }, stats);
         }
       }
       const outcome = {
@@ -1300,6 +1387,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
       edgesCache.set(key, outcome);
       return outcome;
     } catch (error) {
+      if (signal?.aborted) throw error;
       if (isMissingArchivesError(error)) {
         const outcome = { edges: { beatenByMe: new Map(), beatMe: new Map() } };
         edgesCache.set(key, outcome);
@@ -1383,7 +1471,13 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
 
     const edgeBatch = await runThrottled(batch.map((node) => async () => {
       try {
-        return { node, ...(await withTimeout(getEdges(node), SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS)) };
+        return {
+          node,
+          ...(await withAbortTimeout(
+            (signal) => getEdges(node, signal),
+            SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS,
+          )),
+        };
       } catch {
         return { node, deferred: true, reason: "upstream-timeout" };
       }
@@ -1457,12 +1551,15 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
         (max, item) => Math.max(max, Number(item.retryAfter || 0)),
         0,
       );
+      const localChunkBudget = deferred.every((item) => item.reason === "chunk-request-limit");
       return {
         status: "running",
-        progress: retryAfter
-          ? "Chess.com is throttling requests. Search will resume automatically."
-          : "Waiting for Chess.com before retrying the same players.",
-        pauseMs: retryAfter ? retryAfter * 1000 : 1000,
+        progress: localChunkBudget
+          ? `Processed ${stats.requests} player histories; continuing immediately.`
+          : retryAfter
+            ? "Chess.com is throttling requests. Search will resume automatically."
+            : "A Chess.com request failed; retrying the same players shortly.",
+        pauseMs: localChunkBudget ? 0 : retryAfter ? retryAfter * 1000 : 1000,
       };
     }
 
@@ -1635,7 +1732,8 @@ function reconstructServerPath(mid, forwardVisited, backwardVisited) {
   return path.length >= 2 ? { path, hops } : null;
 }
 
-async function tryFastLaneConnection(env, job, stats) {
+async function tryFastLaneConnection(env, job, stats, signal = null) {
+  if (signal?.aborted) throw abortSignalError(signal);
   const exact = await readExactFastLanePair(env, job.start, job.target, job.range);
   const savedStepLimit = job.chain?.found ? chainStepCount(job.chain) : Number.POSITIVE_INFINITY;
   let best = null;
@@ -1655,11 +1753,14 @@ async function tryFastLaneConnection(env, job, stats) {
     best = cachedRoute;
   }
   if (best?.chain?.path?.length === 2) return best;
+  if (signal?.aborted) throw abortSignalError(signal);
 
   const startGames = await readOrFetchGames(env, {
     username: job.start,
     archiveLimit: archiveLimitForRange(job.range),
+    signal,
   }, stats).catch(() => []);
+  if (signal?.aborted) throw abortSignalError(signal);
   const edges = edgesFromGames(job.start, startGames);
   const directUrls = edges.beatenByMe.get(job.target);
   if (directUrls?.length) {
@@ -1704,16 +1805,39 @@ async function tryFastLaneConnection(env, job, stats) {
     startEdges: edges,
     startGames,
     savedStepLimit: graphStepLimit,
+    signal,
   }).catch(() => null);
+  if (signal?.aborted) throw abortSignalError(signal);
   if (graphHint && (!best || graphHint.chain.path.length < best.chain.path.length)) {
     best = graphHint;
   }
   if (graphHint) return best;
-  const hinted = await tryLeaderboardRouteHint(env, job, stats);
+  const hinted = await tryLeaderboardRouteHint(env, job, stats, signal);
   if (hinted?.path?.length && (!best || hinted.path.length < best.chain.path.length)) {
     return { source: "known-route", chain: hinted };
   }
   return best;
+}
+
+async function readProfilesWithin(env, usernames, timeoutMs) {
+  const players = {};
+  try {
+    await withAbortTimeout(
+      (signal) => runThrottled(
+        [...new Set((usernames || []).map(cleanUsername).filter(Boolean))].map(
+          (username) => async () => {
+            const profile = await readOrFetchProfile(env, username, { signal });
+            if (profile) players[username] = profile;
+          },
+        ),
+        3,
+      ),
+      timeoutMs,
+    );
+  } catch (error) {
+    if (error?.name !== "AbortError") throw error;
+  }
+  return players;
 }
 
 function shouldKeepCheckingFastLane(fastLane) {
@@ -1727,6 +1851,7 @@ async function tryVerifiedGraphRouteHint(env, {
   startEdges,
   startGames,
   savedStepLimit,
+  signal = null,
 }) {
   const hinted = await tryGraphIndexBridgeFromStart(env, {
     start: job.start,
@@ -1757,6 +1882,7 @@ async function tryVerifiedGraphRouteHint(env, {
       allowDeep: job.range === "all",
       exactProofOnly: true,
       proofHops: hinted.chain.hops,
+      signal,
     },
   );
   if (hops?.length !== path.length - 1) return null;
@@ -1927,7 +2053,7 @@ function edgeMapSize(map) {
   return map instanceof Map ? map.size : 0;
 }
 
-async function tryLeaderboardRouteHint(env, job, stats) {
+async function tryLeaderboardRouteHint(env, job, stats, signal = null) {
   const entries = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
   const candidates = entries
     .filter((entry) =>
@@ -1938,12 +2064,13 @@ async function tryLeaderboardRouteHint(env, job, stats) {
     .sort((a, b) => a.steps - b.steps || b.ts - a.ts)
     .slice(0, 3);
   for (const entry of candidates) {
+    if (signal?.aborted) throw abortSignalError(signal);
     const verifiedHops = await verifyPathHops(
       env,
       entry.path,
       archiveLimitForRange(job.range),
       stats,
-      { proofHops: entry.hops },
+      { proofHops: entry.hops, signal },
     );
     if (verifiedHops?.length === entry.path.length - 1) {
       const chain = {
@@ -1981,6 +2108,8 @@ async function tryLeaderboardRouteHint(env, job, stats) {
 }
 
 async function verifyPathHops(env, path, archiveLimit, stats = null, options = {}) {
+  const signal = options.signal || null;
+  if (signal?.aborted) throw abortSignalError(signal);
   const cleanPath = Array.isArray(path)
     ? path.map(cleanUsername).filter(Boolean).slice(0, MAX_CHAIN_NODES)
     : [];
@@ -1992,27 +2121,40 @@ async function verifyPathHops(env, path, archiveLimit, stats = null, options = {
   const hops = await runThrottled(cleanPath.slice(0, -1).map((from, index) => async () => {
     const to = cleanPath[index + 1];
     try {
+      if (signal?.aborted) throw abortSignalError(signal);
       const cachedHop = await findCachedHop(env, from, to, exactArchiveLimit);
       if (cachedHop) return cachedHop;
       const suppliedProof = proofHops.get(`${from}>${to}`);
       if (suppliedProof && String(env.EXACT_GAME_PROOF_ENABLED || "true") !== "false") {
-        const verifiedProof = await verifyLiveGameProof(env, suppliedProof, exactArchiveLimit, stats);
+        const verifiedProof = await verifyLiveGameProof(
+          env,
+          suppliedProof,
+          exactArchiveLimit,
+          stats,
+          signal,
+        );
         if (verifiedProof) return verifiedProof;
       }
       if (options.exactProofOnly) return null;
-      const games = await readOrFetchGames(env, { username: from, archiveLimit: limit }, stats);
+      const games = await readOrFetchGames(
+        env,
+        { username: from, archiveLimit: limit, signal },
+        stats,
+      );
       const urls = edgesFromGames(from, games).beatenByMe.get(to);
       if (urls?.length) return (await enrichHopsFromGames([{ from, to, url: urls[0] }], games))[0] || null;
       if (options.allowDeep) return findDeepHop(env, from, to, stats);
       return null;
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw abortSignalError(signal);
       return null;
     }
   }), 2);
   return hops.every(Boolean) ? cleanHopList(hops) : null;
 }
 
-async function verifyLiveGameProof(env, hop, archiveLimit, stats = null) {
+async function verifyLiveGameProof(env, hop, archiveLimit, stats = null, signal = null) {
+  if (signal?.aborted) throw abortSignalError(signal);
   const from = cleanUsername(hop?.from);
   const to = cleanUsername(hop?.to);
   const proofUrl = cleanUrl(hop?.url);
@@ -2022,7 +2164,7 @@ async function verifyLiveGameProof(env, hop, archiveLimit, stats = null) {
   const cacheKey = `proof:game:v1:${gameId}`;
   let fact = await env.GAMES_CACHE.get(cacheKey, { type: "json", cacheTtl: 60 }).catch(() => null);
   if (!validGameProofFact(fact, gameId)) {
-    fact = await fetchLiveGameProofFact(gameId, stats);
+    fact = await fetchLiveGameProofFact(gameId, stats, signal);
     if (!fact) return null;
     await env.GAMES_CACHE.put(cacheKey, JSON.stringify(fact), {
       expirationTtl: GAME_PROOF_CACHE_TTL_SECONDS,
@@ -2036,7 +2178,7 @@ async function verifyLiveGameProof(env, hop, archiveLimit, stats = null) {
       fromPlayer.color !== fact.winnerColor) {
     return null;
   }
-  if (!await proofTimestampInArchiveRange(env, from, fact.endTime, archiveLimit, stats)) {
+  if (!await proofTimestampInArchiveRange(env, from, fact.endTime, archiveLimit, stats, signal)) {
     return null;
   }
   return {
@@ -2068,10 +2210,16 @@ function liveGameIdFromProofUrl(value) {
   return Number.isSafeInteger(gameId) && gameId > 0 ? gameId : null;
 }
 
-async function fetchLiveGameProofFact(gameId, stats = null) {
+async function fetchLiveGameProofFact(gameId, stats = null, signal = null) {
   const callbackUrl = `https://www.chess.com/callback/live/game/${gameId}`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Math.min(FETCH_TIMEOUT_MS, 5000));
+  const abortFromParent = () => controller.abort(abortSignalError(signal));
+  if (signal?.aborted) throw abortSignalError(signal);
+  if (signal) signal.addEventListener("abort", abortFromParent, { once: true });
+  const timeout = setTimeout(
+    () => controller.abort(abortError("live game proof timed out")),
+    Math.min(FETCH_TIMEOUT_MS, 5000),
+  );
   let response;
   let text;
   try {
@@ -2086,10 +2234,12 @@ async function fetchLiveGameProofFact(gameId, stats = null) {
     });
     if (!response.ok || response.status >= 300 && response.status < 400) return null;
     text = await readLimitedResponseText(response, GAME_PROOF_MAX_BYTES);
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw abortSignalError(signal);
     return null;
   } finally {
     clearTimeout(timeout);
+    if (signal) signal.removeEventListener("abort", abortFromParent);
   }
   if (text == null) return null;
 
@@ -2171,7 +2321,15 @@ function validGameProofFact(value, gameId) {
       player.isComputer === false);
 }
 
-async function proofTimestampInArchiveRange(env, username, endTime, archiveLimit, stats = null) {
+async function proofTimestampInArchiveRange(
+  env,
+  username,
+  endTime,
+  archiveLimit,
+  stats = null,
+  signal = null,
+) {
+  if (signal?.aborted) throw abortSignalError(signal);
   if (!Number.isFinite(archiveLimit)) return true;
   const months = Math.max(1, Math.floor(archiveLimit));
   const cacheKey = `archives:v1:${cleanUsername(username)}`;
@@ -2180,7 +2338,10 @@ async function proofTimestampInArchiveRange(env, username, endTime, archiveLimit
       Date.now() - Number(record.ts || 0) >= ARCHIVE_LIST_CACHE_TTL_SECONDS * 1000) {
     try {
       if (stats) stats.requests = Number(stats.requests || 0) + 1;
-      const data = await fetchJSON(`${CHESS_API}${cleanUsername(username)}/games/archives`);
+      const data = await fetchJSON(
+        `${CHESS_API}${cleanUsername(username)}/games/archives`,
+        { signal },
+      );
       const archiveMonths = Array.isArray(data?.archives)
         ? data.archives.map(archiveMonthFromUrl).filter(Boolean)
         : [];
@@ -2190,7 +2351,8 @@ async function proofTimestampInArchiveRange(env, username, endTime, archiveLimit
         expirationTtl: GAME_PROOF_CACHE_TTL_SECONDS,
         metadata: { type: "archive-list", username: cleanUsername(username) },
       }).catch(() => {});
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw abortSignalError(signal);
       return false;
     }
   }
@@ -2315,10 +2477,10 @@ async function enrichHopsFromCache(env, hops, archiveLimit, stats = null) {
   }
   const enriched = new Map();
   await runThrottled([...byFrom.entries()].map(([username, userHops]) => async () => {
-    const games = await readOrFetchGames(env, {
+    const games = await readCachedGames(env, {
       username,
       archiveLimit: Math.min(Number.isFinite(archiveLimit) ? archiveLimit : 12, 12),
-    }, stats);
+    }, stats) || [];
     for (const hop of await enrichHopsFromGames(userHops, games)) {
       enriched.set(`${hop.from}>${hop.to}>${hop.url}`, hop);
     }
@@ -3622,6 +3784,15 @@ async function writePublicSearchJob(env, job) {
 
 async function durableSearchJobRequest(env, id, action, payload = {}, options = {}) {
   const cleanId = cleanAnalyticsId(id);
+  const local = env.__SEARCH_JOB_LOCAL;
+  if (cleanId && local?.id === cleanId && local.object) {
+    const result = await local.object.applyAction(action, payload);
+    return {
+      used: true,
+      job: searchJobShape(result?.body?.job),
+      timedOut: false,
+    };
+  }
   if (!cleanId || !env.SEARCH_JOBS) return { used: false, job: null };
   const stub = env.SEARCH_JOBS.getByName(cleanId);
   const controller = new AbortController();
@@ -4942,10 +5113,10 @@ function parseGameCacheKey(key) {
   return { username: match[1], archiveLimit };
 }
 
-async function fetchGames({ username, archiveLimit }) {
+async function fetchGames({ username, archiveLimit, signal = null }) {
   let archiveData;
   try {
-    archiveData = await fetchJSON(`${CHESS_API}${username}/games/archives`);
+    archiveData = await fetchJSON(`${CHESS_API}${username}/games/archives`, { signal });
   } catch (error) {
     if (isMissingArchivesError(error)) return [];
     throw error;
@@ -4957,7 +5128,7 @@ async function fetchGames({ username, archiveLimit }) {
   const results = await runThrottled(
     selectedArchives.map((archiveUrl) => async () => {
       try {
-        return await fetchJSON(archiveUrl);
+        return await fetchJSON(archiveUrl, { signal });
       } catch (error) {
         if (isMissingMonthlyArchiveError(error)) return { games: [] };
         throw error;
@@ -5103,7 +5274,7 @@ async function readOrFetchProfile(env, username, options = {}) {
   const cached = await readCachedProfile(env, username);
   if (cached) return cached;
   try {
-    const data = await fetchJSON(`${CHESS_API}${username}`);
+    const data = await fetchJSON(`${CHESS_API}${username}`, { signal: options.signal });
     const profile = profileShape(data, username);
     await env.GAMES_CACHE.put(`profile:${username}`, JSON.stringify({ ts: Date.now(), profile }), {
       expirationTtl: KV_RETENTION_SECONDS,
@@ -5111,6 +5282,7 @@ async function readOrFetchProfile(env, username, options = {}) {
     });
     return profile;
   } catch (error) {
+    if (options.signal?.aborted) throw abortSignalError(options.signal);
     if (options.strict && !isMissingProfileError(error)) throw error;
     return null;
   }
@@ -5222,41 +5394,46 @@ function suggestionScore(item, query) {
   return score;
 }
 
-async function fetchJSON(url) {
+async function fetchJSON(url, { signal = null } = {}) {
   for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
+    if (signal?.aborted) throw abortSignalError(signal);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    let response;
+    const abortFromParent = () => controller.abort(abortSignalError(signal));
+    if (signal) signal.addEventListener("abort", abortFromParent, { once: true });
+    const timeout = setTimeout(
+      () => controller.abort(abortError(`Timed out fetching ${url}`)),
+      FETCH_TIMEOUT_MS,
+    );
     try {
-      response = await fetch(url, {
+      const response = await fetch(url, {
         headers: {
           "Accept": "application/json",
           "User-Agent": "chess-connections-cache/2.0 (+https://github.com/tetizz/Connections/issues)",
         },
         signal: controller.signal,
       });
-    } catch (error) {
-      clearTimeout(timeout);
-      if (attempt < FETCH_RETRIES && error?.name === "AbortError") {
-        continue;
+      if (response.ok) {
+        return await response.json();
       }
+
+      const retryAfter = parseRetryAfter(response.headers);
+      const canRetry =
+        attempt < FETCH_RETRIES &&
+        (response.status >= 500 || (response.status === 429 && retryAfter <= 2));
+
+      if (!canRetry) {
+        throw new UpstreamHTTPError(response.status, url, retryAfter);
+      }
+
+      if (retryAfter) await delayWithSignal(retryAfter * 1000, signal);
+    } catch (error) {
+      if (signal?.aborted) throw abortSignalError(signal);
+      if (attempt < FETCH_RETRIES && error?.name === "AbortError") continue;
       throw error;
+    } finally {
+      clearTimeout(timeout);
+      if (signal) signal.removeEventListener("abort", abortFromParent);
     }
-    clearTimeout(timeout);
-    if (response.ok) {
-      return response.json();
-    }
-
-    const retryAfter = parseRetryAfter(response.headers);
-    const canRetry =
-      attempt < FETCH_RETRIES &&
-      (response.status >= 500 || (response.status === 429 && retryAfter <= 2));
-
-    if (!canRetry) {
-      throw new UpstreamHTTPError(response.status, url, retryAfter);
-    }
-
-    if (retryAfter) await delay(retryAfter * 1000);
   }
 
   throw new Error(`Failed to fetch ${url}`);
@@ -5692,6 +5869,46 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function delayWithSignal(ms, signal = null) {
+  if (!signal) return delay(ms);
+  if (signal.aborted) return Promise.reject(abortSignalError(signal));
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+      reject(abortSignalError(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function abortError(message = "operation aborted") {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function abortSignalError(signal) {
+  return signal?.reason instanceof Error ? signal.reason : abortError();
+}
+
+async function withAbortTimeout(operation, ms) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(abortError("operation timed out")),
+    Math.max(1, Number(ms) || 1),
+  );
+  try {
+    return await operation(controller.signal);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function withTimeout(promise, ms) {
   let timeoutId;
   try {
@@ -5719,6 +5936,7 @@ class UpstreamHTTPError extends Error {
 export const __test = Object.freeze({
   advanceServerSearch,
   cleanUsername,
+  enrichHopsFromCache,
   fetchGames,
   graphIndexPathFromReverseTree,
   graphIndexReverseTree,
@@ -5728,6 +5946,7 @@ export const __test = Object.freeze({
   readOrFetchProfile,
   rebuildGraphIndex,
   recoverStaleSearchLease,
+  runSearchJob,
   searchPauseUntil,
   searchJobShape,
   selectGraphCachePlans,
@@ -5736,6 +5955,7 @@ export const __test = Object.freeze({
   tryVerifiedGraphRouteHint,
   verifyLiveGameProof,
   verifyPathHops,
+  withAbortTimeout,
   warmVerificationRoutes,
 });
 

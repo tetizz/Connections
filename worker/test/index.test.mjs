@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 
-import worker, { __test } from "../src/index.js";
+import worker, { __test, SearchJobObject } from "../src/index.js";
 
 const realFetch = globalThis.fetch;
 
@@ -44,6 +44,29 @@ class MemoryKV {
       .slice(0, limit)
       .map((name) => ({ name }));
     return { keys, cursor: "", list_complete: true };
+  }
+}
+
+class MemoryAlarmStorage {
+  constructor() {
+    this.values = new Map();
+    this.alarms = [];
+  }
+
+  async get(key) {
+    return this.values.get(key);
+  }
+
+  async put(key, value) {
+    this.values.set(key, structuredClone(value));
+  }
+
+  async deleteAll() {
+    this.values.clear();
+  }
+
+  async setAlarm(timestamp) {
+    this.alarms.push(Number(timestamp));
   }
 }
 
@@ -141,6 +164,35 @@ test("transient edge failures keep the player pending instead of proving no conn
   assert.equal(stats.expanded, 0);
 });
 
+test("a local chunk budget continues immediately instead of pretending Chess.com asked us to wait", async () => {
+  const kv = new MemoryKV();
+  const env = { GAMES_CACHE: kv };
+  globalThis.fetch = async () => response({ archives: [] });
+  const search = {
+    ...__test.initialSearchState("alpha", "omega"),
+    activeSide: "forward",
+    activeFrontier: ["alpha", "beta", "gamma", "delta"],
+    forwardFrontier: [],
+  };
+  const stats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+
+  const result = await __test.advanceServerSearch(
+    env,
+    { start: "alpha", target: "omega", range: "auto", refreshCached: false },
+    search,
+    stats,
+    async () => {},
+    { expansionBudget: 4, concurrency: 1, timeBudgetMs: 5000 },
+  );
+
+  assert.equal(result.status, "running");
+  assert.equal(result.pauseMs, 0);
+  assert.match(result.progress, /continuing/i);
+  assert.equal(stats.requests, 3);
+  assert.equal(stats.expanded, 3);
+  assert.equal(search.activeCursor, 3);
+});
+
 test("deferred searches preserve a bounded retry pause", () => {
   assert.equal(__test.searchPauseUntil(90000, 1000), 91000);
   assert.equal(__test.searchPauseUntil(999999, 1000), 301000);
@@ -162,6 +214,71 @@ test("archive retrieval rejects transient monthly failures instead of caching pa
     (error) => error?.status === 503,
   );
   assert.equal(calls, 4);
+});
+
+test("a timed-out edge lookup aborts its archive fetch instead of overlapping a retry", async () => {
+  let monthlyCalls = 0;
+  let abortedCalls = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith("/games/archives")) {
+      return response({
+        archives: [
+          "https://api.chess.com/pub/player/alpha/games/2026/05",
+          "https://api.chess.com/pub/player/alpha/games/2026/06",
+          "https://api.chess.com/pub/player/alpha/games/2026/07",
+        ],
+      });
+    }
+    monthlyCalls++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(response({ games: [] })), 250);
+      options.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        abortedCalls++;
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+
+  await assert.rejects(
+    __test.withAbortTimeout(
+      (signal) => __test.fetchGames({ username: "alpha", archiveLimit: 3, signal }),
+      25,
+    ),
+    (error) => error?.name === "AbortError",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(monthlyCalls, 1);
+  assert.equal(abortedCalls, 1);
+});
+
+test("hop enrichment never starts a live archive request", async () => {
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls++;
+    throw new Error("hop enrichment must stay cache-only");
+  };
+  const hop = {
+    from: "alpha",
+    to: "omega",
+    url: "https://www.chess.com/game/live/123",
+  };
+
+  const enriched = await __test.enrichHopsFromCache(
+    { GAMES_CACHE: new MemoryKV() },
+    [hop],
+    6,
+    { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+  );
+
+  assert.equal(enriched.length, 1);
+  assert.equal(enriched[0].from, hop.from);
+  assert.equal(enriched[0].to, hop.to);
+  assert.equal(enriched[0].url, hop.url);
+  assert.equal(fetchCalls, 0);
 });
 
 test("missing profiles return 404 while transient profile failures remain upstream errors", async () => {
@@ -209,7 +326,7 @@ test("search-start rate limits expose the JSON retry delay as Retry-After", asyn
   assert.ok(body.retryAfter >= 1);
 });
 
-test("health identifies the deployed verified graph fast-path release", async () => {
+test("health identifies the deployed continuous-search release", async () => {
   const result = await worker.fetch(
     new Request("https://worker.test/health"),
     { GAMES_CACHE: new MemoryKV() },
@@ -218,7 +335,7 @@ test("health identifies the deployed verified graph fast-path release", async ()
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-07-24-verified-graph-fastpath-v4");
+  assert.equal(body.release, "2026-07-24-continuous-search-v5");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {
@@ -1307,6 +1424,102 @@ test("legacy lossy edge caches cannot hide a bridge present in complete games", 
     assert.deepEqual(result.chain.path, ["alpha", "beta", "omega"]);
     assert.equal(stats.requests, 0);
   }
+});
+
+test("background search drains consecutive local chunks without a browser poll", async () => {
+  const kv = new MemoryKV();
+  const env = { GAMES_CACHE: kv };
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => response({ archives: [] });
+
+  try {
+    const running = searchJob({
+      id: "background-drain",
+      status: "running",
+      stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+      search: {
+        ...__test.initialSearchState("alpha", "omega"),
+        profileChecked: true,
+        fastLaneChecked: true,
+        activeSide: "forward",
+        activeFrontier: ["alpha", "beta", "gamma", "delta"],
+        activeCursor: 0,
+        activeNextFrontier: [],
+        forwardFrontier: [],
+        backwardFrontier: [],
+      },
+      processingToken: "",
+      processingUntil: 0,
+    });
+
+    await kv.put(`search:job:${running.id}`, JSON.stringify(running));
+    await __test.runSearchJob(env, running);
+
+    const finished = JSON.parse(await kv.get(`search:job:${running.id}`));
+    assert.equal(finished.status, "not_found");
+    assert.equal(finished.stats.requests, 4);
+    assert.equal(finished.stats.expanded, 4);
+    assert.doesNotMatch(finished.progress, /waiting/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a Durable Object alarm resumes an active search without a browser poll", async () => {
+  const storage = new MemoryAlarmStorage();
+  const kv = new MemoryKV();
+  const object = new SearchJobObject({ storage }, { GAMES_CACHE: kv });
+  const running = searchJob({
+    id: "alarm-resume",
+    status: "running",
+    stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
+    search: {
+      ...__test.initialSearchState("alpha", "omega"),
+      profileChecked: true,
+      fastLaneChecked: true,
+      activeSide: "forward",
+      activeFrontier: ["alpha", "beta", "gamma", "delta"],
+      activeCursor: 0,
+      activeNextFrontier: [],
+      forwardFrontier: [],
+      backwardFrontier: [],
+    },
+    processingToken: "",
+    processingUntil: 0,
+  });
+
+  globalThis.fetch = async () => response({ archives: [] });
+  await object.writeJob(running);
+  storage.alarms.length = 0;
+  await object.alarm();
+
+  const finished = await object.readJob();
+  assert.equal(finished.status, "not_found");
+  assert.equal(finished.stats.requests, 4);
+  assert.equal(finished.stats.expanded, 4);
+  assert.ok(storage.alarms.some((timestamp) => timestamp > Date.now() + 60_000));
+});
+
+test("a real retry pause schedules a Durable Object wake-up instead of waiting for a poll", async () => {
+  const storage = new MemoryAlarmStorage();
+  const object = new SearchJobObject({ storage }, { GAMES_CACHE: new MemoryKV() });
+  const pauseUntil = Date.now() + 45_000;
+  const paused = searchJob({
+    id: "alarm-pause",
+    status: "running",
+    processingToken: "",
+    processingUntil: pauseUntil,
+  });
+
+  await object.writeJob(paused);
+  assert.equal(storage.alarms.at(-1), pauseUntil);
+
+  await object.alarm();
+  const stillPaused = await object.readJob();
+  assert.equal(stillPaused.status, "running");
+  assert.equal(stillPaused.processingUntil, pauseUntil);
+  assert.equal(storage.alarms.at(-1), pauseUntil);
 });
 
 test("found search jobs preserve paths deeper than the former 12-node limit", () => {

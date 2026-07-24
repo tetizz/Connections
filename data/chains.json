@@ -1,8 +1,9 @@
 {
   "start": "trixize1234",
-  "start_display": null,
+  "start_display": "trixize1234",
   "max_depth": 4,
-  "computed_at": 1782060149,
+  "computed_at": 1784879455,
+  "fully_refreshed": false,
   "chains": [
     {
       "target": "hikaru",
@@ -31,7 +32,9 @@
           "to": "hikaru",
           "url": "https://www.chess.com/game/live/109459898005"
         }
-      ]
+      ],
+      "refresh_status": "verified",
+      "computed_at": 1784878553
     },
     {
       "target": "magnuscarlsen",
@@ -60,7 +63,9 @@
           "to": "magnuscarlsen",
           "url": "https://www.chess.com/game/live/115846799987"
         }
-      ]
+      ],
+      "refresh_status": "verified",
+      "computed_at": 1784878587
     },
     {
       "target": "fabianocaruana",
@@ -89,7 +94,9 @@
           "to": "fabianocaruana",
           "url": "https://www.chess.com/game/live/123219233872"
         }
-      ]
+      ],
+      "refresh_status": "verified",
+      "computed_at": 1784878605
     },
     {
       "target": "danielnaroditsky",
@@ -118,7 +125,9 @@
           "to": "danielnaroditsky",
           "url": "https://www.chess.com/game/live/81674688585"
         }
-      ]
+      ],
+      "refresh_status": "verified",
+      "computed_at": 1784878737
     },
     {
       "target": "nihalsarin2004",
@@ -147,7 +156,9 @@
           "to": "nihalsarin2004",
           "url": "https://www.chess.com/game/live/3291386173"
         }
-      ]
+      ],
+      "refresh_status": "verified",
+      "computed_at": 1784878777
     },
     {
       "target": "alireza2003",
@@ -155,7 +166,9 @@
       "found": false,
       "length": null,
       "path": [],
-      "hops": []
+      "hops": [],
+      "refresh_status": "preserved",
+      "computed_at": 1782060149
     },
     {
       "target": "gmbenjaminfinegold",
@@ -184,7 +197,9 @@
           "to": "gmbenjaminfinegold",
           "url": "https://www.chess.com/game/live/144224297836"
         }
-      ]
+      ],
+      "refresh_status": "verified",
+      "computed_at": 1784879154
     },
     {
       "target": "lachlanq",
@@ -192,7 +207,9 @@
       "found": false,
       "length": null,
       "path": [],
-      "hops": []
+      "hops": [],
+      "refresh_status": "preserved",
+      "computed_at": 1782060149
     }
   ]
 }

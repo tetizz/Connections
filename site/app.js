@@ -1783,37 +1783,11 @@
   }
 
   function precomputedChain(start, target) {
-    if (!state.chains?.chains?.length) return null;
-    if ((state.chains.start || "").toLowerCase() !== start) return null;
-    return state.chains.chains.find((c) => c.found && c.target.toLowerCase() === target) || null;
+    return window.SavedRoutes?.precomputedChain(state.chains, start, target) || null;
   }
 
   function bridgeSuffixesFor(target) {
-    const suffixes = new Map();
-    for (const chain of state.chains?.chains || []) {
-      if (!chain.found || chain.target.toLowerCase() !== target) continue;
-      for (let i = 0; i < chain.path.length - 1; i++) {
-        const node = chain.path[i].toLowerCase();
-        const path = chain.path.slice(i).map((u) => u.toLowerCase());
-        const hops = chain.hops.slice(i).map((hop) => ({
-          from: hop.from.toLowerCase(),
-          to: hop.to.toLowerCase(),
-          url: hop.url,
-        }));
-        const suffix = {
-          target: chain.target.toLowerCase(),
-          display: chain.display || nameOf(chain.target),
-          found: true,
-          length: hops.length,
-          path,
-          hops,
-          source: "saved-bridge",
-        };
-        const current = suffixes.get(node);
-        if (!current || suffix.length < current.length) suffixes.set(node, suffix);
-      }
-    }
-    return suffixes;
+    return window.SavedRoutes?.bridgeSuffixesFor(state.chains, target) || new Map();
   }
 
   function parseSearchMode(range) {
@@ -3257,6 +3231,13 @@
       const validation = await validateSearchPlayers(start, target);
       if (!isCurrent()) return true;
       if (!validation.valid) {
+        if (knownChain?.found) {
+          logLine(`profile lookup could not refresh ${validation.missing}; keeping the saved proof visible`);
+          showStatus("done",
+            `✓ showing the saved verified route — Chess.com no longer returned the ` +
+            `${esc(validation.missing)} profile, but the proof games remain available.`);
+          return true;
+        }
         showStatus("error",
           `couldn't find “${esc(validation.missing)}” on Chess.com. ` +
           "Check the spelling or paste the member profile link.");
@@ -3302,6 +3283,78 @@
       activeJob = job;
       saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId });
       renderSearchQueue(job);
+      if (knownChain?.found) {
+        let displayedChain = knownChain;
+        let improvedByServer = false;
+        const stepsIn = (chain) => window.SavedRoutes?.routeStepCount(chain) ?? 0;
+        const showSavedRoute = (message) => {
+          showStatus("done",
+            `✓ showing a saved verified route — ${esc(start)} connects to ${esc(target)} in ` +
+            `${stepText(stepsIn(displayedChain))}. ${message}`);
+        };
+        const applyIfShorter = async (finished) => {
+          const candidate = finished?.chain;
+          if (!window.SavedRoutes?.isStrictlyShorter(candidate, displayedChain)) return false;
+          const applied = await applyServerChain(finished, analyticsBase, {
+            recordOutcome: "found",
+            isCurrent,
+          });
+          if (applied) {
+            displayedChain = candidate;
+            improvedByServer = true;
+          }
+          return applied;
+        };
+        const finishKnownRouteCheck = async (finished) => {
+          if (!isCurrent()) {
+            clearActiveJob(job.id);
+            return;
+          }
+          clearActiveJob(job.id);
+          finishSearchQueue(finished);
+          const improved = await applyIfShorter(finished);
+          if (!isCurrent() || improved || improvedByServer) return;
+          showSavedRoute("The background check finished without finding a shorter route.");
+        };
+
+        await applyIfShorter(job);
+        if (!isCurrent()) return true;
+        if (TERMINAL_SEARCH_STATUSES.has(job.status)) {
+          await finishKnownRouteCheck(job);
+          return true;
+        }
+
+        logLine("loaded saved verified route instantly; checking for a shorter route");
+        showSavedRoute("Checking for a shorter route in the background.");
+        btn.disabled = false;
+        pollServerSearchJob(job.id, {
+          analyticsBase,
+          logLine,
+          background: true,
+          isCurrent,
+        })
+          .then(finishKnownRouteCheck)
+          .catch((error) => {
+            if (!isCurrent()) {
+              clearActiveJob(job.id);
+              return;
+            }
+            if (error?.status === 404 || error?.status === 410) {
+              clearActiveJob(job.id);
+              finishSearchQueue({
+                ...job,
+                status: "expired",
+                progress: "The shorter-route check expired; the saved proof is still available.",
+              });
+            }
+            logLine(`shorter-route check paused: ${error.message}`);
+            showSavedRoute("The shorter-route check paused; the saved proof is still available.");
+          })
+          .finally(() => {
+            if (isCurrent()) btn.disabled = false;
+          });
+        return true;
+      }
       let showedInstantChain = false;
       let instantChainKey = "";
       if (job.chain?.found) {
@@ -3398,6 +3451,12 @@
       if (!isCurrent()) return true;
       logLine(`server search unavailable: ${error.message}`);
       if (activeJob?.id) {
+        if (knownChain?.found) {
+          showStatus("done",
+            "✓ the saved verified route is still available. " +
+            "The shorter-route check paused and can resume after a reload.");
+          return true;
+        }
         showStatus("error",
           "The connection search is still saved, but live updates paused. " +
           "Reload this page to resume the same search instead of starting over.");
@@ -3781,7 +3840,8 @@
 
     const savedChain = precomputedChain(start, target);
     if (savedChain) {
-      showStatus("done", `loaded the saved ${savedChain.display || target} chain instantly.`);
+      showStatus("done",
+        `showing a saved verified route to ${savedChain.display || target} while checking for a shorter route.`);
       const renderedChain = {
         target: savedChain.target,
         display: savedChain.display || nameOf(savedChain.target),
@@ -3791,6 +3851,7 @@
         hops: savedChain.hops,
       };
       renderChain(renderedChain);
+      setActiveChip(target);
       submitLeaderboardChain(start, target, renderedChain);
       recordSearchEvent("saved", {
         ...analyticsBase,

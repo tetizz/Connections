@@ -2154,19 +2154,55 @@ async function verifyPathHops(env, path, archiveLimit, stats = null, options = {
   return hops.every(Boolean) ? cleanHopList(hops) : null;
 }
 
+async function verifyExactSharePath(env, path, proofHops, stats = null) {
+  const cleanPath = Array.isArray(path)
+    ? path.map(cleanUsername).filter(Boolean).slice(0, MAX_CHAIN_NODES)
+    : [];
+  if (cleanPath.length < 2 || new Set(cleanPath).size !== cleanPath.length) {
+    return { state: "invalid" };
+  }
+  const proofByPair = new Map(cleanHopList(proofHops)
+    .map((hop) => [`${hop.from}>${hop.to}`, hop]));
+  const outcomes = await runThrottled(cleanPath.slice(0, -1).map((from, index) => async () => {
+    const to = cleanPath[index + 1];
+    try {
+      const cachedHop = await findCachedHop(env, from, to, Infinity);
+      if (cachedHop) return { state: "verified", hop: cachedHop };
+      const suppliedProof = proofByPair.get(`${from}>${to}`);
+      if (!suppliedProof) return { state: "invalid" };
+      if (String(env.EXACT_GAME_PROOF_ENABLED || "true") === "false") {
+        return { state: "unavailable" };
+      }
+      return verifyLiveGameProofOutcome(env, suppliedProof, Infinity, stats);
+    } catch {
+      return { state: "unavailable" };
+    }
+  }), 2);
+  if (outcomes.some((outcome) => outcome.state === "invalid")) return { state: "invalid" };
+  if (outcomes.some((outcome) => outcome.state !== "verified")) return { state: "unavailable" };
+  return { state: "verified", hops: cleanHopList(outcomes.map((outcome) => outcome.hop)) };
+}
+
 async function verifyLiveGameProof(env, hop, archiveLimit, stats = null, signal = null) {
+  const outcome = await verifyLiveGameProofOutcome(env, hop, archiveLimit, stats, signal);
+  return outcome.state === "verified" ? outcome.hop : null;
+}
+
+async function verifyLiveGameProofOutcome(env, hop, archiveLimit, stats = null, signal = null) {
   if (signal?.aborted) throw abortSignalError(signal);
   const from = cleanUsername(hop?.from);
   const to = cleanUsername(hop?.to);
   const proofUrl = cleanUrl(hop?.url);
   const gameId = liveGameIdFromProofUrl(proofUrl);
-  if (!env?.GAMES_CACHE || !from || !to || from === to || !gameId) return null;
+  if (!from || !to || from === to || !gameId) return { state: "invalid" };
+  if (!env?.GAMES_CACHE) return { state: "unavailable" };
 
   const cacheKey = `proof:game:v1:${gameId}`;
   let fact = await env.GAMES_CACHE.get(cacheKey, { type: "json", cacheTtl: 60 }).catch(() => null);
   if (!validGameProofFact(fact, gameId)) {
-    fact = await fetchLiveGameProofFact(gameId, stats, signal);
-    if (!fact) return null;
+    const fetched = await fetchLiveGameProofFactOutcome(gameId, stats, signal);
+    if (fetched.state !== "verified") return fetched;
+    fact = fetched.fact;
     await env.GAMES_CACHE.put(cacheKey, JSON.stringify(fact), {
       expirationTtl: GAME_PROOF_CACHE_TTL_SECONDS,
       metadata: { type: "game-proof", gameId },
@@ -2177,20 +2213,23 @@ async function verifyLiveGameProof(env, hop, archiveLimit, stats = null, signal 
   const toPlayer = fact.players.find((player) => player.username === to);
   if (!fromPlayer || !toPlayer || fromPlayer.color === toPlayer.color ||
       fromPlayer.color !== fact.winnerColor) {
-    return null;
+    return { state: "invalid" };
   }
   if (!await proofTimestampInArchiveRange(env, from, fact.endTime, archiveLimit, stats, signal)) {
-    return null;
+    return { state: "invalid" };
   }
   return {
-    from,
-    to,
-    url: `https://www.chess.com/game/live/${gameId}`,
-    timeClass: fact.timeClass,
-    endTime: fact.endTime,
-    result: "win",
-    color: fromPlayer.color,
-    opening: fact.opening,
+    state: "verified",
+    hop: {
+      from,
+      to,
+      url: `https://www.chess.com/game/live/${gameId}`,
+      timeClass: fact.timeClass,
+      endTime: fact.endTime,
+      result: "win",
+      color: fromPlayer.color,
+      opening: fact.opening,
+    },
   };
 }
 
@@ -2211,7 +2250,7 @@ function liveGameIdFromProofUrl(value) {
   return Number.isSafeInteger(gameId) && gameId > 0 ? gameId : null;
 }
 
-async function fetchLiveGameProofFact(gameId, stats = null, signal = null) {
+async function fetchLiveGameProofFactOutcome(gameId, stats = null, signal = null) {
   const callbackUrl = `https://www.chess.com/callback/live/game/${gameId}`;
   const controller = new AbortController();
   const abortFromParent = () => controller.abort(abortSignalError(signal));
@@ -2233,27 +2272,29 @@ async function fetchLiveGameProofFact(gameId, stats = null, signal = null) {
       signal: controller.signal,
       redirect: "manual",
     });
-    if (!response.ok || response.status >= 300 && response.status < 400) return null;
+    if (!response.ok || response.status >= 300 && response.status < 400) {
+      return { state: "unavailable" };
+    }
     text = await readLimitedResponseText(response, GAME_PROOF_MAX_BYTES);
   } catch (error) {
     if (signal?.aborted) throw abortSignalError(signal);
-    return null;
+    return { state: "unavailable" };
   } finally {
     clearTimeout(timeout);
     if (signal) signal.removeEventListener("abort", abortFromParent);
   }
-  if (text == null) return null;
+  if (text == null) return { state: "unavailable" };
 
   let payload;
   try {
     payload = JSON.parse(text);
   } catch {
-    return null;
+    return { state: "unavailable" };
   }
   const game = payload?.game;
   if (Number(game?.id) !== gameId || game?.isLiveGame !== true ||
       game?.isFinished !== true || game?.type !== "chess") {
-    return null;
+    return { state: "unavailable" };
   }
   const winnerColor = String(game?.colorOfWinner || "").toLowerCase();
   const endTime = cleanProofTimestamp(game?.endTime);
@@ -2273,13 +2314,13 @@ async function fetchLiveGameProofFact(gameId, stats = null, signal = null) {
         player.isComputer !== false) ||
       players[0].username === players[1].username ||
       players[0].color === players[1].color) {
-    return null;
+    return { state: "unavailable" };
   }
   const headers = game?.pgnHeaders && typeof game.pgnHeaders === "object" &&
     !Array.isArray(game.pgnHeaders)
     ? game.pgnHeaders
     : null;
-  if (!headers) return null;
+  if (!headers) return { state: "unavailable" };
   const white = players.find((player) => player.color === "white");
   const black = players.find((player) => player.color === "black");
   const headerWhite = cleanUsername(headers.White);
@@ -2289,7 +2330,7 @@ async function fetchLiveGameProofFact(gameId, stats = null, signal = null) {
   if (headerWhite !== white.username ||
       headerBlack !== black.username ||
       headerResult !== expectedResult) {
-    return null;
+    return { state: "unavailable" };
   }
   if (stats) stats.fetched = Number(stats.fetched || 0) + 1;
   const typeName = String(game?.typeName || "").toLowerCase();
@@ -2302,7 +2343,9 @@ async function fetchLiveGameProofFact(gameId, stats = null, signal = null) {
     timeClass: ["rapid", "blitz", "bullet"].find((type) => typeName.includes(type)) || "",
     opening: String(headers.Opening || headers.ECOUrl || "").slice(0, 90),
   };
-  return validGameProofFact(fact, gameId) ? fact : null;
+  return validGameProofFact(fact, gameId)
+    ? { state: "verified", fact }
+    : { state: "unavailable" };
 }
 
 function validGameProofFact(value, gameId) {
@@ -3313,6 +3356,7 @@ async function handleShareCreate(request, env) {
     id,
     createdAt: Date.now(),
   };
+  record.proofVerification = await verifiedShareProofMarker(record);
   await env.GAMES_CACHE.put(`share:${id}`, JSON.stringify(record), {
     expirationTtl: SHARE_TTL_SECONDS,
     metadata: {
@@ -3328,30 +3372,52 @@ async function handleShareRead(url, env) {
   const id = cleanShareId(url.searchParams.get("id") || url.searchParams.get("c"));
   if (!id) return json({ error: "missing id" }, 400, "no-store");
   const cacheKey = `share:${id}`;
-  const record = shareRecordShape(await env.GAMES_CACHE.get(cacheKey, { type: "json", cacheTtl: 60 }));
+  const storedRecord = await env.GAMES_CACHE.get(cacheKey, { type: "json", cacheTtl: 60 });
+  const record = shareRecordShape(storedRecord);
   if (!record) return json({ error: "share not found" }, 404, "no-store");
-  const verificationStats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
-  const verifiedHops = await verifyPathHops(
-    env,
-    record.chain.path,
-    Infinity,
-    verificationStats,
-    {
-      proofHops: record.chain.hops,
-      exactProofOnly: true,
-    },
-  );
-  if (verifiedHops?.length !== record.chain.path.length - 1) {
-    await env.GAMES_CACHE.delete(cacheKey).catch(() => {});
-    return json({ error: "share proof could not be verified" }, 404, "no-store");
+  let verifiedRecord = record;
+  if (!await hasTrustedShareProofMarker(storedRecord, record)) {
+    const verificationStats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+    const outcome = await verifyExactSharePath(
+      env,
+      record.chain.path,
+      record.chain.hops,
+      verificationStats,
+    );
+    if (outcome.state === "invalid") {
+      await env.GAMES_CACHE.delete(cacheKey).catch(() => {});
+      return json({ error: "share proof is invalid" }, 404, "no-store");
+    }
+    if (outcome.state !== "verified" || outcome.hops.length !== record.chain.path.length - 1) {
+      return json(
+        { error: "share proof is temporarily unavailable" },
+        503,
+        "no-store",
+        { "Retry-After": "30" },
+      );
+    }
+    verifiedRecord = {
+      ...record,
+      chain: {
+        ...record.chain,
+        hops: outcome.hops,
+      },
+    };
+    const upgradedStoredRecord = {
+      ...storedRecord,
+      ...verifiedRecord,
+      id,
+      proofVerification: await verifiedShareProofMarker(verifiedRecord),
+    };
+    await env.GAMES_CACHE.put(cacheKey, JSON.stringify(upgradedStoredRecord), {
+      expirationTtl: SHARE_TTL_SECONDS,
+      metadata: {
+        type: "share",
+        start: verifiedRecord.start,
+        target: verifiedRecord.target,
+      },
+    });
   }
-  const verifiedRecord = {
-    ...record,
-    chain: {
-      ...record.chain,
-      hops: verifiedHops,
-    },
-  };
   const upgraded = await upgradeShareRecord(env, verifiedRecord).catch(() => verifiedRecord);
   return json({ ok: true, id, share: publicShareRecord({ ...upgraded, id }) }, 200, "public, max-age=60");
 }
@@ -3476,6 +3542,10 @@ function publicShareRecord(record) {
 }
 
 async function shareIdForRecord(record) {
+  return (await shareProofFingerprint(record)).slice(0, SHARE_ID_LENGTH);
+}
+
+async function shareProofFingerprint(record) {
   const canonical = JSON.stringify({
     start: record.start,
     target: record.target,
@@ -3484,7 +3554,26 @@ async function shareIdForRecord(record) {
   });
   const bytes = new TextEncoder().encode(canonical);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return base64UrlBytes(new Uint8Array(digest)).slice(0, SHARE_ID_LENGTH);
+  return base64UrlBytes(new Uint8Array(digest));
+}
+
+async function verifiedShareProofMarker(record) {
+  return {
+    schema: 1,
+    state: "verified",
+    fingerprint: await shareProofFingerprint(record),
+    verifiedAt: Date.now(),
+  };
+}
+
+async function hasTrustedShareProofMarker(storedRecord, shapedRecord) {
+  const marker = storedRecord?.proofVerification;
+  return marker?.schema === 1 &&
+    marker.state === "verified" &&
+    Number.isFinite(marker.verifiedAt) &&
+    marker.verifiedAt > 0 &&
+    typeof marker.fingerprint === "string" &&
+    marker.fingerprint === await shareProofFingerprint(shapedRecord);
 }
 
 async function handleSubmit(request, env) {

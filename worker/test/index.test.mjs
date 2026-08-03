@@ -517,6 +517,17 @@ test("short shares store a route only after every exact game proof is verified",
   assert.equal(body.share.hops[0].result, "win");
   assert.equal(body.share.hops[0].color, "white");
   assert.equal(kv.values.has(`share:${body.id}`), true);
+  const stored = JSON.parse(kv.values.get(`share:${body.id}`));
+  assert.equal(stored.proofVerification?.schema, 1);
+  assert.equal(stored.proofVerification?.state, "verified");
+  assert.equal(Number.isFinite(stored.proofVerification?.verifiedAt), true);
+
+  await kv.delete(`proof:game:v1:${gameId}`);
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return response({ error: "temporarily unavailable" }, 503);
+  };
 
   const loaded = await worker.fetch(
     new Request(`https://worker.test/share?id=${body.id}`),
@@ -525,9 +536,11 @@ test("short shares store a route only after every exact game proof is verified",
   );
   assert.equal(loaded.status, 200);
   assert.equal((await loaded.json()).share.hops[0].result, "win");
+  assert.equal(requests, 0);
+  assert.equal(kv.values.has(`share:${body.id}`), true);
 });
 
-test("legacy short shares are deleted when their stored proof is not valid", async () => {
+test("legacy short shares survive when exact proof verification is temporarily unavailable", async () => {
   const kv = new MemoryKV();
   const id = "abcdefgh";
   await kv.put(`share:${id}`, JSON.stringify({
@@ -547,7 +560,54 @@ test("legacy short shares are deleted when their stored proof is not valid", asy
     },
     players: {},
   }));
-  globalThis.fetch = async () => response({});
+  globalThis.fetch = async () => response({ error: "temporarily unavailable" }, 503);
+
+  const result = await worker.fetch(
+    new Request(`https://worker.test/share?id=${id}`),
+    { GAMES_CACHE: kv },
+    {},
+  );
+
+  assert.equal(result.status, 503);
+  assert.equal(kv.values.has(`share:${id}`), true);
+});
+
+test("legacy short shares are deleted when their stored proof is confirmed invalid", async () => {
+  const kv = new MemoryKV();
+  const id = "abcdefgh";
+  await kv.put(`share:${id}`, JSON.stringify({
+    v: 1,
+    start: "alpha",
+    target: "omega",
+    chain: {
+      target: "omega",
+      found: true,
+      length: 1,
+      path: ["alpha", "omega"],
+      hops: [{
+        from: "alpha",
+        to: "omega",
+        url: "https://www.chess.com/game/live/1",
+      }],
+    },
+    players: {},
+  }));
+  globalThis.fetch = async () => response({
+    game: {
+      id: 1,
+      isLiveGame: true,
+      isFinished: true,
+      type: "chess",
+      colorOfWinner: "white",
+      endTime: Math.floor(Date.now() / 1000) - 60,
+      typeName: "Rapid",
+      pgnHeaders: { White: "omega", Black: "alpha", Result: "1-0" },
+    },
+    players: {
+      top: { username: "omega", color: "white", isComputer: false },
+      bottom: { username: "alpha", color: "black", isComputer: false },
+    },
+  });
 
   const result = await worker.fetch(
     new Request(`https://worker.test/share?id=${id}`),

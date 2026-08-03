@@ -326,7 +326,7 @@ test("search-start rate limits expose the JSON retry delay as Retry-After", asyn
   assert.ok(body.retryAfter >= 1);
 });
 
-test("health identifies the deployed continuous-search release", async () => {
+test("health identifies the verified-share release", async () => {
   const result = await worker.fetch(
     new Request("https://worker.test/health"),
     { GAMES_CACHE: new MemoryKV() },
@@ -335,7 +335,7 @@ test("health identifies the deployed continuous-search release", async () => {
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-07-24-continuous-search-v5");
+  assert.equal(body.release, "2026-08-02-verified-shares-v6");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {
@@ -432,6 +432,172 @@ test("client submissions without cached proof cannot poison route caches", async
   assert.equal(body.skipped, true);
   assert.equal(kv.values.has("leaderboard:entries"), false);
   assert.equal(kv.values.has("search:pair:v2:alpha:omega:auto"), false);
+});
+
+test("short shares reject unverified winner claims instead of storing fake proof", async () => {
+  const kv = new MemoryKV();
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return response({});
+  };
+
+  const result = await worker.fetch(
+    new Request("https://worker.test/share", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "CF-Connecting-IP": "203.0.113.10",
+      },
+      body: JSON.stringify({
+        v: 1,
+        target: "omega",
+        found: true,
+        length: 1,
+        path: ["alpha", "omega"],
+        hops: [{
+          from: "alpha",
+          to: "omega",
+          url: "https://www.chess.com/game/live/1",
+        }],
+      }),
+    }),
+    { GAMES_CACHE: kv },
+    {},
+  );
+
+  assert.equal(result.status, 422);
+  assert.equal(requests, 1);
+  assert.equal([...kv.values.keys()].some((key) => key.startsWith("share:") && !key.startsWith("share:ratelimit:")), false);
+});
+
+test("short shares store a route only after every exact game proof is verified", async () => {
+  const kv = new MemoryKV();
+  const gameId = 123456;
+  const endTime = Math.floor(Date.now() / 1000) - 60;
+  await kv.put(`proof:game:v1:${gameId}`, JSON.stringify({
+    schema: 1,
+    gameId,
+    endTime,
+    winnerColor: "white",
+    players: [
+      { username: "alpha", color: "white", isComputer: false },
+      { username: "omega", color: "black", isComputer: false },
+    ],
+    timeClass: "rapid",
+    opening: "Test Opening",
+  }));
+
+  const result = await worker.fetch(
+    new Request("https://worker.test/share", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "CF-Connecting-IP": "203.0.113.11",
+      },
+      body: JSON.stringify({
+        v: 1,
+        target: "omega",
+        found: true,
+        length: 1,
+        path: ["alpha", "omega"],
+        hops: [{
+          from: "alpha",
+          to: "omega",
+          url: `https://www.chess.com/game/live/${gameId}`,
+        }],
+      }),
+    }),
+    { GAMES_CACHE: kv },
+    {},
+  );
+  const body = await result.json();
+
+  assert.equal(result.status, 200);
+  assert.equal(body.share.hops[0].result, "win");
+  assert.equal(body.share.hops[0].color, "white");
+  assert.equal(kv.values.has(`share:${body.id}`), true);
+
+  const loaded = await worker.fetch(
+    new Request(`https://worker.test/share?id=${body.id}`),
+    { GAMES_CACHE: kv },
+    {},
+  );
+  assert.equal(loaded.status, 200);
+  assert.equal((await loaded.json()).share.hops[0].result, "win");
+});
+
+test("legacy short shares are deleted when their stored proof is not valid", async () => {
+  const kv = new MemoryKV();
+  const id = "abcdefgh";
+  await kv.put(`share:${id}`, JSON.stringify({
+    v: 1,
+    start: "alpha",
+    target: "omega",
+    chain: {
+      target: "omega",
+      found: true,
+      length: 1,
+      path: ["alpha", "omega"],
+      hops: [{
+        from: "alpha",
+        to: "omega",
+        url: "https://www.chess.com/game/live/1",
+      }],
+    },
+    players: {},
+  }));
+  globalThis.fetch = async () => response({});
+
+  const result = await worker.fetch(
+    new Request(`https://worker.test/share?id=${id}`),
+    { GAMES_CACHE: kv },
+    {},
+  );
+
+  assert.equal(result.status, 404);
+  assert.equal(kv.values.has(`share:${id}`), false);
+});
+
+test("short-share rate limiting happens before any proof fetch", async () => {
+  const kv = new MemoryKV();
+  await kv.put("share:ratelimit:203.0.113.12", JSON.stringify({
+    startedAt: Date.now(),
+    count: 12,
+  }));
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return response({});
+  };
+
+  const result = await worker.fetch(
+    new Request("https://worker.test/share", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "CF-Connecting-IP": "203.0.113.12",
+      },
+      body: JSON.stringify({
+        v: 1,
+        target: "omega",
+        found: true,
+        length: 1,
+        path: ["alpha", "omega"],
+        hops: [{
+          from: "alpha",
+          to: "omega",
+          url: "https://www.chess.com/game/live/123456",
+        }],
+      }),
+    }),
+    { GAMES_CACHE: kv },
+    {},
+  );
+
+  assert.equal(result.status, 429);
+  assert.equal(result.headers.get("Retry-After"), "60");
+  assert.equal(requests, 0);
 });
 
 test("all-history proof cannot leak into an auto-range submitted route", async () => {

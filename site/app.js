@@ -1040,7 +1040,15 @@
       shared = await fetchShortSharedChain(shortId);
     }
     if (!shared) {
-      shared = decodeSharePayload(params.get(CHAIN_PARAM) || params.get(LEGACY_SHARE_PARAM));
+      const encoded = params.get(CHAIN_PARAM) || params.get(LEGACY_SHARE_PARAM);
+      const decoded = decodeSharePayload(encoded);
+      if (decoded) {
+        shared = await verifyLongSharedChain(decoded);
+        if (!shared) {
+          showStatus("error", "This shared chain could not be verified.");
+          return true;
+        }
+      }
     }
     if (!shared) return false;
     state.players = state.players || {};
@@ -1056,6 +1064,23 @@
     renderChain(shared);
     showStatus("done", `loaded a shared chain to ${shared.display || shared.target}.`);
     return true;
+  }
+
+  async function verifyLongSharedChain(shared) {
+    const remoteBase = workerBase();
+    if (!remoteBase || !shared?.found) return null;
+    try {
+      const res = await fetch(`${remoteBase}/share`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify(shared),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return decodeShareObject(data.share);
+    } catch {
+      return null;
+    }
   }
 
   async function fetchShortSharedChain(id) {

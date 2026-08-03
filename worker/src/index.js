@@ -12,7 +12,7 @@
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-07-24-continuous-search-v5";
+const WORKER_RELEASE = "2026-08-02-verified-shares-v6";
 const CACHE_SCHEMA_VERSION = 2;
 const TTL_SECONDS = 7 * 24 * 60 * 60;
 const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -23,6 +23,7 @@ const TITLED_GROUPS = ["GM", "IM", "FM", "NM", "WGM", "WIM", "WFM", "CM", "WCM"]
 const ARCHIVE_CONCURRENCY = 1;
 const SUBMIT_WINDOW_SECONDS = 60;
 const MAX_SUBMITS_PER_WINDOW = 30;
+const MAX_SHARES_PER_WINDOW = 12;
 const MAX_ANALYTICS_EVENTS = 120;
 const MAX_ANALYTICS_LIMIT = 50;
 const MAX_ANALYTICS_EVENTS_PER_WINDOW = 80;
@@ -3255,6 +3256,8 @@ async function listKvKeys(env, prefix, max) {
 }
 
 async function handleShareCreate(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const rateLimitKey = `share:ratelimit:${ip}`;
   let body;
   try {
     body = await request.json();
@@ -3264,9 +3267,49 @@ async function handleShareCreate(request, env) {
 
   const share = shareRecordShape(body);
   if (!share) return json({ error: "invalid share" }, 400, "no-store");
-  const id = await shareIdForRecord(share);
-  const record = {
+
+  const shareWindow = await readSubmitWindow(env.GAMES_CACHE, rateLimitKey);
+  if (shareWindow.count >= MAX_SHARES_PER_WINDOW) {
+    const retryAfter = Math.max(
+      1,
+      SUBMIT_WINDOW_SECONDS - Math.floor((Date.now() - shareWindow.startedAt) / 1000),
+    );
+    return json({
+      error: "too many share requests, wait a moment",
+      retryAfter,
+    }, 429, "no-store", { "Retry-After": String(retryAfter) });
+  }
+  await env.GAMES_CACHE.put(rateLimitKey, JSON.stringify({
+    startedAt: shareWindow.startedAt,
+    count: shareWindow.count + 1,
+  }), { expirationTtl: SUBMIT_WINDOW_SECONDS * 2 });
+
+  const verificationStats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+  const verifiedHops = await verifyPathHops(
+    env,
+    share.chain.path,
+    Infinity,
+    verificationStats,
+    {
+      proofHops: share.chain.hops,
+      exactProofOnly: true,
+    },
+  );
+  if (verifiedHops?.length !== share.chain.path.length - 1) {
+    return json({
+      error: "share proof could not be verified",
+    }, 422, "no-store");
+  }
+  const verifiedShare = {
     ...share,
+    chain: {
+      ...share.chain,
+      hops: verifiedHops,
+    },
+  };
+  const id = await shareIdForRecord(verifiedShare);
+  const record = {
+    ...verifiedShare,
     id,
     createdAt: Date.now(),
   };
@@ -3274,8 +3317,8 @@ async function handleShareCreate(request, env) {
     expirationTtl: SHARE_TTL_SECONDS,
     metadata: {
       type: "share",
-      start: share.start,
-      target: share.target,
+      start: verifiedShare.start,
+      target: verifiedShare.target,
     },
   });
   return json({ ok: true, id, share: publicShareRecord(record) }, 200, "no-store");
@@ -3284,9 +3327,32 @@ async function handleShareCreate(request, env) {
 async function handleShareRead(url, env) {
   const id = cleanShareId(url.searchParams.get("id") || url.searchParams.get("c"));
   if (!id) return json({ error: "missing id" }, 400, "no-store");
-  const record = shareRecordShape(await env.GAMES_CACHE.get(`share:${id}`, { type: "json", cacheTtl: 60 }));
+  const cacheKey = `share:${id}`;
+  const record = shareRecordShape(await env.GAMES_CACHE.get(cacheKey, { type: "json", cacheTtl: 60 }));
   if (!record) return json({ error: "share not found" }, 404, "no-store");
-  const upgraded = await upgradeShareRecord(env, record).catch(() => record);
+  const verificationStats = { fetched: 0, requests: 0, cached: 0, expanded: 0 };
+  const verifiedHops = await verifyPathHops(
+    env,
+    record.chain.path,
+    Infinity,
+    verificationStats,
+    {
+      proofHops: record.chain.hops,
+      exactProofOnly: true,
+    },
+  );
+  if (verifiedHops?.length !== record.chain.path.length - 1) {
+    await env.GAMES_CACHE.delete(cacheKey).catch(() => {});
+    return json({ error: "share proof could not be verified" }, 404, "no-store");
+  }
+  const verifiedRecord = {
+    ...record,
+    chain: {
+      ...record.chain,
+      hops: verifiedHops,
+    },
+  };
+  const upgraded = await upgradeShareRecord(env, verifiedRecord).catch(() => verifiedRecord);
   return json({ ok: true, id, share: publicShareRecord({ ...upgraded, id }) }, 200, "public, max-age=60");
 }
 

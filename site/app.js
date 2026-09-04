@@ -17,7 +17,6 @@
   const LS_RANGE_KEY = "chess-connections:range";
   const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
   const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v1";
-  const INTRO_COMPLETE_KEY = "chess-connections:intro-complete:v1";
   const CHAIN_PARAM = "chain";
   const SHORT_CHAIN_PARAM = "c";
   const LEGACY_SHARE_PARAM = "share";
@@ -40,7 +39,7 @@
   const TOP_TRACE_SUBMIT_LIMIT = 30;
   const TOP_TRACE_SUBMIT_CONCURRENCY = 4;
   const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
-  let introCompletedThisSession = false;
+  const COMPACT_GRAPH_MEDIA = window.matchMedia("(max-width: 620px)");
   const QUICK_TARGET_GROUPS = [
     {
       id: "rapid",
@@ -86,6 +85,9 @@
     topTraceRunId: 0,
     topTraceResults: [],
     topTraceSubmittedKeys: new Set(),
+    dialogReturnFocus: new WeakMap(),
+    profilePopoverAnchor: null,
+    graphImageObserver: null,
   };
 
   // ---------- small utils ----------
@@ -108,6 +110,56 @@
   };
   const connectionCount = (path = []) => Math.max(0, path.length - 2);
   const stepText = (count) => `${count} step${count === 1 ? "" : "s"}`;
+  const FOCUSABLE_SELECTOR = [
+    "a[href]",
+    "button:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    "[tabindex]:not([tabindex='-1'])",
+  ].join(",");
+
+  function focusableElements(container) {
+    if (!container) return [];
+    return [...container.querySelectorAll(FOCUSABLE_SELECTOR)]
+      .filter((node) => (
+        !node.closest("[hidden]")
+        && node.getAttribute("aria-hidden") !== "true"
+        && node.getClientRects().length > 0
+      ));
+  }
+
+  function rememberDialogFocus(dialog) {
+    if (!dialog || dialog.hidden === false) return;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) state.dialogReturnFocus.set(dialog, active);
+  }
+
+  function restoreDialogFocus(dialog, fallback) {
+    const target = state.dialogReturnFocus.get(dialog);
+    state.dialogReturnFocus.delete(dialog);
+    if (target instanceof HTMLElement && target.isConnected) target.focus();
+    else fallback?.focus();
+  }
+
+  function trapDialogFocus(event, dialog) {
+    if (event.key !== "Tab" || !dialog || dialog.hidden) return false;
+    const focusable = focusableElements(dialog);
+    if (!focusable.length) {
+      event.preventDefault();
+      return true;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+    return true;
+  }
 
   const titleOf = (u) => state.players?.[u.toLowerCase()]?.title || null;
   const nameOf = (u) => {
@@ -295,7 +347,7 @@
     const rank = Number.isFinite(player.rank) ? `<span class="quick-player__rank">#${player.rank}</span>` : "";
     const score = Number.isFinite(player.score) ? `<span>${plainNumber(player.score)}</span>` : "";
     const avatar = player.avatar
-      ? `<img class="quick-player__photo" src="${esc(player.avatar)}" alt="${esc(display)} profile photo" width="34" height="34" referrerpolicy="no-referrer" loading="lazy" decoding="async">`
+      ? `<img class="quick-player__photo" src="${esc(player.avatar)}" alt="${esc(display)} profile photo" width="34" height="34" crossorigin="anonymous" referrerpolicy="no-referrer" loading="lazy" decoding="async">`
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
     return `
       <button class="chip quick-player${username === active ? " is-active" : ""}" type="button"
@@ -337,6 +389,21 @@
       clearTimeout(timeout);
       setActiveChip($("#search-target")?.value || DEFAULT_TARGET);
     }
+  }
+
+  function loadLeaderboardTargetsWhenVisible() {
+    const section = $(".quick-targets");
+    renderQuickTargetsLoading();
+    if (!section || typeof IntersectionObserver !== "function") {
+      loadLeaderboardTargets();
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      loadLeaderboardTargets();
+    }, { rootMargin: "80px 0px" });
+    observer.observe(section);
   }
 
   function buildLeaderboardTargetGroups(data) {
@@ -460,10 +527,6 @@
     const start = cleanUsernameInput(startRaw);
     const btn = $("#trace-top-players");
     if (!btn) return;
-    if (!introComplete()) {
-      openIntroGate();
-      return;
-    }
     if (!start) {
       showStatus("error", usernameInputError(startRaw, "your username"));
       $("#search-start")?.focus();
@@ -766,6 +829,7 @@
     // or clicks one.
     state.suggest.activeIndex = -1;
     input.setAttribute("aria-expanded", "true");
+    input.removeAttribute("aria-activedescendant");
     for (const other of ["start", "target"]) {
       if (other !== field) {
         const otherConfig = suggestConfig(other);
@@ -773,19 +837,20 @@
         const otherInput = $(otherConfig.input);
         if (otherBox) otherBox.hidden = true;
         otherInput?.setAttribute("aria-expanded", "false");
+        otherInput?.removeAttribute("aria-activedescendant");
       }
     }
     box.hidden = false;
     box.innerHTML = `
       <div class="username-suggest__panel">
         ${options.loading ? `<div class="username-suggest__status">Searching players...</div>` : ""}
-        ${state.suggest.items.length ? state.suggest.items.map((item, index) => usernameSuggestionRow(item, index)).join("") : usernameSuggestEmpty(query)}
+        ${state.suggest.items.length ? state.suggest.items.map((item, index) => usernameSuggestionRow(item, index, field)).join("") : usernameSuggestEmpty(query)}
         <button class="username-suggest__all" type="button" data-exact="${esc(query)}">Use exact username "${esc(query)}"</button>
       </div>
     `;
   }
 
-  function usernameSuggestionRow(item, index) {
+  function usernameSuggestionRow(item, index, field) {
     const display = item.name || item.username;
     const avatar = item.avatar
       ? `<img src="${esc(item.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer" loading="lazy" decoding="async">`
@@ -793,7 +858,7 @@
     const title = item.title ? `<span class="username-suggest__title">${esc(item.title)}</span>` : "";
     const country = countryFlagIcon(item.country);
     return `
-      <button class="username-suggest__row${index === state.suggest.activeIndex ? " is-active" : ""}" type="button"
+      <button class="username-suggest__row${index === state.suggest.activeIndex ? " is-active" : ""}" id="username-suggest-option-${esc(field)}-${index}" type="button"
               role="option" aria-selected="${index === state.suggest.activeIndex ? "true" : "false"}"
               data-index="${index}" data-username="${esc(item.username)}">
         <span class="username-suggest__avatar">${avatar}</span>
@@ -829,6 +894,8 @@
       row.setAttribute("aria-selected", active ? "true" : "false");
       if (active) row.scrollIntoView({ block: "nearest" });
     });
+    const input = $(config.input);
+    if (input) input.setAttribute("aria-activedescendant", `username-suggest-option-${config.field}-${state.suggest.activeIndex}`);
   }
 
   function selectUsernameSuggestion(username, field = state.suggest.field) {
@@ -866,6 +933,7 @@
         box.innerHTML = "";
       }
       input?.setAttribute("aria-expanded", "false");
+      input?.removeAttribute("aria-activedescendant");
     }
   }
 
@@ -1918,8 +1986,65 @@
   }
 
   // ---------- graph ----------
+  function hydrateGraphImages(svg) {
+    svg.querySelectorAll("image[data-avatar-src]").forEach((image) => {
+      const source = image.dataset.avatarSrc;
+      if (!source) return;
+      image.setAttribute("href", source);
+      image.removeAttribute("data-avatar-src");
+    });
+  }
+
+  function loadGraphImagesWhenVisible(svg) {
+    state.graphImageObserver?.disconnect();
+    state.graphImageObserver = null;
+    if (!svg.querySelector("image[data-avatar-src]")) return;
+    if (typeof IntersectionObserver !== "function") {
+      hydrateGraphImages(svg);
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      if (state.graphImageObserver === observer) state.graphImageObserver = null;
+      hydrateGraphImages(svg);
+    }, { rootMargin: "160px 0px" });
+    state.graphImageObserver = observer;
+    observer.observe(svg.closest(".graph-wrap") || svg);
+  }
+
+  function updateGraphSummary(chain) {
+    const summary = $("#graph-summary");
+    const svg = $("#graph");
+    if (!summary || !svg) return;
+    if (!chain) {
+      summary.textContent = "No connection is selected yet.";
+      svg.setAttribute("aria-label", "Connection graph");
+      return;
+    }
+    if (chain.tree) {
+      const root = chain.root || chain.path?.[0] || "the starting player";
+      const found = chain.foundSlotCount || chain.branchCount || 0;
+      const total = chain.targetCount || chain.branchCount || 0;
+      summary.textContent = `Connection tree from ${root}. ${found} of ${total} leaderboard targets have verified routes. Open the proof ledger below for each game.`;
+      svg.setAttribute("aria-label", `Connection tree from ${root}`);
+      return;
+    }
+    if (!chain.found || !Array.isArray(chain.path) || !chain.path.length) {
+      const target = chain.display || chain.target || "that player";
+      summary.textContent = `No verified connection to ${target} is available for this search.`;
+      svg.setAttribute("aria-label", `No verified connection to ${target}`);
+      return;
+    }
+    const route = chain.path.map((username) => nameOf(username)).join(" then ");
+    const links = Math.max(0, chain.path.length - 1);
+    summary.textContent = `Verified ${links}-link win chain: ${route}. Every link has a public proof game in the ledger below.`;
+    svg.setAttribute("aria-label", `Verified win chain from ${nameOf(chain.path[0])} to ${nameOf(chain.path[chain.path.length - 1])}`);
+  }
+
   function renderGraph(chain, options = {}) {
     hideGraphExplorer();
+    updateGraphSummary(chain);
     if (chain?.tree) {
       renderTreeGraph(chain, options);
       return;
@@ -1929,10 +2054,21 @@
     svg.classList.remove("is-tree-graph");
     delete svg.dataset.treeSignature;
     delete svg.dataset.treeAnimationRun;
-    svg.setAttribute("viewBox", "0 0 1040 420");
+    const compactGraph = COMPACT_GRAPH_MEDIA.matches;
+    let viewWidth = compactGraph ? 300 : 1040;
+    let viewHeight = 420;
+    svg.setAttribute("viewBox", `0 0 ${viewWidth} ${viewHeight}`);
+    svg.style.setProperty("--chain-graph-height", compactGraph ? "420px" : "330px");
 
     const defs = el("defs");
-    const grad = el("linearGradient", { id: "edge-grad", gradientUnits: "userSpaceOnUse", x1: "0", y1: "0", x2: "1040", y2: "0" });
+    const grad = el("linearGradient", {
+      id: "edge-grad",
+      gradientUnits: "userSpaceOnUse",
+      x1: "0",
+      y1: "0",
+      x2: compactGraph ? "0" : String(viewWidth),
+      y2: compactGraph ? String(viewHeight) : "0",
+    });
     grad.appendChild(el("stop", { offset: "0%", "stop-color": "#496a46" }));
     grad.appendChild(el("stop", { offset: "50%", "stop-color": "#b4833a" }));
     grad.appendChild(el("stop", { offset: "100%", "stop-color": "#415d75" }));
@@ -1944,8 +2080,8 @@
 
     if (!chain.found) {
       const t = el("text", {
-        x: 520, y: 180, "text-anchor": "middle",
-        fill: "#63685f", "font-size": "18", "font-family": "Inter, sans-serif",
+        x: viewWidth / 2, y: 180, "text-anchor": "middle",
+        fill: "#63685f", "font-size": compactGraph ? "14" : "18", "font-family": "ui-sans-serif, system-ui, sans-serif",
       });
       t.textContent = `couldn't find a connection to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} steps.`;
       svg.appendChild(t);
@@ -1956,17 +2092,25 @@
 
     const nodes = chain.path;
     const n = nodes.length;
-    const PAD = 128, W = 1040;
-    const usable = W - PAD * 2;
+    if (compactGraph) {
+      viewHeight = Math.max(420, 164 + Math.max(0, n - 1) * 132);
+      svg.setAttribute("viewBox", `0 0 ${viewWidth} ${viewHeight}`);
+      svg.style.setProperty("--chain-graph-height", `${viewHeight}px`);
+      grad.setAttribute("y2", String(viewHeight));
+    }
+    const PAD = 128;
+    const usable = viewWidth - PAD * 2;
     const stepX = n > 1 ? usable / (n - 1) : 0;
-    const y = 196;
-    const positions = nodes.map((_, i) => ({ x: PAD + stepX * i, y }));
+    const positions = compactGraph
+      ? nodes.map((_, i) => ({ x: viewWidth / 2, y: 64 + i * 132 }))
+      : nodes.map((_, i) => ({ x: PAD + stepX * i, y: 196 }));
 
     const edgesGroup = el("g");
     for (let i = 0; i < n - 1; i++) {
       const a = positions[i], b = positions[i + 1];
-      const midX = (a.x + b.x) / 2;
-      const d = `M ${a.x} ${a.y} Q ${midX} ${a.y - 28} ${b.x} ${b.y}`;
+      const d = compactGraph
+        ? `M ${a.x} ${a.y} C ${a.x + 28} ${(a.y + b.y) / 2}, ${b.x + 28} ${(a.y + b.y) / 2}, ${b.x} ${b.y}`
+        : `M ${a.x} ${a.y} Q ${(a.x + b.x) / 2} ${a.y - 28} ${b.x} ${b.y}`;
       edgesGroup.appendChild(el("path", { class: "edge-glow", d }));
       edgesGroup.appendChild(el("path", { class: "edge-line", d }));
     }
@@ -1977,6 +2121,13 @@
       const pos = positions[i];
       const isStart = i === 0;
       const isTarget = i === n - 1;
+      const title = titleOf(u);
+      const nodeMeta = title
+        ? [title, isTarget ? "TARGET" : ""]
+        : [isTarget ? "TARGET" : isStart ? "YOU" : ""];
+      const nodeLabel = [nameOf(u), ...nodeMeta, "profile"]
+        .filter(Boolean)
+        .join(" ");
       const g = el("g", {
         class: "node" + (isStart ? " is-start" : "") + (isTarget ? " is-target" : ""),
         transform: `translate(${pos.x}, ${pos.y})`,
@@ -1984,7 +2135,7 @@
         "data-profile-trigger": "",
         tabindex: "0",
         role: "button",
-        "aria-label": `${nameOf(u)} profile`,
+        "aria-label": nodeLabel,
       });
       g.appendChild(el("circle", { class: "node__hit", r: 46 }));
       g.appendChild(el("ellipse", { class: "node__shadow", cx: 0, cy: 42, rx: 34, ry: 8 }));
@@ -1992,29 +2143,26 @@
       g.appendChild(el("circle", { class: "node__ring", r: 32 }));
 
       const av = avatarOf(u);
+      const fallback = el("text", { class: "node__icon", x: 0, y: 0 });
+      fallback.textContent = pieceFor(isStart, isTarget);
+      g.appendChild(fallback);
       if (av) {
         const img = el("image", {
-          class: "node__img", href: av,
+          class: "node__img", "data-avatar-src": av,
           x: -32, y: -32, width: 64, height: 64,
           "clip-path": "url(#clip)", preserveAspectRatio: "xMidYMid slice",
         });
         img.addEventListener("error", () => {
-          const fb = el("text", { class: "node__icon", x: 0, y: 0 });
-          fb.textContent = pieceFor(isStart, isTarget);
-          if (img.parentNode) g.replaceChild(fb, img);
+          img.remove();
         });
+        img.addEventListener("load", () => fallback.remove(), { once: true });
         g.appendChild(img);
-      } else {
-        const ic = el("text", { class: "node__icon", x: 0, y: 0 });
-        ic.textContent = pieceFor(isStart, isTarget);
-        g.appendChild(ic);
       }
 
       const label = el("text", { class: "node__label", x: 0, y: 58 });
       label.textContent = compactGraphLabel(nameOf(u), n > 7 ? 11 : 15);
       g.appendChild(label);
 
-      const title = titleOf(u);
       if (title) {
         const ttag = el("text", { class: "node__title", x: 0, y: 76 });
         ttag.textContent = title + (isTarget ? " · TARGET" : "");
@@ -2042,12 +2190,19 @@
     $("#graph-hint").textContent =
       `every arrow is a real win from a real game. ${n - 1} link${n - 1 === 1 ? "" : "s"} in total.`;
 
+    loadGraphImagesWhenVisible(svg);
     animateGraph(svg, traveller, spark);
   }
 
   if (location.hostname === "127.0.0.1" || location.hostname === "localhost") {
     window.__connectionsDebugRenderGraph = renderGraph;
   }
+
+  COMPACT_GRAPH_MEDIA.addEventListener?.("change", () => {
+    if (!state.currentChain || state.currentChain.tree) return;
+    hideProfilePopover();
+    renderGraph(state.currentChain);
+  });
 
   function renderTreeGraph(treeChain, options = {}) {
     const svg = $("#graph");
@@ -2552,9 +2707,9 @@
     return new Promise((resolve) => {
       setTimeout(() => {
         node.style.removeProperty("transform");
-        node.style.transition = "opacity .35s ease";
+        node.style.transition = "opacity .14s ease";
         node.style.opacity = 1;
-        setTimeout(resolve, 350);
+        setTimeout(resolve, 140);
       }, delay);
     });
   }
@@ -2567,17 +2722,17 @@
       ring.setAttribute("r", 30);
       ring.style.opacity = 0.9;
       void ring.getBoundingClientRect();
-      ring.style.transition = "r .7s ease-out, opacity .7s ease-out";
+      ring.style.transition = "r .22s ease-out, opacity .22s ease-out";
       ring.setAttribute("r", 52);
       ring.style.opacity = 0;
-      setTimeout(resolve, 700);
+      setTimeout(resolve, 220);
     });
   }
 
   function travelPath(path, glow, traveller, spark) {
     return new Promise((resolve) => {
       const len = path.getTotalLength();
-      const dur = 760;
+      const dur = 300;
       const start = performance.now();
       if (glow) {
         glow.style.opacity = 0.11;
@@ -2791,6 +2946,11 @@
       img.className = "card__avatar" + (title ? " is-titled" : "");
       img.src = av;
       img.alt = nameOf(username);
+      img.width = 42;
+      img.height = 42;
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.crossOrigin = "anonymous";
       img.dataset.profileUser = username.toLowerCase();
       img.dataset.profileTrigger = "";
       img.referrerPolicy = "no-referrer";
@@ -2821,7 +2981,7 @@
     const profile = await fetchProfile(key).catch(() => state.players?.[key] || { username: key });
     const neighbors = chainNeighbors(key);
     const avatar = profile?.avatar
-      ? `<img src="${esc(profile.avatar)}" alt="${esc(nameOf(key))} profile photo" referrerpolicy="no-referrer">`
+      ? `<img src="${esc(profile.avatar)}" alt="${esc(nameOf(key))} profile photo" crossorigin="anonymous" referrerpolicy="no-referrer">`
       : esc((nameOf(key)[0] || "?").toUpperCase());
     panel.hidden = false;
     panel.innerHTML = `
@@ -3090,7 +3250,7 @@
     const handle = profile?.username || username;
     const title = profile?.title ? `<span class="profile-popover__title">${esc(profile.title)}</span> ` : "";
     const avatar = profile?.avatar
-      ? `<img src="${esc(profile.avatar)}" alt="${esc(display)} profile photo" referrerpolicy="no-referrer">`
+      ? `<img src="${esc(profile.avatar)}" alt="${esc(display)} profile photo" crossorigin="anonymous" referrerpolicy="no-referrer">`
       : `<span>${esc((display[0] || "?").toUpperCase())}</span>`;
     const joined = profile?.joined ? `<span>Joined ${esc(formatProfileDate(profile.joined))}</span>` : `<span>Joined unavailable</span>`;
     const countryFlag = profile?.country ? flagIcon(profile.country, "profile-popover__flag") : "";
@@ -3111,6 +3271,7 @@
     const recentGames = renderProfileRecentGames(profile?.recentGames);
 
     pop.innerHTML = `
+      <button class="profile-popover__close" type="button" data-profile-close aria-label="Close player details">Close</button>
       <div class="profile-popover__top">
         <span class="profile-popover__avatar">${avatar}</span>
         <span class="profile-popover__main">
@@ -3123,8 +3284,10 @@
       ${recentGames}
       <a class="profile-popover__open" href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>
     `;
+    pop.setAttribute("aria-label", `${display} player details`);
     pop.hidden = false;
     positionProfilePopover(pop, anchor);
+    pop.querySelector("[data-profile-close]")?.focus({ preventScroll: true });
   }
 
   function positionProfilePopover(pop, anchor) {
@@ -3145,11 +3308,13 @@
     const key = String(username || "").trim().toLowerCase();
     if (!key || !anchor) return;
     const token = ++state.profilePopoverToken;
+    state.profilePopoverAnchor = anchor;
     const pop = $("#profile-popover");
     if (pop) {
       pop.hidden = false;
-      pop.innerHTML = `<div class="profile-popover__loading">Loading ${esc(key)}...</div>`;
+      pop.innerHTML = `<button class="profile-popover__close" type="button" data-profile-close aria-label="Close player details">Close</button><div class="profile-popover__loading" role="status">Loading ${esc(key)}...</div>`;
       positionProfilePopover(pop, anchor);
+      pop.querySelector("[data-profile-close]")?.focus({ preventScroll: true });
     }
     const profile = await fetchProfile(key);
     if (token !== state.profilePopoverToken || $("#profile-popover")?.hidden) return;
@@ -3157,13 +3322,16 @@
     renderProfilePopover(profile, key, anchor);
   }
 
-  function hideProfilePopover() {
+  function hideProfilePopover(restoreFocus = false) {
     state.profilePopoverToken++;
     const pop = $("#profile-popover");
     if (pop) {
       pop.hidden = true;
       pop.innerHTML = "";
     }
+    const anchor = state.profilePopoverAnchor;
+    state.profilePopoverAnchor = null;
+    if (restoreFocus && anchor?.isConnected && typeof anchor.focus === "function") anchor.focus();
   }
 
   function formatProfileDate(seconds) {
@@ -4230,43 +4398,12 @@
     btn.title = isDark ? "Switch to light mode" : "Switch to dark mode";
   }
 
-  // ---------- first-run intro ----------
-  function introComplete() {
-    if (introCompletedThisSession) return true;
-    try {
-      return localStorage.getItem(INTRO_COMPLETE_KEY) === "1";
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function openIntroGate() {
-    const gate = $("#intro-gate");
-    if (!gate) return;
-    gate.hidden = false;
-    requestAnimationFrame(() => $("#intro-start")?.focus());
-  }
-
-  function closeIntroGate() {
-    const gate = $("#intro-gate");
-    if (gate) gate.hidden = true;
-  }
-
-  function completeIntroGate() {
-    introCompletedThisSession = true;
-    try {
-      localStorage.setItem(INTRO_COMPLETE_KEY, "1");
-    } catch (_) {
-      // If storage is blocked, treat this tab as introduced and keep going.
-    }
-    closeIntroGate();
-    $("#search-start")?.focus();
-  }
-
   // ---------- settings modal ----------
   function openSettings() {
     const modal = $("#settings-modal");
+    rememberDialogFocus(modal);
     modal.hidden = false;
+    document.body.classList.add("has-open-dialog");
     // populate fields from current state / storage
     $("#setting-username").value = localStorage.getItem(LS_KEY) || "";
     refreshCacheSize();
@@ -4284,9 +4421,13 @@
       ownerAnalytics.hidden = true;
       ownerAnalytics.innerHTML = "";
     }
+    requestAnimationFrame(() => $("#setting-username")?.focus());
   }
   function closeSettings() {
-    $("#settings-modal").hidden = true;
+    const modal = $("#settings-modal");
+    modal.hidden = true;
+    document.body.classList.remove("has-open-dialog");
+    restoreDialogFocus(modal, $("#settings-open"));
   }
   async function refreshCacheSize() {
     const el = $("#setting-cache-size");
@@ -4301,17 +4442,24 @@
     const current = document.documentElement.dataset.theme || "dark";
     applyTheme(current === "dark" ? "light" : "dark");
   });
-  $("#intro-start")?.addEventListener("click", completeIntroGate);
-  $("#intro-close")?.addEventListener("click", completeIntroGate);
   $("#settings-modal").addEventListener("click", (e) => {
     if (e.target.id === "settings-modal") closeSettings(); // click backdrop
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("#intro-gate")?.hidden) {
-      completeIntroGate();
+    const settings = $("#settings-modal");
+    if (settings && !settings.hidden) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeSettings();
+        return;
+      }
+      trapDialogFocus(e, settings);
       return;
     }
-    if (e.key === "Escape" && !$("#settings-modal").hidden) closeSettings();
+    if (e.key === "Escape" && !$("#profile-popover")?.hidden) {
+      e.preventDefault();
+      hideProfilePopover(true);
+    }
   });
   $("#owner-form")?.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -4501,10 +4649,6 @@
     if (!chip) return;
     $("#search-target").value = chip.dataset.target;
     setActiveChip(chip.dataset.target);
-    if (!introComplete()) {
-      openIntroGate();
-      return;
-    }
     if ($("#search-start").value) {
       $("#search-form").requestSubmit();
     } else {
@@ -4523,6 +4667,10 @@
     }
     if (event.target.closest("[data-explorer-close]")) {
       hideGraphExplorer();
+      return;
+    }
+    if (event.target.closest("[data-profile-close]")) {
+      hideProfilePopover(true);
       return;
     }
     const target = event.target.closest("[data-profile-trigger][data-profile-user]");
@@ -4552,14 +4700,15 @@
     localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
     $("#search-range").value = "auto";
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
-    if (!introComplete()) openIntroGate();
-    warmSharedCaches();
+    const scheduleCacheWarm = () => warmSharedCaches();
+    if (typeof requestIdleCallback === "function") requestIdleCallback(scheduleCacheWarm, { timeout: 3000 });
+    else setTimeout(scheduleCacheWarm, 1200);
     loadShowcase().then(async () => {
       const sharedLoaded = await loadSharedChainFromUrl();
-      loadLeaderboardTargets();
+      loadLeaderboardTargetsWhenVisible();
       if (!sharedLoaded) resumeActiveSearchJob();
     });
-    // load the global leaderboard in the background
-    if (window.Leaderboard) window.Leaderboard.load();
+    // Keep the global leaderboard off the initial critical path.
+    if (window.Leaderboard) window.Leaderboard.init();
   });
 })();

@@ -6,10 +6,13 @@
   <meta name="color-scheme" content="dark light" />
   <title>Chess Connections | Trace real Chess.com win chains</title>
   <meta name="description" content="Search two Chess.com players and trace the chain of live-game wins that connects them." />
+  <meta name="theme-color" content="#0d100e" />
+  <meta property="og:title" content="Chess Connections" />
+  <meta property="og:description" content="Trace a chain of real Chess.com live-game wins between two players." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://tetizz.github.io/Connections/" />
+  <meta name="twitter:card" content="summary" />
   <link rel="icon" href="assets/connections-mark.png" type="image/png" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
   <script>
     try {
       const themeKey = "chess-connections:theme";
@@ -26,10 +29,12 @@
   </script>
   <style>
     html, body { background: #0d100e; color: #f6efe2; }
+    html[data-theme="light"], html[data-theme="light"] body { background: #f5f1e8; color: #161814; }
   </style>
-  <link rel="stylesheet" href="styles.css?v=intro-dismiss-20260703" />
+  <link rel="stylesheet" href="styles.css?v=astra-20260904" />
 </head>
 <body>
+  <a class="skip-link" href="#trace-workspace">Skip to trace search</a>
   <div class="site-shell">
     <header class="masthead">
       <a class="brand" href="./" aria-label="Chess Connections home">
@@ -61,17 +66,23 @@
       </nav>
     </header>
 
-    <main>
-      <section class="command-center" aria-labelledby="page-title">
+    <main id="main-content">
+      <section class="command-center" id="trace-workspace" aria-labelledby="page-title">
         <div class="command-center__intro">
+          <p class="command-center__kicker"><span aria-hidden="true"></span> Verified public-game graph</p>
           <h1 id="page-title">Find the win chain between any two players</h1>
           <p>Every link is a real Chess.com live win: rapid, blitz, or bullet.</p>
+          <ul class="trust-strip" aria-label="Search proof standards">
+            <li><strong>Standard live</strong><span>No daily or variant games</span></li>
+            <li><strong>Proof attached</strong><span>Open every source game</span></li>
+            <li><strong>Safe to share</strong><span>Verified routes survive outages</span></li>
+          </ul>
         </div>
 
         <form class="search" id="search-form" autocomplete="off">
           <div class="search__field search__field--username">
             <label for="search-start">Your username</label>
-            <input id="search-start" type="text" placeholder="input your username"
+            <input id="search-start" type="text" role="combobox" placeholder="input your username"
                    spellcheck="false" autocapitalize="none" autocomplete="off"
                    aria-autocomplete="list" aria-controls="username-suggest"
                    aria-expanded="false" />
@@ -79,7 +90,7 @@
           </div>
           <div class="search__field search__field--target">
             <label for="search-target">Connect to</label>
-            <input id="search-target" type="text" value="magnuscarlsen" placeholder="magnuscarlsen"
+            <input id="search-target" type="text" role="combobox" value="magnuscarlsen" placeholder="magnuscarlsen"
                    spellcheck="false" autocapitalize="none" autocomplete="off"
                    aria-autocomplete="list" aria-controls="target-suggest"
                    aria-expanded="false" />
@@ -95,7 +106,7 @@
           </button>
         </form>
 
-        <div class="search__status" id="search-status" hidden></div>
+        <div class="search__status" id="search-status" role="status" aria-live="polite" aria-atomic="true" hidden></div>
         <div class="search-queue" id="search-queue" hidden>
           <div class="search-queue__head">
             <span>Live search queue</span>
@@ -108,7 +119,7 @@
             <span><small>Reused</small><b id="queue-cached">0</b></span>
             <span><small>Elapsed</small><b id="queue-elapsed">0s</b></span>
           </div>
-          <p id="queue-message">Waiting for the backend job to start.</p>
+          <p id="queue-message" role="status" aria-live="polite" aria-atomic="true">Waiting for the backend job to start.</p>
         </div>
         <div class="search__log" id="search-log" hidden></div>
         <div class="cache-info" id="cache-info" hidden></div>
@@ -162,8 +173,9 @@
           </button>
         </div>
         <div class="graph-wrap">
-          <svg id="graph" viewBox="0 0 1040 420" preserveAspectRatio="xMidYMid meet" aria-label="Connection graph"></svg>
+          <svg id="graph" viewBox="0 0 1040 420" preserveAspectRatio="xMidYMid meet" role="group" aria-label="Interactive connection graph" aria-describedby="graph-summary"></svg>
         </div>
+        <p class="sr-only" id="graph-summary" aria-live="polite" aria-atomic="true">No connection is selected yet.</p>
         <p class="graph-hint" id="graph-hint"></p>
         <aside class="graph-explorer" id="graph-explorer" hidden aria-live="polite"></aside>
       </section>
@@ -197,37 +209,19 @@
           </div>
         </div>
         <div class="leaderboard-tabs" id="leaderboard-tabs" role="tablist" aria-label="Leaderboard categories">
-          <button class="leaderboard-tab is-active" type="button" data-category="connectors">Top connectors</button>
-          <button class="leaderboard-tab" type="button" data-category="fastest">Fastest chains</button>
-          <button class="leaderboard-tab" type="button" data-category="top_targets">Top targets</button>
-          <button class="leaderboard-tab" type="button" data-category="searched">Most searched</button>
-          <button class="leaderboard-tab" type="button" data-category="recent">Recent</button>
+          <button class="leaderboard-tab is-active" id="leaderboard-tab-connectors" type="button" role="tab" aria-selected="true" aria-controls="leaderboard-list" tabindex="0" data-category="connectors">Top connectors</button>
+          <button class="leaderboard-tab" id="leaderboard-tab-fastest" type="button" role="tab" aria-selected="false" aria-controls="leaderboard-list" tabindex="-1" data-category="fastest">Fastest chains</button>
+          <button class="leaderboard-tab" id="leaderboard-tab-top-targets" type="button" role="tab" aria-selected="false" aria-controls="leaderboard-list" tabindex="-1" data-category="top_targets">Top targets</button>
+          <button class="leaderboard-tab" id="leaderboard-tab-searched" type="button" role="tab" aria-selected="false" aria-controls="leaderboard-list" tabindex="-1" data-category="searched">Most searched</button>
+          <button class="leaderboard-tab" id="leaderboard-tab-recent" type="button" role="tab" aria-selected="false" aria-controls="leaderboard-list" tabindex="-1" data-category="recent">Recent</button>
         </div>
-        <div id="leaderboard-list"></div>
+        <div id="leaderboard-list" role="tabpanel" aria-labelledby="leaderboard-tab-connectors" tabindex="0"></div>
       </section>
     </main>
 
     <footer class="footer">
       <p>Built from public Chess.com data.</p>
     </footer>
-  </div>
-
-  <div class="intro-gate" id="intro-gate" hidden role="dialog" aria-modal="true" aria-labelledby="intro-title">
-    <div class="intro-card">
-      <button class="intro-close" id="intro-close" type="button" aria-label="Close intro">
-        <span aria-hidden="true">&times;</span>
-      </button>
-      <span class="intro-card__mark" aria-hidden="true">♞</span>
-      <p class="eyebrow">New here</p>
-      <h2 id="intro-title">Trace yourself to a Chess.com leaderboard player</h2>
-      <p class="intro-card__copy">Input your username, pick a Rapid, Blitz, or Bullet target, trace the chain, then open the proof games behind every link.</p>
-      <ol class="intro-steps">
-        <li><span>1</span><strong>Input your username</strong><small>Use your exact Chess.com handle.</small></li>
-        <li><span>2</span><strong>Pick a target</strong><small>Targets come from live Chess.com leaderboards.</small></li>
-        <li><span>3</span><strong>Open proof games</strong><small>Each connection points to a real public game.</small></li>
-      </ol>
-      <button class="intro-start" id="intro-start" type="button">Start tracing</button>
-    </div>
   </div>
 
   <div class="modal-overlay" id="settings-modal" hidden>
@@ -304,13 +298,13 @@
     </div>
   </div>
 
-  <div class="profile-popover" id="profile-popover" role="dialog" aria-live="polite" hidden></div>
+  <div class="profile-popover" id="profile-popover" role="region" aria-label="Player details" aria-live="polite" hidden></div>
 
   <script src="config.js?v=feature-expansion-20260627"></script>
   <script src="cache.js?v=feature-expansion-20260627"></script>
   <script src="engine.js?v=feature-expansion-20260627"></script>
-  <script src="leaderboard.js?v=search-reliability-20260724"></script>
+  <script src="leaderboard.js?v=astra-20260904"></script>
   <script src="saved-routes.js?v=saved-suffix-fastpath-20260724"></script>
-  <script src="app.js?v=saved-suffix-fastpath-20260724"></script>
+  <script src="app.js?v=astra-20260904"></script>
 </body>
 </html>

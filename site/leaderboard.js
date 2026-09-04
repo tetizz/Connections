@@ -13,6 +13,7 @@ window.Leaderboard = (() => {
   const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
   let activeCategory = "connectors";
   let tabsWired = false;
+  let initialLoadObserver = null;
 
   /** Auto-submit a found chain. Fire-and-forget; never blocks the UI. */
   async function submit(start, target, length, path, hops = [], range = "auto") {
@@ -31,12 +32,15 @@ window.Leaderboard = (() => {
 
   /** Load + render the leaderboard into #leaderboard-list. */
   async function load(category = activeCategory) {
+    initialLoadObserver?.disconnect();
+    initialLoadObserver = null;
     activeCategory = category || "connectors";
     wireTabs();
     setActiveTab(activeCategory);
     const el = document.getElementById("leaderboard-list");
     if (!el) return;
-    el.innerHTML = '<div class="lb-loading">loading…</div>';
+    el.setAttribute("aria-busy", "true");
+    el.innerHTML = '<div class="lb-loading" role="status">Loading leaderboard…</div>';
     try {
       const url = new URL(WORKER_URL + "/leaderboard");
       url.searchParams.set("limit", "10");
@@ -51,15 +55,17 @@ window.Leaderboard = (() => {
       await render(el, entries, activeCategory);
     } catch (e) {
       el.innerHTML =
-        '<div class="lb-empty">leaderboard isn\'t live yet — ' +
+        '<div class="lb-empty" role="status">Leaderboard isn\'t available right now — ' +
         'it activates once the worker is deployed.</div>';
+    } finally {
+      el.setAttribute("aria-busy", "false");
     }
   }
 
   async function render(el, entries, category) {
     if (!entries || entries.length === 0) {
       el.innerHTML =
-        `<div class="lb-empty">no ${esc(categoryLabel(category).toLowerCase())} yet.</div>`;
+        `<div class="lb-empty" role="status">No ${esc(categoryLabel(category).toLowerCase())} yet.</div>`;
       return;
     }
     const top = entries
@@ -68,7 +74,7 @@ window.Leaderboard = (() => {
       .slice(0, 10);
     if (!top.length) {
       el.innerHTML =
-        `<div class="lb-empty">no ${esc(categoryLabel(category).toLowerCase())} yet.</div>`;
+        `<div class="lb-empty" role="status">No ${esc(categoryLabel(category).toLowerCase())} yet.</div>`;
       return;
     }
     const profiles = await loadProfiles([...new Set(top.flatMap((e) => [e.username, e.target]).filter(Boolean))]);
@@ -77,7 +83,7 @@ window.Leaderboard = (() => {
       const rankClass = i === 0 ? " is-gold" : i === 1 ? " is-silver" : i === 2 ? " is-bronze" : "";
       const title = profile.title ? `<span class="lb-title">${esc(profile.title)}</span>` : "";
       const avatar = profile.avatar
-        ? `<img class="lb-avatar" src="${esc(profile.avatar)}" alt="${esc(e.username)} profile photo" referrerpolicy="no-referrer" loading="lazy">`
+        ? `<img class="lb-avatar" src="${esc(profile.avatar)}" alt="${esc(e.username)} profile photo" width="42" height="42" crossorigin="anonymous" referrerpolicy="no-referrer" loading="lazy" decoding="async">`
         : `<span class="lb-avatar lb-avatar--fallback">${esc((e.username[0] || "?").toUpperCase())}</span>`;
       const examples = Array.isArray(e.examples) && e.examples.length
         ? e.examples.map((example) => `${example.start} → ${example.target}`).join(" · ")
@@ -109,12 +115,55 @@ window.Leaderboard = (() => {
       if (!tab) return;
       load(tab.dataset.category);
     });
+    document.getElementById("leaderboard-tabs")?.addEventListener("keydown", (event) => {
+      const current = event.target.closest("[role='tab'][data-category]");
+      if (!current) return;
+      const tabs = [...document.querySelectorAll("#leaderboard-tabs [role='tab'][data-category]")];
+      const index = tabs.indexOf(current);
+      if (index < 0) return;
+      let next = null;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") next = tabs[(index + 1) % tabs.length];
+      else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = tabs[(index - 1 + tabs.length) % tabs.length];
+      else if (event.key === "Home") next = tabs[0];
+      else if (event.key === "End") next = tabs[tabs.length - 1];
+      if (!next) return;
+      event.preventDefault();
+      next.focus();
+      load(next.dataset.category);
+    });
+  }
+
+  function init() {
+    wireTabs();
+    setActiveTab(activeCategory);
+    const section = document.querySelector(".leaderboard-section");
+    const panel = document.getElementById("leaderboard-list");
+    if (!panel) return;
+    panel.innerHTML = '<div class="lb-loading" role="status">Leaderboard loads as you reach it.</div>';
+    if (!section || typeof IntersectionObserver !== "function") {
+      load();
+      return;
+    }
+    initialLoadObserver = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      initialLoadObserver?.disconnect();
+      initialLoadObserver = null;
+      load();
+    }, { rootMargin: "160px 0px" });
+    initialLoadObserver.observe(section);
   }
 
   function setActiveTab(category) {
-    document.querySelectorAll("[data-category]").forEach((tab) => {
-      tab.classList.toggle("is-active", tab.dataset.category === category);
+    let activeTab = null;
+    document.querySelectorAll("#leaderboard-tabs [role='tab'][data-category]").forEach((tab) => {
+      const active = tab.dataset.category === category;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
+      if (active) activeTab = tab;
     });
+    const panel = document.getElementById("leaderboard-list");
+    if (panel && activeTab?.id) panel.setAttribute("aria-labelledby", activeTab.id);
     const heading = document.getElementById("lb-heading");
     const sub = document.getElementById("lb-sub");
     if (heading) heading.textContent = categoryLabel(category);
@@ -245,5 +294,5 @@ window.Leaderboard = (() => {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   })[c]);
 
-  return { submit, load };
+  return { submit, load, init };
 })();

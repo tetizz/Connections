@@ -157,10 +157,9 @@ button { -webkit-tap-highlight-color: transparent; }
 .brand__mark {
   width: 36px;
   height: 36px;
-  display: grid;
-  place-items: center;
+  display: block;
+  object-fit: cover;
   background: var(--panel-dark);
-  color: var(--brass-2);
   border: 1px solid rgba(255, 255, 255, .14);
   border-radius: var(--radius);
   box-shadow: var(--shadow-soft);

@@ -94,10 +94,12 @@ class InterfaceContractTests(unittest.TestCase):
         self.assertIn("--chain-graph-height", APP)
         self.assertIn("height: var(--chain-graph-height, 330px)", CSS)
 
-    def test_redesign_uses_local_system_fonts_and_quiet_motion(self):
+    def test_original_design_keeps_local_fonts_and_quiet_motion(self):
         self.assertNotIn("fonts.googleapis.com", HTML)
         self.assertNotIn("fonts.gstatic.com", HTML)
-        self.assertRegex(CSS, re.compile(r"Astra portfolio pass: signal-map interface"))
+        self.assertNotIn("trust-strip", HTML)
+        self.assertNotIn("command-center__kicker", HTML)
+        self.assertIn('<span class="brand__mark" aria-hidden="true">♞</span>', HTML)
         self.assertRegex(CSS, re.compile(r"body,\s*html\[data-theme=\"dark\"\] body\s*\{[^}]*animation:\s*none", re.S))
         self.assertRegex(CSS, re.compile(r"\.top-links \.home-site-button,[^{]+\{\s*animation:\s*none", re.S))
         self.assertIn("@media (prefers-reduced-motion: reduce)", CSS)

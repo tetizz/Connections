@@ -12,7 +12,7 @@
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://tetizz.github.io/Connections/" />
   <meta name="twitter:card" content="summary" />
-  <link rel="icon" href="assets/connections-mark.png" type="image/png" />
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
   <script>
     try {
       const themeKey = "chess-connections:theme";
@@ -31,14 +31,14 @@
     html, body { background: #0d100e; color: #f6efe2; }
     html[data-theme="light"], html[data-theme="light"] body { background: #f5f1e8; color: #161814; }
   </style>
-  <link rel="stylesheet" href="styles.css?v=astra-20260904" />
+  <link rel="stylesheet" href="styles.css?v=original-design-20260905" />
 </head>
 <body>
   <a class="skip-link" href="#trace-workspace">Skip to trace search</a>
   <div class="site-shell">
     <header class="masthead">
       <a class="brand" href="./" aria-label="Chess Connections home">
-        <img class="brand__mark" src="assets/connections-mark.png" alt="" width="256" height="256" />
+        <span class="brand__mark" aria-hidden="true">♞</span>
         <span class="brand__text">Chess Connections</span>
       </a>
       <nav class="top-links" aria-label="Project links">
@@ -67,16 +67,10 @@
     </header>
 
     <main id="main-content">
-      <section class="command-center" id="trace-workspace" aria-labelledby="page-title">
+      <section class="command-center" id="trace-workspace" tabindex="-1" aria-labelledby="page-title">
         <div class="command-center__intro">
-          <p class="command-center__kicker"><span aria-hidden="true"></span> Verified public-game graph</p>
           <h1 id="page-title">Find the win chain between any two players</h1>
           <p>Every link is a real Chess.com live win: rapid, blitz, or bullet.</p>
-          <ul class="trust-strip" aria-label="Search proof standards">
-            <li><strong>Standard live</strong><span>No daily or variant games</span></li>
-            <li><strong>Proof attached</strong><span>Open every source game</span></li>
-            <li><strong>Safe to share</strong><span>Verified routes survive outages</span></li>
-          </ul>
         </div>
 
         <form class="search" id="search-form" autocomplete="off">
@@ -303,8 +297,8 @@
   <script src="config.js?v=feature-expansion-20260627"></script>
   <script src="cache.js?v=feature-expansion-20260627"></script>
   <script src="engine.js?v=feature-expansion-20260627"></script>
-  <script src="leaderboard.js?v=astra-20260904"></script>
+  <script src="leaderboard.js?v=original-design-20260905"></script>
   <script src="saved-routes.js?v=saved-suffix-fastpath-20260724"></script>
-  <script src="app.js?v=astra-20260904"></script>
+  <script src="app.js?v=original-design-20260905"></script>
 </body>
 </html>

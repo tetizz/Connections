@@ -233,6 +233,10 @@
         error.retryAfterMs = retryAfterMs(response);
         error.retryable = response.status === 408 || response.status === 425 ||
           response.status === 429 || response.status >= 500;
+        if (response.status === 429 && options.stopOnRateLimit) {
+          error.retryable = false;
+          error.retryAfterMs = Math.max(error.retryAfterMs,Math.min(300000,Math.max(0,Number(data?.retryAfter || 0)*1000)));
+        }
         throw error;
       } catch (error) {
         const normalized = error?.name === "AbortError"
@@ -3151,6 +3155,7 @@
     if (!key) return null;
     const existing = state.players?.[key];
     if (existing?.profileComplete) return existing;
+    if (Number(existing?.profileRetryAt || 0) > Date.now()) return existing;
     if (state.profilePromises.has(key)) return state.profilePromises.get(key);
 
     const promise = (async () => {
@@ -3161,10 +3166,22 @@
           const { data } = await fetchJsonWithRetry(
             `${remoteBase}/profile?username=${encodeURIComponent(key)}`,
             { headers: { "Accept": "application/json" } },
-            { attempts: 2, timeoutMs: 7000 }
+            { attempts: 2, timeoutMs: 7000, stopOnRateLimit: true }
           );
           profile = data?.profile || null;
-        } catch {
+          if (profile && data?.stale) profile = {...profile,enrichment:{
+            stats:profile.enrichment?.stats === "unavailable" ? "unavailable" : "stale",
+            recentGames:profile.enrichment?.recentGames === "unavailable" ? "unavailable" : "stale",
+            retryAfterSeconds:Math.max(60,Number(data.retryAfter || 60)),
+          }};
+        } catch (error) {
+          if (error?.status === 429) {
+            state.players = state.players || {};
+            state.players[key] = {...(existing || {username:key}),profileComplete:false,
+              profilePartial:true,enrichment:existing?.enrichment || {stats:"unavailable",recentGames:"unavailable"},
+              profileRetryAt:Date.now()+Math.max(60000,Number(error.retryAfterMs || 0))};
+            return state.players[key];
+          }
           // fall through to Chess.com direct lookup
         }
       }
@@ -3187,7 +3204,10 @@
         ...(state.players[key] || {}),
         ...shaped,
         profileExists: true,
-        profileComplete: true,
+        profileComplete: !profile.enrichment || (profile.enrichment.stats === "fresh" && profile.enrichment.recentGames === "fresh"),
+        profilePartial: !!profile.enrichment && (profile.enrichment.stats !== "fresh" || profile.enrichment.recentGames !== "fresh"),
+        profileRetryAt: profile.enrichment && (profile.enrichment.stats !== "fresh" || profile.enrichment.recentGames !== "fresh")
+          ? Date.now() + Math.max(60000, Number(profile.enrichment.retryAfterSeconds || 60)*1000) : 0,
       };
       refreshGraphProfileNodes(key);
       return state.players[key];
@@ -3267,8 +3287,10 @@
       ? `<span class="profile-popover__status${String(profile.status).toLowerCase() === "premium" ? " is-premium" : ""}">${esc(profileStatusLabel(profile.status))}</span>`
       : "";
     const url = profile?.url || `https://www.chess.com/member/${encodeURIComponent(handle)}`;
-    const stats = renderProfileStats(profile?.stats);
+    const stats = renderProfileStats(profile?.stats, profile?.enrichment?.stats === "unavailable");
     const recentGames = renderProfileRecentGames(profile?.recentGames);
+    const partialNotice = profile?.profilePartial
+      ? `<p class="profile-popover__loading" role="status">Some player details could not refresh. ${profile.enrichment?.stats === "stale" || profile.enrichment?.recentGames === "stale" ? "Showing previously saved details." : "Ratings or recent games are temporarily unavailable."} Try again shortly.</p>` : "";
 
     pop.innerHTML = `
       <button class="profile-popover__close" type="button" data-profile-close aria-label="Close player details">Close</button>
@@ -3280,6 +3302,7 @@
         </span>
       </div>
       <div class="profile-popover__meta">${country}${followers}${joined}${online}${location}${fide}${status}</div>
+      ${partialNotice}
       ${stats}
       ${recentGames}
       <a class="profile-popover__open" href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>
@@ -3346,7 +3369,7 @@
       .replace(/\b\w/g, (char) => char.toUpperCase());
   }
 
-  function renderProfileStats(stats) {
+  function renderProfileStats(stats, unavailable = false) {
     const modes = [
       ["rapid", "Rapid"],
       ["blitz", "Blitz"],
@@ -3355,7 +3378,7 @@
     const cells = modes.map(([key, label]) => {
       const stat = stats?.[key];
       if (!stat?.rating) {
-        return `<div class="profile-stat"><span>${label}</span><strong>--</strong><small>No rating</small></div>`;
+        return `<div class="profile-stat"><span>${label}</span><strong>--</strong><small>${unavailable ? "Unavailable" : "No rating"}</small></div>`;
       }
       const games = Number.isFinite(stat.games) ? `${plainNumber(stat.games)} games` : "rated";
       const best = Number.isFinite(stat.best) ? `best ${plainNumber(stat.best)}` : games;
@@ -4346,7 +4369,10 @@
       fide: p.fide,
       stats: p.stats,
       recentGames: Array.isArray(p.recentGames) ? p.recentGames : [],
-      profileComplete: Boolean(p.profileComplete || p.stats),
+      enrichment: p.enrichment,
+      profilePartial: p.profilePartial,
+      profileRetryAt: p.profileRetryAt,
+      profileComplete: !p.profilePartial && (!p.enrichment || (p.enrichment.stats === "fresh" && p.enrichment.recentGames === "fresh")) && Boolean(p.profileComplete || p.stats),
     };
   }
 

@@ -16,6 +16,25 @@ const WORKER_RELEASE = "2026-08-02-verified-shares-v6";
 const CACHE_SCHEMA_VERSION = 2;
 const TTL_SECONDS = 7 * 24 * 60 * 60;
 const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const PARTIAL_PROFILE_TTL_SECONDS = 60;
+const coldFills = new WeakMap();
+let activeColdFills = 0;
+async function shareColdFill(binding, key, fill) {
+  let entries = coldFills.get(binding);
+  if (!entries) { entries = new Map(); coldFills.set(binding, entries); }
+  if (entries.has(key)) return entries.get(key);
+  // Bound retained promises; excess distinct keys use the existing request path.
+  if (activeColdFills >= 128) return fill();
+  activeColdFills++;
+  const pending = Promise.resolve().then(fill).finally(() => {
+    entries.delete(key); activeColdFills--;
+  });
+  entries.set(key, pending);
+  return pending;
+}
+function partialProfile(profile) {
+  return !!profile?.enrichment && (profile.enrichment.stats !== "fresh" || profile.enrichment.recentGames !== "fresh");
+}
 const KV_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const MAX_LEADERBOARD_ENTRIES = 1000;
 const MAX_SUGGESTIONS = 10;
@@ -344,8 +363,11 @@ async function handleGames(url, env) {
   }
 
   try {
-    const games = await fetchGames(parsed);
-    await putGamesCache(env.GAMES_CACHE, kvKey, parsed, games);
+    const games = await shareColdFill(env.GAMES_CACHE, kvKey, async () => {
+      const rows = await fetchGames(parsed);
+      await putGamesCache(env.GAMES_CACHE, kvKey, parsed, rows);
+      return rows;
+    });
     return json({ source: "chess.com", key, games });
   } catch (error) {
     if (isRateLimitError(error)) {
@@ -394,17 +416,28 @@ async function handleProfile(url, env) {
   const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
 
   if (cachedProfile && cachedProfile.stats && Array.isArray(cachedProfile.recentGames) &&
-      Date.now() - cachedAt < PROFILE_TTL_SECONDS * 1000) {
-    return json({ source: "cloudflare-kv", profile: cachedProfile });
+      Date.now() - cachedAt < (partialProfile(cachedProfile) ? PARTIAL_PROFILE_TTL_SECONDS : PROFILE_TTL_SECONDS) * 1000) {
+    return json({ source: "cloudflare-kv", profile: cachedProfile, partial: partialProfile(cachedProfile) }, 200,
+      partialProfile(cachedProfile) ? "public, max-age=60" : null);
   }
 
+  const activeLimit = await readRateLimit(env.GAMES_CACHE);
+  if (activeLimit) {
+    return cachedProfile
+      ? json({source:"cloudflare-kv-stale",profile:cachedProfile,stale:true,partial:partialProfile(cachedProfile),retryAfter:activeLimit.retryAfter},200,"public, max-age=30",{"Retry-After":String(activeLimit.retryAfter)})
+      : json({error:"Chess.com rate limited this request. Try again shortly.",username,retryAfter:activeLimit.retryAfter},429,"no-store",{"Retry-After":String(activeLimit.retryAfter)});
+  }
   try {
-    const profile = await fetchProfileDetails(username, env);
-    await env.GAMES_CACHE.put(kvKey, JSON.stringify({ ts: Date.now(), profile }), {
-      expirationTtl: KV_RETENTION_SECONDS,
-      metadata: { username, type: "profile" },
+    const profile = await shareColdFill(env.GAMES_CACHE, kvKey, async () => {
+      const value = await fetchProfileDetails(username, env, cachedProfile);
+      await env.GAMES_CACHE.put(kvKey, JSON.stringify({ ts: Date.now(), profile: value }), {
+        expirationTtl: KV_RETENTION_SECONDS,
+        metadata: { username, type: "profile" },
+      });
+      return value;
     });
-    return json({ source: "chess.com", profile });
+    return json({ source: "chess.com", profile, partial: partialProfile(profile) },200,
+      partialProfile(profile) ? "public, max-age=60" : null);
   } catch (error) {
     console.warn(JSON.stringify({
       event: "profile_upstream_error",
@@ -2613,7 +2646,7 @@ async function readCachedExpansionEdges(env, parsed, stats = null) {
   return { edges, source: "game-cache" };
 }
 
-async function readOrFetchGames(env, parsed, stats = null) {
+async function readOrFetchGames(env, parsed, stats = null, onStale = null) {
   const key = cacheKeyFromParsed(parsed);
   const kvKey = `games:${key}`;
   const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
@@ -2629,6 +2662,7 @@ async function readOrFetchGames(env, parsed, stats = null) {
   const activeLimit = await readRateLimit(env.GAMES_CACHE);
   if (activeLimit && cachedGames) {
     if (stats) stats.cached++;
+    onStale?.();
     return cachedGames;
   }
   if (activeLimit) {
@@ -2646,6 +2680,7 @@ async function readOrFetchGames(env, parsed, stats = null) {
       await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
       if (cachedGames) {
         if (stats) stats.cached++;
+        onStale?.();
         return cachedGames;
       }
     }
@@ -5334,27 +5369,45 @@ function profileShape(data, fallbackUsername) {
   };
 }
 
-async function fetchProfileDetails(username, env = null) {
+async function fetchProfileDetails(username, env = null, previous = null) {
+  const permit = async (url) => {
+    if (!env) return;
+    const limit = await readRateLimit(env.GAMES_CACHE);
+    if (limit) throw new UpstreamHTTPError(429,url,limit.retryAfter);
+  };
+  await permit(`${CHESS_API}${username}`);
   const data = await fetchJSON(`${CHESS_API}${username}`);
   const profile = profileShape(data, username);
+  profile.enrichment = {stats:"fresh",recentGames:env?"fresh":"unavailable",retryAfterSeconds:PARTIAL_PROFILE_TTL_SECONDS};
+  const failed = async (section,error) => {
+    const retained = section === "stats"
+      ? previous?.stats && Object.keys(previous.stats).length > 0 && previous.enrichment?.stats !== "unavailable"
+      : Array.isArray(previous?.recentGames) && (previous.recentGames.length > 0 || ["fresh","stale"].includes(previous.enrichment?.recentGames));
+    profile[section] = retained ? previous[section] : section === "stats" ? {} : [];
+    profile.enrichment[section] = retained ? "stale" : "unavailable";
+    if (env && isRateLimitError(error))
+      profile.enrichment.retryAfterSeconds = Math.max(PARTIAL_PROFILE_TTL_SECONDS, await rememberRateLimit(env.GAMES_CACHE,error.retryAfter));
+  };
   try {
+    await permit(`${CHESS_API}${username}/stats`);
     const stats = await fetchJSON(`${CHESS_API}${username}/stats`);
     profile.stats = statsShape(stats);
-  } catch {
-    profile.stats = {};
+  } catch (error) {
+    await failed("stats",error);
   }
   if (env) {
     try {
-      profile.recentGames = await fetchRecentProfileGames(env, username);
-    } catch {
-      profile.recentGames = [];
+      await permit(`${CHESS_API}${username}/games/archives`);
+      profile.recentGames = await fetchRecentProfileGames(env, username, () => {profile.enrichment.recentGames = "stale";});
+    } catch (error) {
+      await failed("recentGames",error);
     }
   }
   return profile;
 }
 
-async function fetchRecentProfileGames(env, username) {
-  const games = await readOrFetchGames(env, { username, archiveLimit: 2 });
+async function fetchRecentProfileGames(env, username, onStale = null) {
+  const games = await readOrFetchGames(env, { username, archiveLimit: 2 }, null, onStale);
   return games
     .filter((game) => game.white === username || game.black === username)
     .sort((a, b) => (b.endTime || 0) - (a.endTime || 0))

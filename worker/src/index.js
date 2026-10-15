@@ -2698,6 +2698,15 @@ async function readOrFetchGames(env, parsed, stats = null, onStale = null) {
   }
 
   try {
+    // Only unowned fills may share: search counters, cancellation and forced
+    // refresh retain their existing request ownership and error accounting.
+    if (!parsed.forceFresh && !parsed.signal && stats === null) {
+      return await shareColdFill(env.GAMES_CACHE, kvKey, async () => {
+        const games = await fetchGames(parsed);
+        await putGamesCache(env.GAMES_CACHE, kvKey, parsed, games);
+        return games;
+      }, parsed.metrics);
+    }
     if (stats) stats.requests++;
     const games = await fetchGames(parsed);
     if (stats) stats.fetched++;

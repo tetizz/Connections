@@ -34,7 +34,11 @@ test('concurrent profile records attribute physical upstream work to one owner',
   const results=await Promise.all(Array.from({length:12},()=>profile(kv)));
   assert.equal(calls,3);assert.equal(records.length,12);
   assert.equal(records.reduce((sum,row)=>sum+row.upstream_attempts,0),3);
-  assert.equal(records.reduce((sum,row)=>sum+row.cold_fill_owned,0),1);
+  // One profile owner also owns the distinct internal games fill.
+  assert.equal(records.reduce((sum,row)=>sum+row.cold_fill_owned,0),2);
+  const physicalOwners=records.filter(row=>row.upstream_attempts>0);
+  assert.equal(physicalOwners.length,1);
+  assert.equal(physicalOwners[0].cold_fill_owned,2);
   assert.equal(records.reduce((sum,row)=>sum+row.cold_fill_shared,0),11);
   assert.ok(!JSON.stringify(records).includes('private-name'));assert.ok(!JSON.stringify(records).includes('private-owner'));
   assert.ok(results.every(result=>result.status===200));

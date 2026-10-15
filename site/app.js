@@ -3443,38 +3443,6 @@
       status.className = "search__status is-working";
       logEl.hidden = false;
       logEl.innerHTML = "";
-      showStatus("working", "checking both Chess.com usernames...");
-      const validation = await validateSearchPlayers(start, target);
-      if (!isCurrent()) return true;
-      if (!validation.valid) {
-        if (knownChain?.found) {
-          logLine(`profile lookup could not refresh ${validation.missing}; keeping the saved proof visible`);
-          showStatus("done",
-            `✓ showing the saved verified route — Chess.com no longer returned the ` +
-            `${esc(validation.missing)} profile, but the proof games remain available.`);
-          return true;
-        }
-        showStatus("error",
-          `couldn't find “${esc(validation.missing)}” on Chess.com. ` +
-          "Check the spelling or paste the member profile link.");
-        renderChain({
-          target,
-          display: target,
-          found: false,
-          length: null,
-          path: [],
-          hops: [],
-        });
-        recordSearchEvent("not_found", {
-          ...analyticsBase,
-          error: `player not found: ${validation.missing}`,
-        });
-        return true;
-      }
-      if (validation.uncertain) {
-        logLine("Chess.com profile lookup was slow; the search service will verify the handles");
-      }
-
       showStatus("working", "starting server search...");
       logLine(`queued ${start} -> ${target} (${mode.label})`);
 
@@ -3491,11 +3459,11 @@
             knownChain,
           }),
         },
-        { attempts: 3, timeoutMs: 12000 }
+        { attempts: 3, timeoutMs: 12000, stopOnRateLimit: true }
       );
       if (!isCurrent()) return true;
       const job = data?.job;
-      if (!job?.id) throw new Error("job start failed");
+      if (!job?.id) throw Object.assign(new Error("job start failed"), { code: "SEARCH_PROTOCOL_ERROR" });
       activeJob = job;
       saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId });
       renderSearchQueue(job);
@@ -3639,7 +3607,10 @@
           (finished?.status === "timeout" ? "timeout" :
             finished?.status === "not_found" ? "not_found" : "error");
         const outcome = ["timeout", "not_found"].includes(rawOutcome) ? rawOutcome : "error";
-        showStatus("error", finished?.progress ||
+        const missing = cleanUsernameInput(finished?.missingPlayer);
+        showStatus("error", missing
+          ? `couldn't find “${esc(missing)}” on Chess.com. Check the spelling or paste the member profile link.`
+          : finished?.progress ||
           (finished?.status === "expired"
             ? "This saved search expired. Start it again to get a fresh result."
             : "no connection found in this search."));
@@ -3678,6 +3649,17 @@
           "Reload this page to resume the same search instead of starting over.");
         return true;
       }
+      const unavailable = error?.code !== "SEARCH_PROTOCOL_ERROR" &&
+        (error?.status == null || [404, 405, 502, 503, 504].includes(error.status));
+      if (!unavailable) {
+        showStatus("error", error?.status === 429
+          ? "The search service is cooling down. Try again after its rate limit clears."
+          : "The search service could not accept this search. Try again later.");
+        recordSearchEvent("error", { ...analyticsBase, error: error.message });
+        return true;
+      }
+      // Only an unavailable Worker falls through to the existing legacy
+      // engine, whose own profile lookup runs with newly created controllers.
       return false;
     } finally {
       if (isCurrent()) btn.disabled = false;

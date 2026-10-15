@@ -1047,6 +1047,7 @@ async function runSearchJobChunk(env, id, options = {}) {
           status: "not_found",
           outcome: "not_found",
           progress: "One of those players could not be found.",
+          missingPlayer: !startProfile ? job.start : job.target,
           stats,
           search,
           processingUntil: 0,
@@ -4814,6 +4815,7 @@ function searchJobShape(job) {
     outcome: analyticsOutcomeFilter(job.outcome) || statusToOutcome(status),
     progress: String(job.progress || "").slice(0, 180),
     error: String(job.error || "").slice(0, 240),
+    ...([start, target].includes(cleanUsername(job.missingPlayer)) ? { missingPlayer: cleanUsername(job.missingPlayer) } : {}),
     stats: {
       fetched: cleanNonNegativeNumber(stats.fetched, 100000) || 0,
       requests: cleanNonNegativeNumber(stats.requests, 100000) || 0,
@@ -4847,6 +4849,7 @@ function publicSearchJob(job) {
     outcome: shaped.outcome,
     progress: shaped.progress,
     error: shaped.error,
+    ...(shaped.missingPlayer ? { missingPlayer: shaped.missingPlayer } : {}),
     stats: shaped.stats,
     chain: shaped.chain,
     players: shaped.players,
@@ -4877,6 +4880,7 @@ function publicSearchJobShape(job) {
     outcome: analyticsOutcomeFilter(job.outcome) || statusToOutcome(job.status),
     progress: String(job.progress || "").slice(0, 180),
     error: String(job.error || "").slice(0, 240),
+    ...([start, target].includes(cleanUsername(job.missingPlayer)) ? { missingPlayer: cleanUsername(job.missingPlayer) } : {}),
     stats: {
       fetched: cleanNonNegativeNumber(stats.fetched, 100000) || 0,
       requests: cleanNonNegativeNumber(stats.requests, 100000) || 0,
@@ -5108,6 +5112,7 @@ function searchJobAnalyticsEvent(job) {
     requests: shaped.stats.requests,
     cached: shaped.stats.cached,
     error: shaped.error,
+
     quality: shaped.chain?.quality || null,
     country: "",
     device: "server",

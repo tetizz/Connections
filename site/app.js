@@ -10,6 +10,9 @@
 (() => {
   "use strict";
 
+  // Element-scoped failed URLs suppress only redundant final-batch retries.
+  const failedAvatarURLs = new WeakMap();
+
   const SVG_NS = "http://www.w3.org/2000/svg";
   const DATA_BASE = new URL("./data/", document.baseURI).href;
   const LS_KEY = "chess-connections:username";
@@ -2157,6 +2160,7 @@
           "clip-path": "url(#clip)", preserveAspectRatio: "xMidYMid slice",
         });
         img.addEventListener("error", () => {
+          if (img.parentNode === g) failedAvatarURLs.set(g, av);
           img.remove();
         });
         img.addEventListener("load", () => fallback.remove(), { once: true });
@@ -2959,12 +2963,14 @@
       img.dataset.profileTrigger = "";
       img.referrerPolicy = "no-referrer";
       img.addEventListener("error", () => {
+        if (!img.parentNode) return;
         const fb = document.createElement("div");
         fb.className = "card__avatar-fallback";
         fb.textContent = (nameOf(username)[0] || "?").toUpperCase();
         fb.dataset.profileUser = username.toLowerCase();
         fb.dataset.profileTrigger = "";
         fb.tabIndex = 0;
+        failedAvatarURLs.set(fb, av);
         img.replaceWith(fb);
       });
       return img;
@@ -3254,9 +3260,18 @@
           "clip-path": "url(#clip)",
           preserveAspectRatio: "xMidYMid slice",
         });
-        img.addEventListener("error", () => img.remove());
         const icon = node.querySelector(".node__icon");
-        if (icon) icon.replaceWith(img);
+        img.addEventListener("load", () => {
+          // A late image must not remove a different fallback or replacement node.
+          if (icon && img.parentNode === node && icon.parentNode === node &&
+              node.querySelector(".node__icon") === icon) icon.remove();
+        }, { once: true });
+        const avatarURL = profile.avatar;
+        img.addEventListener("error", () => {
+          if (img.parentNode === node) failedAvatarURLs.set(node, avatarURL);
+          img.remove();
+        }, { once: true });
+        if (icon?.parentNode === node) node.insertBefore(img, icon.nextSibling);
         else node.appendChild(img);
       }
       node.classList.add("is-profile-loaded");
@@ -3856,11 +3871,8 @@
         profileComplete: Boolean(profile?.stats),
       };
     }
-    await hydratePlayers(chain.path || [], {
-      fetchJSON: (url) => fetch(url, { headers: { "Accept": "application/json" } }).then((res) => res.json()),
-      API: "https://api.chess.com/pub/player/",
-    });
-    if (!isCurrent()) return false;
+    // Publish this already verified route before optional display enrichment.
+    const isDisplayed = () => isCurrent() && state.currentChain === chain;
     if (checking) {
       showStatus("working",
         `loaded saved connection instantly — checking for a shorter route.`);
@@ -3873,6 +3885,16 @@
     }
     setActiveChip(job.target);
     renderChain(chain);
+    const initialShareUrl = $("#copy-share")?.dataset.shareUrl;
+    // Keep the graph/card containers and their original finite animations alive.
+    void hydratePlayers(chain.path || [], {
+      fetchJSON: (url) => fetch(url, { headers: { "Accept": "application/json" } }).then((res) => res.json()),
+      API: "https://api.chess.com/pub/player/",
+    }).then(() => {
+      if (isDisplayed()) refreshVisibleChainMetadata(chain, initialShareUrl);
+    }).catch(() => {
+      // Optional metadata failure must not retract verified public game proof.
+    });
     if (submit) submitLeaderboardChain(job.start, job.target, chain, job.range || analyticsBase?.range || "auto");
     recordSearchEvent(recordOutcome, {
       ...analyticsBase,
@@ -3891,6 +3913,56 @@
     return true;
   }
 
+  function refreshVisibleChainMetadata(chain, initialShareUrl) {
+    if (state.currentChain !== chain || chain.tree || !chain.found) return;
+    const path = chain.path || [];
+    const shareButton = $("#copy-share");
+    if (initialShareUrl && shareButton?.dataset.shareUrl === initialShareUrl) {
+      shareButton.dataset.shareUrl = buildLongShareUrl(chain);
+    }
+    updateGraphSummary(chain);
+    const svg = $("#graph");
+    if (svg) svg.querySelectorAll('.node[data-profile-user]').forEach((node) => {
+      const username = node.dataset.profileUser;
+      if (!path.includes(username)) return;
+      // Existing avatars keep their placement/profile animation state.
+      if (state.players?.[username]?.avatar && !node.querySelector('.node__img') &&
+          failedAvatarURLs.get(node) !== state.players[username].avatar) {
+        refreshGraphProfileNodes(username);
+      }
+      const isStart = node.classList.contains("is-start"), isTarget = node.classList.contains("is-target");
+      const title = titleOf(username);
+      const label = node.querySelector('.node__label');
+      if (label) label.textContent = compactGraphLabel(nameOf(username), path.length > 7 ? 11 : 15);
+      const meta = title ? [title, isTarget ? "TARGET" : ""] : [isTarget ? "TARGET" : isStart ? "YOU" : ""];
+      node.setAttribute('aria-label', [nameOf(username), ...meta, "profile"].filter(Boolean).join(' '));
+      let tag = node.querySelector('.node__title');
+      const titleText = title ? title + (isTarget ? ' · TARGET' : '') : isTarget ? 'TARGET' : isStart ? 'YOU' : '';
+      if (titleText) {
+        if (!tag) { tag = el('text', {class:'node__title',x:0,y:76});node.appendChild(tag); }
+        tag.textContent = titleText;
+      } else tag?.remove();
+    });
+    const cards = $("#cards")?.querySelectorAll('.card') || [];
+    (chain.hops || []).forEach((hop,index) => {
+      const card = cards[index];if (!card) return;
+      const winner = card.querySelector('.winner'), loser = card.querySelector('.loser');
+      if (winner) winner.textContent = nameOf(hop.from);
+      if (loser) loser.textContent = nameOf(hop.to);
+      const avatars = card.querySelectorAll('.card__avatars [data-profile-user]');
+      [hop.from,hop.to].forEach((username,i) => {
+        const current = avatars[i];if (!current) return;
+        const avatar = avatarOf(username);
+        if (current.tagName === 'IMG' && avatar && current.getAttribute('src') === avatar) {
+          current.alt = nameOf(username);
+          current.classList.toggle('is-titled', Boolean(titleOf(username)));
+        } else if (current.classList.contains('card__avatar-fallback') &&
+            (!avatar || failedAvatarURLs.get(current) === avatar)) {
+          current.textContent = (nameOf(username)[0] || '?').toUpperCase();
+        } else current.replaceWith(avatarEl(username));
+      });
+    });
+  }
   function saveActiveJob(job) {
     try {
       localStorage.setItem(LS_ACTIVE_JOB_KEY, JSON.stringify({ ...job, ts: Date.now() }));

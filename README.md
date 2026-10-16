@@ -6,7 +6,7 @@ Chess Connections answers a simple chess question:
 
 The site traces those links with real Chess.com live-game results. A link only counts when one player beat the next player in rapid, blitz, or bullet. Daily games and variants are skipped.
 
-Live site: https://tetizz.github.io/Connections/
+Live site: https://tetizz-connections.pages.dev/
 
 ## What the site does
 
@@ -66,10 +66,10 @@ Main files:
 
 ## Cloudflare backend
 
-The shared backend runs on Cloudflare Workers + KV:
+The public API runs at the Pages address below. Its service binding forwards requests to the private `connections-cache` Worker, preserving the existing Worker, Durable Object and KV backend:
 
 ```text
-https://connections-cache.tetizz.workers.dev
+https://tetizz-connections-api.pages.dev
 ```
 
 Endpoints:

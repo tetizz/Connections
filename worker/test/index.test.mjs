@@ -400,7 +400,7 @@ test("health identifies the fresh-search release", async () => {
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-10-16-bulk-months-v4");
+  assert.equal(body.release, "2026-10-16-failure-outcomes-v5");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {
@@ -1932,4 +1932,51 @@ test("deep verified routes survive submit and analytics normalization", async ()
   const events = JSON.parse(kv.values.get("analytics:events"));
   assert.equal(events[0].path.length, path.length);
   assert.equal(events[0].steps, path.length - 1);
+});
+
+test("failed fresh searches retain outcomes and analytics without a second exception", async () => {
+  const originalWarn = console.warn;
+  try {
+    for (const throttled of [false, true]) {
+      const kv = new MemoryKV();
+      const job = searchJob({
+        id: throttled ? "failure-analytics-throttled" : "failure-analytics-error",
+        processingUntil: 0,
+        processingToken: "",
+        search: { ...__test.initialSearchState("alpha", "omega"), fastLaneChecked: true },
+      });
+      await kv.put(__test.searchJobKey(job.id), JSON.stringify(job));
+      const warnings = [];
+      console.warn = value => { warnings.push(JSON.parse(value)); };
+      globalThis.fetch = async input => {
+        assert.match(String(input), /^https:\/\/api\.chess\.com\/pub\/player\/(alpha|omega)$/);
+        if (throttled) return response({}, 429, { "Retry-After": "90" });
+        throw new Error("Fixture upstream failure");
+      };
+      // The unfixed failSearchJob updates storage, then rejects here with
+      // ReferenceError: completed is not defined before writing analytics.
+      await assert.doesNotReject(() => __test.runSearchJob({ GAMES_CACHE: kv }, job));
+      const stored = JSON.parse(kv.values.get(__test.searchJobKey(job.id)));
+      assert.equal(stored.status, throttled ? "timeout" : "failed");
+      assert.equal(stored.outcome, throttled ? "timeout" : "error");
+      assert.equal(stored.processingToken, "");
+      assert.equal(stored.processingUntil, 0);
+      assert.equal(stored.policyVersion, __test.SEARCH_POLICY_VERSION);
+      assert.equal(stored.chain, null);
+      assert.ok(stored.error);
+      if (!throttled) assert.equal(stored.error, "Fixture upstream failure");
+      const events = JSON.parse(kv.values.get("analytics:events"));
+      assert.equal(events.length, 1);
+      assert.equal(events[0].id, job.id);
+      assert.equal(events[0].outcome, throttled ? "timeout" : "error");
+      assert.deepEqual(events[0].path, []);
+      assert.deepEqual(events[0].hops, []);
+      assert.equal(warnings.length, 1);
+      assert.equal(warnings[0].event, "search_job_failed");
+      assert.equal(warnings[0].id, job.id);
+      assert.equal([...kv.values.keys()].some(key => key.startsWith("search:pair:") || key.startsWith("fastlane:") || key.startsWith("graph:")), false);
+    }
+  } finally {
+    console.warn = originalWarn;
+  }
 });

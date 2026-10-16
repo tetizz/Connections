@@ -15,7 +15,7 @@ import { bindVerifiedJobSubmission } from './verified-job-submit.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-16-bulk-months-v4";
+const WORKER_RELEASE = "2026-10-16-failure-outcomes-v5";
 const SEARCH_POLICY_VERSION = "fresh-search-v2";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
@@ -1753,7 +1753,7 @@ async function failSearchJob(env, id, error, ownerToken = "") {
     : await updateSearchJob(env, id, patch);
   if (ownerToken && !job) return;
   const event = searchJobAnalyticsEvent(job);
-  if (event) await saveAnalyticsEvent(env, event, { skipRoutePromotion: completed?.policyVersion === SEARCH_POLICY_VERSION });
+  if (event) await saveAnalyticsEvent(env, event, { skipRoutePromotion: job?.policyVersion === SEARCH_POLICY_VERSION });
   console.warn(JSON.stringify({
     event: "search_job_failed",
     id,

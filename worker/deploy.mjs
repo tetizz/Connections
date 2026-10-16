@@ -4,7 +4,7 @@
  *   cd worker && npm install && npm run deploy
  *
  * Creates the KV namespace if missing, rewrites wrangler.toml with
- * the real namespace ID, then runs `wrangler deploy` and prints the URL.
+ * the real namespace ID, then runs `wrangler deploy`. The public API is on Pages.
  * Requires the user to have run `wrangler login` (or set CLOUDFLARE_API_TOKEN).
  */
 import { execSync } from "node:child_process";
@@ -74,10 +74,9 @@ try {
   process.exit(1);
 }
 
-// 4. print the URL to paste into site/config.js
-const workerName = "connections-cache";
+// 4. Pages reaches the private Worker through its existing service binding.
 console.log("\n------------------------------------------------");
 console.log("deployed");
-console.log(`\n  Worker URL: https://${workerName}.<your-subdomain>.workers.dev`);
-console.log("\n  If the URL changed, update site/config.js, then push the site.");
+console.log("\n  Public API: https://tetizz-connections-api.pages.dev");
+console.log("\n  Keep workers.dev and preview URLs disabled in wrangler.toml.");
 console.log("------------------------------------------------\n");

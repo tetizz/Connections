@@ -8,7 +8,9 @@ test('deferred same-layer player resumes and replaces four-hop candidate with tw
     ...api.initialSearchState('alpha','omega'),
     sinceMonth:'2024/01', profileChecked:true, fastLaneChecked:true,
     activeSide:'forward', activeFrontier:['first','second'], activeCursor:0,
-    forwardFrontier:[], backwardFrontier:['gamma'],
+    // Conservative partial reverse-tree fixture: omega remains the unexpanded
+    // depth-zero frontier, so four hops cannot satisfy the early-finish bound.
+    forwardFrontier:[], backwardFrontier:['omega'],
     forwardVisited:{
       alpha:{prev:'',hopUrl:''},
       first:{prev:'alpha',hopUrl:proof(1)},
@@ -60,4 +62,47 @@ test('deferred same-layer player resumes and replaces four-hop candidate with tw
   assert.deepEqual(reads,['first','second','second']);
   assert.equal(stats.expanded,2);
   assert.equal(second.shortestVerified,false);
+});
+
+function boundFixture() {
+  const proof=id=>`https://www.chess.com/game/live/${id}`;
+  const search={...api.initialSearchState('alpha','omega'),sinceMonth:'2024/01',
+    activeSide:'forward',activeFrontier:['first','sibling'],activeCursor:0,
+    forwardFrontier:[],backwardFrontier:['beta'],
+    forwardVisited:{alpha:{prev:'',hopUrl:''},first:{prev:'alpha',hopUrl:proof(1)},sibling:{prev:'alpha',hopUrl:proof(2)}},
+    backwardVisited:{omega:{next:'',hopUrl:''},beta:{next:'omega',hopUrl:proof(4)}},
+  };
+  const job={id:'bound-layer',start:'alpha',target:'omega',range:'instant',policyVersion:api.SEARCH_POLICY_VERSION,search};
+  const stats={requests:0,fetched:0,cached:0,expanded:0};const reads=[];
+  const edgeReader={async prime(){},async read(name){reads.push(name);return name==='first'
+    ?{edges:{beatenByMe:new Map([['beta',[proof(3)]]]),beatMe:new Map()}}
+    :{deferred:true,reason:'chunk-request-limit'};}};
+  return {search,job,stats,reads,options:{edgeReader,expansionBudget:10,timeBudgetMs:5000}};
+}
+test('uniform depth-one frontiers accept three-hop minimum despite deferred sibling',async()=>{
+  const f=boundFixture();
+  const result=await api.advanceServerSearch({},f.job,f.search,f.stats,async()=>{},f.options);
+  assert.equal(result.status,'found');
+  assert.deepEqual(result.chain.path,['alpha','first','beta','omega']);
+  assert.equal(f.search.bestMeetingLength,3);
+  assert.deepEqual(f.reads,['first','sibling']);
+  assert.equal(f.stats.expanded,1);
+  assert.equal(result.shortestVerified,false);
+});
+
+for(const [name,mutate] of [
+  ['missing frontier node',f=>{f.search.backwardFrontier=['missing'];}],
+  ['broken parent',f=>{f.search.backwardVisited.beta.next='missing';}],
+  ['cyclic parent',f=>{f.search.backwardVisited.loop={next:'loop',hopUrl:''};f.search.backwardFrontier=['loop'];}],
+  ['nonuniform depths',f=>{f.search.backwardFrontier=['omega','beta'];}],
+  ['missing root',f=>{delete f.search.backwardVisited.omega;}],
+  ['cyclic root',f=>{f.search.backwardVisited.omega.next='omega';}],
+  ['incomplete prior coverage',f=>{f.search.incomplete=true;}],
+]) test(`early finish rejects ${name}`,async()=>{
+  const f=boundFixture();mutate(f);
+  const result=await api.advanceServerSearch({},f.job,f.search,f.stats,async()=>{},f.options);
+  assert.equal(result.status,'running');
+  // Malformed ancestry is deliberately not a proof-valid route fixture; this
+  // assertion isolates refusal of the early-finish bound, not reconstruction.
+  assert.deepEqual(f.search.activeFrontier,['sibling']);
 });

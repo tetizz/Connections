@@ -15,7 +15,7 @@ import { bindVerifiedJobSubmission } from './verified-job-submit.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-16-fresh-search-v1";
+const WORKER_RELEASE = "2026-10-16-fresh-search-v2";
 const SEARCH_POLICY_VERSION = "fresh-search-v1";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
@@ -1462,6 +1462,37 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
     search.bestMeetingLength = Number.isFinite(meetingLength) ? meetingLength : 0;
   };
   const totalVisited = () => forwardVisited.size + backwardVisited.size;
+  const frontierDepth = (nodes, visited, root, link) => {
+    if (!nodes?.length) return null;
+    if (visited.get(root)?.[link] !== "") return null;
+    let uniform = null;
+    for (const node of nodes) {
+      let current = node, depth = 0;
+      const seen = new Set();
+      while (current !== root) {
+        if (!current || seen.has(current) || depth >= SEARCH_MAX_DEPTH) return null;
+        seen.add(current);
+        current = visited.get(current)?.[link];
+        depth++;
+      }
+      if (uniform !== null && uniform !== depth) return null;
+      uniform = depth;
+    }
+    return uniform;
+  };
+  const meetingCannotImprove = () => {
+    if (!meeting) return false;
+    if (meetingLength === 1) return true;
+    if (search.incomplete) return false;
+    const forward = search.activeSide === "forward" ? search.activeFrontier : search.forwardFrontier;
+    const backward = search.activeSide === "backward" ? search.activeFrontier : search.backwardFrontier;
+    const forwardDepth = frontierDepth(forward, forwardVisited, job.start, "prev");
+    const backwardDepth = frontierDepth(backward, backwardVisited, job.target, "next");
+    // Every smaller layer is already complete. Any route shorter than this
+    // bound would therefore have intersected the two visited sets already.
+    return forwardDepth !== null && backwardDepth !== null &&
+      meetingLength <= forwardDepth + backwardDepth + 1;
+  };
   const considerMeeting = (candidate) => {
     const cleanCandidate = cleanUsername(candidate);
     if (!cleanCandidate) return;
@@ -1523,6 +1554,11 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
         }
         return { status: "not_found", progress: "No connection found in this search." };
       }
+    }
+
+    if (meetingCannotImprove()) {
+      syncSearch();
+      return { status: "found", chain: reconstructServerPath(meeting, forwardVisited, backwardVisited) };
     }
 
     if (search.activeCursor >= search.activeFrontier.length) {
@@ -1612,6 +1648,9 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
       ];
       search.activeCursor = batchStart;
       syncSearch();
+      if (meetingCannotImprove()) {
+        return { status: "found", chain: reconstructServerPath(meeting, forwardVisited, backwardVisited) };
+      }
       if (deferred.some((item) => item.reason === "search-request-limit")) {
         return {
           status: "timeout",
@@ -1637,7 +1676,7 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
     }
 
     search.activeCursor = batchStart + batch.length;
-    if (meeting && search.activeCursor >= search.activeFrontier.length) {
+    if (meeting && (meetingCannotImprove() || search.activeCursor >= search.activeFrontier.length)) {
       syncSearch();
       return { status: "found", chain: reconstructServerPath(meeting, forwardVisited, backwardVisited) };
     }

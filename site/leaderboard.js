@@ -8,7 +8,7 @@
 
 window.Leaderboard = (() => {
   const WORKER_URL = String(
-    window.CONNECTIONS_CACHE_API || "https://connections-cache.tetizz.workers.dev"
+    window.CONNECTIONS_CACHE_API || "https://tetizz-connections-api.pages.dev"
   ).replace(/\/+$/, "");
   const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
   let activeCategory = "connectors";

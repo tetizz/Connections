@@ -15,7 +15,7 @@ import { bindVerifiedJobSubmission } from './verified-job-submit.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-16-fresh-search-v3";
+const WORKER_RELEASE = "2026-10-16-bulk-months-v4";
 const SEARCH_POLICY_VERSION = "fresh-search-v2";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
@@ -5493,10 +5493,36 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
   const newestFirst = directScan || collectGames === false;
   if (newestFirst) selected.reverse();
   let expiresAt = Math.min(list.ts + ARCHIVE_LIST_CACHE_TTL_SECONDS * 1000, Date.now() + TTL_SECONDS * 1000);
-  const rows = await runThrottled(selected.map((url) => async () => {
+  // One awaited group at a time: no cache lookahead survives a direct win.
+  // Duplicate URLs retain original per-occurrence reads and callback identity.
+  let bulkEnabled = Boolean(env) && new Set(selected).size === selected.length;
+  let cachedGroup = new Map();
+  const readMonthCache = async (key, index) => {
+    if (!env) return null;
+    if (cachedGroup.has(key)) return cachedGroup.get(key);
+    if (bulkEnabled && index > 0) {
+      const keys = selected.slice(index, index + 4).map(url =>
+        `archive:games:v1:${username}:${archiveMonthFromUrl(url)}`);
+      if (keys.length > 1) {
+        try {
+          const values = await env.GAMES_CACHE.get(keys, { type: "json", cacheTtl: 60 });
+          checkAbort();
+          if (!(values instanceof Map)) throw new Error("Invalid bulk cache response");
+          cachedGroup = new Map(keys.map(item => [item, values.get(item) ?? null]));
+          return cachedGroup.get(key);
+        } catch {
+          checkAbort();
+          bulkEnabled = false;
+          cachedGroup.clear();
+        }
+      }
+    }
+    return env.GAMES_CACHE.get(key, { type: "json", cacheTtl: 60 }).catch(() => null);
+  };
+  const rows = await runThrottled(selected.map((url, index) => async () => {
     checkAbort();
     const key = `archive:games:v1:${username}:${archiveMonthFromUrl(url)}`;
-    let cached = env ? await env.GAMES_CACHE.get(key, { type: "json", cacheTtl: 60 }).catch(() => null) : null;
+    const cached = await readMonthCache(key, index);
     checkAbort();
     if (cached?.schema === 1 && cached.url === url && Number.isFinite(cached.expiresAt) &&
         cached.expiresAt > Date.now() && Array.isArray(cached.games) && cached.games.every(validSanitizedArchiveGame)) {

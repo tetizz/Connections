@@ -72,15 +72,20 @@ function fixture({ chains = publicData } = {}) {
     updateShareButton: chain => shares.push(chain),
     runServerSearchFlow: async options => { serverCalls.push(options); return true; },
     fetch: () => { throw new Error("Unexpected HTTP in controller fixture"); },
+    pollServerSearchJob: async id => { context.polled = id; return { id, policyVersion: "fresh-search-v1", status: "found", chain: { found: true } }; },
+    renderSearchQueue: () => {}, finishSearchQueue: () => {},
+    applyServerChain: async job => { context.applied = job; },
+    Date,
     console,
   });
   vm.runInContext([
-    ...["LS_KEY", "LS_RANGE_KEY", "LS_ACTIVE_JOB_KEY", "AUTO_SEARCH_DEPTH", "USERNAME_MAX_LENGTH", "BLOCKED_USERNAMES"].map(constant),
+    ...["LS_KEY", "LS_RANGE_KEY", "LS_ACTIVE_JOB_KEY", "SEARCH_POLICY_VERSION", "AUTO_SEARCH_DEPTH", "USERNAME_MAX_LENGTH", "BLOCKED_USERNAMES"].map(constant),
+    section("  const esc =", "  const plainNumber ="),
     section("  const cleanUsernameInput =", "  const wait ="),
     section("  function precomputedChain(", "  async function quickBridge("),
     section("  function renderChain(", "  function qualityFromChain("),
     section("  function resetSearchQueue(", "  function compactJobId("),
-    section("  function clearActiveJob(", "  async function resumeActiveSearchJob("),
+    section("  function saveActiveJob(", "  function warmSharedCaches("),
     section("  async function runSearch(", "  function metaShape("),
     section("  function showStatus(", "  function applyTheme("),
   ].join("\n"), context, { filename: "actual-app-saved-route-search-sections.js" });
@@ -91,116 +96,65 @@ function fixture({ chains = publicData } = {}) {
   };
 }
 
-test("actual direct saved edge completes without a new server search and clears prior resume state", async () => {
-  const f = fixture();
-  const originalFocus = f.document.activeElement;
-  const wasPriorOwner = () => f.state.activeSearchOwner === f.priorOwner;
-  assert.equal(wasPriorOwner(), true);
-  await f.run("FREDALSUP", "PianoSkater", "12");
+const activeKey = "chess-connections:active-search-job:v2:fresh-search";
 
-  const chain = plain(f.state.currentChain);
-  assert.deepEqual(chain.path, ["fredalsup", "pianoskater"]);
-  assert.equal(chain.length, 1);
-  assert.equal(chain.target, "pianoskater");
-  assert.deepEqual(chain.hops, [{ from: "fredalsup", to: "pianoskater", url: "https://www.chess.com/game/live/63496054537" }]);
-  assert.equal(f.serverCalls.length, 0, "Direct minimum must not enter search/start or polling flow");
-  assert.equal(f.storage.has("chess-connections:active-search-job:v1"), false);
-  assert.equal(f.storage.get("chess-connections:username"), "fredalsup");
-  assert.equal(f.storage.get("chess-connections:range"), "12");
-  assert.equal(f.element("#setting-username").value, "fredalsup");
-  assert.equal(wasPriorOwner(), false);
-  assert.equal(f.state.activeSearchId, "client-test-1");
-  assert.equal(f.state.activeSearchOwner, "search:client-test-1");
-  assert.equal(f.element("#trace-chain").disabled, false);
-  assert.equal(f.state.queueTimer, null);
-  assert.ok(f.timerClears.includes(17));
-  assert.equal(f.element("#search-queue").hidden, true);
-  assert.equal(f.element("#search-log").hidden, true);
-  assert.equal(f.element("#search-log").innerHTML, "");
-  assert.match(f.element("#search-status").textContent, /verified direct win against pianoskater/i);
-  assert.match(f.element("#search-status").textContent, /shortest possible connection/i);
-  assert.doesNotMatch(f.element("#search-status").className, /is-working|is-error/);
-  assert.equal(f.document.activeElement, originalFocus);
-  assert.deepEqual(f.focusCalls, []);
-  assert.equal(f.renders.length, 1);
-  assert.deepEqual(plain(f.renders[0].chain), chain);
-  assert.deepEqual(plain(f.cards[0]), chain);
-  assert.deepEqual(plain(f.shares[0]), chain, "Unchanged render path receives complete proof payload for sharing");
-  assert.equal(f.submissions.length, 1);
-  assert.deepEqual(plain(f.submissions[0]), { start: "fredalsup", target: "pianoskater", chain });
-  assert.deepEqual(f.events.map(row => row.outcome), ["started", "saved"]);
-  assert.equal(f.events[1].detail.steps, 1);
-  assert.equal(f.events[1].detail.searchId, "client-test-1");
-  assert.deepEqual(plain(f.events[1].detail.path), chain.path);
-  assert.equal(f.scrolls.length, 1);
-  assert.equal(f.context.activeChip, "pianoskater");
+test("all ordinary pairs discard saved answers and enter one fresh server search", async t => {
+  for (const [start, target] of [["fredalsup", "pianoskater"], ["trixize1234", "pianoskater"], ["public-a", "public-b"]]) {
+    await t.test(`${start} to ${target}`, async () => {
+      const f = fixture();
+      await f.run(start, target);
+      assert.equal(f.serverCalls.length, 1);
+      const call = f.serverCalls[0];
+      assert.equal(call.start, start);
+      assert.equal(call.target, target);
+      assert.equal(call.knownChain, undefined);
+      assert.equal(f.state.currentChain.found, false);
+      assert.deepEqual(plain(f.state.currentChain.path), []);
+      assert.deepEqual(plain(f.cards.at(-1).hops), []);
+      assert.equal(f.shares.at(-1).found, false, "Normal renderer clears stale share payload");
+      assert.deepEqual(plain(f.state.chains), { chains: [] });
+      assert.deepEqual(f.events.map(row => row.outcome), ["started"]);
+      assert.equal(f.submissions.length, 0);
+      assert.match(f.element("#search-status").innerHTML, /fresh search/);
+      assert.equal(f.state.activeSearchOwner, "search:client-test-1");
+      assert.deepEqual(f.focusCalls, []);
+    });
+  }
 });
 
-test("actual saved route longer than one keeps the existing background search boundary", async () => {
-  const f = fixture();
-  await f.run("trixize1234", "pianoskater", "all");
-  const chain = plain(f.state.currentChain);
-  assert.deepEqual(chain.path, ["trixize1234", "fredalsup", "pianoskater"]);
-  assert.equal(chain.length, 2);
-  assert.equal(f.serverCalls.length, 1);
-  const call = f.serverCalls[0];
-  assert.equal(call.start, "trixize1234");
-  assert.equal(call.target, "pianoskater");
-  assert.equal(call.range, "all");
-  assert.equal(call.mode.key, "all");
-  assert.equal(call.mode.instantOnly, false);
-  assert.deepEqual(plain(call.knownChain), chain);
-  assert.equal(call.analyticsBase.searchId, f.state.activeSearchId);
-  assert.equal(f.state.activeSearchOwner, `search:${call.analyticsBase.searchId}`);
-  assert.match(f.element("#search-status").textContent, /checking for a shorter route/i);
-  assert.doesNotMatch(f.element("#search-status").textContent, /shortest possible/i);
-  assert.equal(f.submissions.length, 1);
-  assert.deepEqual(f.events.map(row => row.outcome), ["started", "saved"]);
-  assert.equal(f.shares.length, 1);
-  // The existing server flow owns save/poll/clear, not this adapted boundary.
-  assert.equal(f.storage.has("chess-connections:active-search-job:v1"), true);
+test("invalid, same and blocked inputs preserve validation without server work", async t => {
+  for (const [label, start, target] of [["empty", "", "pianoskater"], ["invalid", "fredalsup", "not a username!"], ["same", "fredalsup", "FREDALSUP"]]) {
+    await t.test(label, async () => { const f=fixture(); await f.run(start,target); assert.equal(f.serverCalls.length,0); assert.equal(f.renders.length,0); assert.equal(f.state.activeSearchOwner,f.priorOwner); });
+  }
+  const f=fixture();const blocked=vm.runInContext("Array.from(BLOCKED_USERNAMES)[0]",f.context);await f.run(blocked,"pianoskater");assert.equal(f.serverCalls.length,0);
 });
 
-test("invalid and same-player inputs retain validation before saved-route shortcuts", async t => {
-  for (const [label, start, target, focus] of [
-    ["empty start", "", "pianoskater", "#search-start"],
-    ["invalid target", "fredalsup", "not a username!", "#search-target"],
-    ["same player", "fredalsup", "FREDALSUP", null],
-  ]) await t.test(label, async () => {
-    const f = fixture();
-    await f.run(start, target);
-    assert.equal(f.renders.length, 0);
-    assert.equal(f.serverCalls.length, 0);
-    assert.equal(f.submissions.length, 0);
-    assert.equal(f.events.length, 0);
-    assert.equal(f.state.activeSearchOwner, f.priorOwner);
-    assert.equal(f.storage.has("chess-connections:active-search-job:v1"), true);
-    assert.match(f.element("#search-status").className, /is-error/);
-    assert.deepEqual(f.focusCalls, focus ? [focus] : []);
-  });
+test("old policy records are invalidated without polling or rendering", async () => {
+  const f=fixture();f.storage.set(activeKey,JSON.stringify({id:"legacy",ts:Date.now()}));
+  await f.context.resumeActiveSearchJob();
+  assert.equal(f.context.polled,undefined);assert.equal(f.storage.has(activeKey),false);assert.equal(f.renders.length,0);
+  assert.match(appSource,/localStorage\.removeItem\("chess-connections:active-search-job:v1"\)/);
 });
 
-test("blocked player validation remains ahead of any saved proof fast path", async () => {
-  const f = fixture();
-  const blocked = vm.runInContext("Array.from(BLOCKED_USERNAMES)[0]", f.context);
-  await f.run(blocked, "pianoskater");
-  assert.equal(f.renders.length, 0);
-  assert.equal(f.serverCalls.length, 0);
-  assert.equal(f.events.length, 0);
-  assert.match(f.element("#search-status").textContent, /not available/);
-  assert.equal(f.state.activeSearchOwner, f.priorOwner);
+test("fresh policy jobs retain resume reliability and policy-bound persistence", async () => {
+  const f=fixture();f.context.saveActiveJob({id:"fresh",searchId:"fresh",start:"fredalsup",target:"pianoskater",range:"auto"});
+  assert.equal(JSON.parse(f.storage.get(activeKey)).policyVersion,"fresh-search-v1");
+  await f.context.resumeActiveSearchJob();assert.equal(f.context.polled,"fresh");assert.equal(f.context.applied.id,"fresh");assert.equal(f.storage.has(activeKey),false);
 });
 
-test("malformed saved direct proof falls through to ordinary server flow", async () => {
-  const f = fixture({ chains: { chains: [{
-    target: "pianoskater", found: true, path: ["fredalsup", "pianoskater"],
-    hops: [{ from: "fredalsup", to: "pianoskater", url: "https://www.chess.com/game/live/63496054537?redirect=1" }],
-  }] } });
-  await f.run("fredalsup", "pianoskater");
-  assert.equal(f.renders.length, 0);
-  assert.equal(f.submissions.length, 0);
-  assert.equal(f.serverCalls.length, 1);
-  assert.equal(f.serverCalls[0].knownChain, undefined);
-  assert.deepEqual(f.events.map(row => row.outcome), ["started"]);
-  assert.equal(f.storage.has("chess-connections:active-search-job:v1"), true);
+test("metadata startup does not fetch or automatically render showcase answers", () => {
+  const startup=section("  async function loadPlayerMetadata(","  function renderShowcaseTabs(");
+  assert.match(startup,/players\.json/);assert.doesNotMatch(startup,/chains\.json|selectTarget|renderChain/);
+  assert.doesNotMatch(appSource,/loadShowcase\(/);
+  assert.match(appSource,/loadSharedChainFromUrl\(\)/,"Explicit shared links remain supported");
+});
+test("discovered route wording does not imply an unverified global minimum", () => {
+  const context=vm.createContext({});
+  vm.runInContext(section("  function searchOptimalityNote(", "  async function applyServerChain("),context);
+  assert.equal(context.searchOptimalityNote({shortestVerified:false}),"Shortest route has not been verified.");
+  assert.equal(context.searchOptimalityNote({}),"Shortest route has not been verified.");
+  assert.equal(context.searchOptimalityNote({shortestVerified:true}),"Shortest route verified for this search.");
+  const publication=section("  async function applyServerChain(","  function refreshVisibleChainMetadata(");
+  assert.match(publication,/searchOptimalityNote\(job\)/);
+  assert.doesNotMatch(publication,/loaded saved connection|shortest possible/i);
 });

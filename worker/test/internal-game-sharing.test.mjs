@@ -24,8 +24,8 @@ async function pairFixture({profileFirst=false,separateBinding=false,failWrite=f
   globalThis.fetch=async raw=>{
     const url=String(raw);
     if(url.endsWith('/stats')){counts.stats++;statsDone();return response({chess_rapid:{last:{rating:1777},record:{win:4,loss:2,draw:1}}});}
-    if(url.endsWith('/games/archives')){counts.archives++;arrived();await gate;return response({archives:['https://fixture.test/month/1','https://fixture.test/month/2']});}
-    if(url.startsWith('https://fixture.test/month/')){counts.months++;return response(month(Number(url.split('/').pop())));}
+    if(url.endsWith('/games/archives')){counts.archives++;arrived();await gate;return response({archives:['https://api.chess.com/pub/player/alpha/games/2020/01','https://api.chess.com/pub/player/alpha/games/2020/02']});}
+    if(url.startsWith('https://api.chess.com/pub/player/alpha/games/2020/')){counts.months++;return response(month(Number(url.split('/').pop())));}
     counts.core++;return response({username:'alpha',name:'Alpha',country:'https://api.chess.com/pub/country/US'});
   };
   let profilePending,historyPending;
@@ -66,6 +66,8 @@ test('best-effort shared KV write failure preserves responses and a fresh fill r
   const replies=await Promise.all([request(value.kv,'/profile?username=alpha'),request(value.kv,'/games?key=alpha:recent:2')]);
   const [profile,history]=await Promise.all(replies.map(r=>r.json()));
   assertComplete({kv:value.kv,profile,history,statuses:replies.map(r=>r.status)});
-  assert.equal(value.counts.archives,2);
-  assert.equal(value.counts.months,4);
+  // Completed list/month caches survive the failed aggregate write. The fresh
+  // aggregate fill retries persistence without downloading those months again.
+  assert.equal(value.counts.archives,1);
+  assert.equal(value.counts.months,2);
 });

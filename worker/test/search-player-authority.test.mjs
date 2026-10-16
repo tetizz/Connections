@@ -22,9 +22,9 @@ test('actual strict search persists and returns the missing endpoint without sta
   };
   try{
     const job=__test.searchJobShape({id:'missing-endpoint',start:'alpha',target:'omega',range:'auto',status:'running',stats:{},search:__test.initialSearchState('alpha','omega'),processingUntil:0,processingToken:''});
-    await kv.put('search:job:'+job.id,JSON.stringify(job));
+    await kv.put(__test.searchJobKey(job.id),JSON.stringify(job));
     await __test.runSearchJob({GAMES_CACHE:kv},job);
-    const saved=JSON.parse(await kv.get('search:job:'+job.id));
+    const saved=JSON.parse(await kv.get(__test.searchJobKey(job.id)));
     assert.equal(saved.status,'not_found');assert.equal(saved.missingPlayer,'omega');
     const response=await worker.fetch(new Request('https://worker.test/search/job?id='+job.id),{GAMES_CACHE:kv},{waitUntil(){}});
     assert.equal(response.status,200);assert.equal((await response.json()).job.missingPlayer,'omega');

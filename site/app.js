@@ -1,6 +1,6 @@
 /* ============================================================
    Chess Connections — app.js
-   - Loads a precomputed showcase (data/chains.json)
+   - Searches each requested pair using verified game histories
    - Lets the visitor enter their own username + target and runs
      the BFS search live in the browser (engine.js)
    - Saves the username in localStorage for next visit
@@ -19,7 +19,8 @@
   const LS_THEME_KEY = "chess-connections:theme";
   const LS_RANGE_KEY = "chess-connections:range";
   const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
-  const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v1";
+  const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v2:fresh-search";
+  const SEARCH_POLICY_VERSION = "fresh-search-v1";
   const CHAIN_PARAM = "chain";
   const SHORT_CHAIN_PARAM = "c";
   const LEGACY_SHARE_PARAM = "share";
@@ -65,7 +66,7 @@
   ];
 
   const state = {
-    chains: null,
+    chains: { chains: [] },
     players: null,
     activeTarget: null,
     currentChain: null,
@@ -261,30 +262,15 @@
   }
 
   // ---------- data load ----------
-  async function loadShowcase() {
+  async function loadPlayerMetadata() {
+    state.chains = { chains: [] };
     try {
-      const [chainsRes, playersRes] = await Promise.all([
-        fetch(DATA_BASE + "chains.json"),
-        fetch(DATA_BASE + "players.json"),
-      ]);
-      if (!chainsRes.ok) throw new Error("chains.json " + chainsRes.status);
-      state.chains = await chainsRes.json();
-      state.players = playersRes.ok ? await playersRes.json() : {};
-    } catch (e) {
-      console.error(e);
-      $("#graph-hint").textContent =
-        "no example loaded yet — try the search above to see your own connection";
-      return;
+      const response = await fetch(DATA_BASE + "players.json");
+      state.players = response.ok ? await response.json() : {};
+    } catch {
+      state.players = {};
     }
-    renderShowcaseTabs();
-    // show an example chain so the page isn't blank on first visit
-    const first =
-      state.chains.chains.find((c) => c.found && c.target === DEFAULT_TARGET) ||
-      state.chains.chains.find((c) => c.found) ||
-      state.chains.chains[0];
-    if (first) selectTarget(first.target);
   }
-
   function renderShowcaseTabs() {
     // we keep a lightweight showcase selector below the search for quick swaps
     // (built dynamically only if showcase chains exist)
@@ -1411,6 +1397,7 @@
     target,
     chain,
     range = $("#search-range")?.value || "auto",
+    serverSearchId = undefined,
   ) {
     if (!window.Leaderboard || !chain?.found || !Array.isArray(chain.path)) return;
     if (isBlockedUsername(start) || isBlockedUsername(target) || pathHasBlockedUser(chain.path)) return;
@@ -1421,6 +1408,7 @@
       chain.path,
       chain.hops || [],
       range,
+      serverSearchId,
     )
       .then(() => window.Leaderboard && window.Leaderboard.load());
   }
@@ -2039,8 +2027,8 @@
     }
     if (!chain.found || !Array.isArray(chain.path) || !chain.path.length) {
       const target = chain.display || chain.target || "that player";
-      summary.textContent = `No verified connection to ${target} is available for this search.`;
-      svg.setAttribute("aria-label", `No verified connection to ${target}`);
+      summary.textContent = chain.pending ? `Searching for a verified connection to ${target}.` : `No verified connection to ${target} is available for this search.`;
+      svg.setAttribute("aria-label", chain.pending ? `Searching for a connection to ${target}` : `No verified connection to ${target}`);
       return;
     }
     const route = chain.path.map((username) => nameOf(username)).join(" then ");
@@ -2090,10 +2078,10 @@
         x: viewWidth / 2, y: 180, "text-anchor": "middle",
         fill: "#63685f", "font-size": compactGraph ? "14" : "18", "font-family": "ui-sans-serif, system-ui, sans-serif",
       });
-      t.textContent = `couldn't find a connection to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} steps.`;
+      t.textContent = chain.pending ? `searching for a connection to ${chain.display || chain.target}...` : `couldn't find a connection to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} steps.`;
       svg.appendChild(t);
       $("#graph-hint").textContent =
-        "try a different target, or pick someone who plays a lot of games.";
+        chain.pending ? "Checking public game connections." : "try a different target, or pick someone who plays a lot of games.";
       return;
     }
 
@@ -3478,9 +3466,10 @@
       );
       if (!isCurrent()) return true;
       const job = data?.job;
+      if (job?.policyVersion !== SEARCH_POLICY_VERSION) throw Object.assign(new Error("Start a new fresh search."), { code: "SEARCH_POLICY_EXPIRED" });
       if (!job?.id) throw Object.assign(new Error("job start failed"), { code: "SEARCH_PROTOCOL_ERROR" });
       activeJob = job;
-      saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId });
+      saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId, policyVersion: job.policyVersion });
       renderSearchQueue(job);
       if (knownChain?.found) {
         let displayedChain = knownChain;
@@ -3523,7 +3512,7 @@
           return true;
         }
 
-        logLine("loaded saved verified route instantly; checking for a shorter route");
+        logLine("found a verified route; checking for a shorter route");
         showSavedRoute("Checking for a shorter route in the background.");
         btn.disabled = false;
         pollServerSearchJob(job.id, {
@@ -3571,9 +3560,9 @@
           submit: true,
           isCurrent,
         });
-        logLine("loaded saved connection instantly; checking for a shorter route");
+        logLine("found a verified connection; checking for a shorter route");
         showStatus("done",
-          `✓ loaded saved connection — ${esc(start)} connects to ${esc(target)} in ` +
+          `✓ found a verified connection — ${esc(start)} connects to ${esc(target)} in ` +
           `${stepText((job.chain.path || []).length - 1)}. Checking for a shorter route in the background.`);
         btn.disabled = false;
         pollServerSearchJob(job.id, {
@@ -3652,6 +3641,11 @@
       if (error?.code === "SEARCH_SUPERSEDED") return true;
       if (!isCurrent()) return true;
       logLine(`server search unavailable: ${error.message}`);
+      if (error?.status === 410 || error?.code === "SEARCH_POLICY_EXPIRED") {
+        clearActiveJob(activeJob?.id || "");
+        showStatus("error", "This search has expired. Start a new search.");
+        return true;
+      }
       if (activeJob?.id) {
         if (knownChain?.found) {
           showStatus("done",
@@ -3733,6 +3727,10 @@
         continue;
       }
 
+      if (data?.job?.policyVersion !== SEARCH_POLICY_VERSION) {
+        clearActiveJob(id);
+        throw Object.assign(new Error("This search belongs to an older policy. Start a new search."), { code: "SEARCH_POLICY_EXPIRED" });
+      }
       job = mergeSearchJobSnapshot(data?.job);
       if (!job) throw new Error("job missing");
       if (!background) showServerJobProgress(job);
@@ -3852,6 +3850,11 @@
     return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
   }
 
+  function searchOptimalityNote(job) {
+    return job?.shortestVerified === true
+      ? "Shortest route verified for this search."
+      : "Shortest route has not been verified.";
+  }
   async function applyServerChain(job, analyticsBase, options = {}) {
     const {
       checking = false,
@@ -3875,13 +3878,13 @@
     const isDisplayed = () => isCurrent() && state.currentChain === chain;
     if (checking) {
       showStatus("working",
-        `loaded saved connection instantly — checking for a shorter route.`);
+        `Found a verified connection — checking for a shorter route.`);
     } else {
       showStatus("done",
-        `${job.progress && /saved connection/i.test(job.progress) ? "✓" : "✓ found it"} — ` +
+        `✓ found it — ` +
         `${esc(job.start)} connects to ${esc(job.target)} in ${stepText((chain.path || []).length - 1)}. ` +
         `checked ${Number(job.stats?.expanded || 0)} players, made ${Number(job.stats?.requests || 0)} requests` +
-        (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ".");
+        (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ". " + searchOptimalityNote(job));
     }
     setActiveChip(job.target);
     renderChain(chain);
@@ -3895,7 +3898,7 @@
     }).catch(() => {
       // Optional metadata failure must not retract verified public game proof.
     });
-    if (submit) submitLeaderboardChain(job.start, job.target, chain, job.range || analyticsBase?.range || "auto");
+    if (submit) submitLeaderboardChain(job.start, job.target, chain, job.range || analyticsBase?.range || "auto", job.id);
     recordSearchEvent(recordOutcome, {
       ...analyticsBase,
       jobId: job.id,
@@ -3965,7 +3968,7 @@
   }
   function saveActiveJob(job) {
     try {
-      localStorage.setItem(LS_ACTIVE_JOB_KEY, JSON.stringify({ ...job, ts: Date.now() }));
+      localStorage.setItem(LS_ACTIVE_JOB_KEY, JSON.stringify({ ...job, policyVersion: SEARCH_POLICY_VERSION, ts: Date.now() }));
     } catch {
       // Non-critical.
     }
@@ -3988,7 +3991,7 @@
     } catch {
       clearActiveJob();
     }
-    if (!record?.id || Date.now() - Number(record.ts || 0) > 2 * 60 * 60 * 1000) {
+    if (!record?.id || record.policyVersion !== SEARCH_POLICY_VERSION || Date.now() - Number(record.ts || 0) > 2 * 60 * 60 * 1000) {
       clearActiveJob();
       return;
     }
@@ -4047,6 +4050,11 @@
       }
     } catch (error) {
       if (!ownsResume()) return;
+      if (error?.status === 410 || error?.code === "SEARCH_POLICY_EXPIRED") {
+        clearActiveJob(record.id);
+        showStatus("error", "This search has expired. Start a new search.");
+        return;
+      }
       saveActiveJob(record);
       if (!ownsResume()) return;
       showStatus("error",
@@ -4108,52 +4116,10 @@
     localStorage.setItem(LS_RANGE_KEY, range);
     $("#setting-username").value = start;
 
-    const savedChain = precomputedChain(start, target);
-    if (savedChain) {
-      const isDirectWin = window.SavedRoutes?.routeStepCount(savedChain) === 1;
-      showStatus("done",
-        isDirectWin
-          ? `verified direct win against ${savedChain.display || target}. This is the shortest possible connection.`
-          : `showing a saved verified route to ${savedChain.display || target} while checking for a shorter route.`);
-      const renderedChain = {
-        target: savedChain.target,
-        display: savedChain.display || nameOf(savedChain.target),
-        found: savedChain.found,
-        length: savedChain.length,
-        path: savedChain.path,
-        hops: savedChain.hops,
-      };
-      renderChain(renderedChain);
-      setActiveChip(target);
-      submitLeaderboardChain(start, target, renderedChain);
-      recordSearchEvent("saved", {
-        ...analyticsBase,
-        length: renderedChain.length,
-        steps: Math.max(0, renderedChain.path.length - 1),
-        path: renderedChain.path,
-        durationMs: performance.now() - searchStartedAt,
-      });
-      document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
-      if (isDirectWin) {
-        clearActiveJob();
-        btn.disabled = false;
-        return;
-      }
-      const handledByServer = await runServerSearchFlow({
-        start,
-        target,
-        range,
-        analyticsBase,
-        mode,
-        btn,
-        status,
-        logEl,
-        knownChain: renderedChain,
-      });
-      if (handledByServer) return;
-      return;
-    }
-
+    clearActiveJob();
+    state.chains = { chains: [] };
+    renderChain({ target, display: nameOf(target), found: false, pending: true, length: null, path: [], hops: [] });
+    showStatus("working", "starting fresh search...");
     const handledByServer = await runServerSearchFlow({
       start,
       target,
@@ -4788,10 +4754,8 @@
     localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
     $("#search-range").value = "auto";
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
-    const scheduleCacheWarm = () => warmSharedCaches();
-    if (typeof requestIdleCallback === "function") requestIdleCallback(scheduleCacheWarm, { timeout: 3000 });
-    else setTimeout(scheduleCacheWarm, 1200);
-    loadShowcase().then(async () => {
+    localStorage.removeItem("chess-connections:active-search-job:v1");
+    loadPlayerMetadata().then(async () => {
       const sharedLoaded = await loadSharedChainFromUrl();
       loadLeaderboardTargetsWhenVisible();
       if (!sharedLoaded) resumeActiveSearchJob();

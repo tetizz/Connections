@@ -75,7 +75,6 @@ class InterfaceContractTests(unittest.TestCase):
         self.assertIn('"data-avatar-src": av', APP)
         self.assertIn('img.loading = "lazy"', APP)
         self.assertIn('loading="lazy" decoding="async"', LEADERBOARD)
-        self.assertIn("requestIdleCallback", APP)
         self.assertIn("window.Leaderboard.init()", APP)
         self.assertIn("function init()", LEADERBOARD)
         self.assertIn("initialLoadObserver", LEADERBOARD)

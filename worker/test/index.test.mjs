@@ -77,6 +77,71 @@ function response(body, status = 200, headers = {}) {
   });
 }
 
+// Exercise fresh traversal through the public endpoint. The only route proofs
+// admitted here are the games supplied for this fixture, never saved chains.
+async function freshEndpointRoute(kv, edges, searchId) {
+  const now = Date.now();
+  const endTime = Math.floor(now / 1000) - 60;
+  const month = new Date(endTime * 1000);
+  const suffix = `${month.getUTCFullYear()}/${String(month.getUTCMonth() + 1).padStart(2, "0")}`;
+  const games = edges.map(([white, black, id]) => ({
+    white, black, whiteResult: "win", blackResult: "resigned",
+    url: `https://www.chess.com/game/live/${id}`, timeClass: "rapid", endTime,
+  }));
+  const nodes = new Set(["alpha", "omega", ...edges.flatMap(([from, to]) => [from, to])]);
+  for (const username of nodes) {
+    await kv.put(`games:${username}:recent:6`, JSON.stringify({
+      schema: 2, ts: now, games: games.filter(g => g.white === username || g.black === username),
+    }));
+  }
+  const requested = [];
+  globalThis.fetch = async input => {
+    const url = new URL(String(input));
+    requested.push(url.href);
+    assert.equal(url.origin, "https://api.chess.com", "saved graph proofs must not be fetched");
+    const match = url.pathname.match(/^\/pub\/player\/([^/]+)(.*)$/);
+    assert.ok(match, url.href);
+    const [, username, tail] = match;
+    assert.ok(nodes.has(username), `unexpected graph-only player ${username}`);
+    if (!tail) return response({ username, name: username });
+    if (tail === "/stats") return response({});
+    if (tail === "/games/archives") return response({ archives: [`https://api.chess.com/pub/player/${username}/games/${suffix}`] });
+    assert.equal(tail, `/games/${suffix}`);
+    return response({ games: games.filter(g => g.white === username || g.black === username).map(g => ({
+      rules: "chess",
+      white: { username: g.white, result: g.whiteResult },
+      black: { username: g.black, result: g.blackResult },
+      url: g.url, time_class: g.timeClass, end_time: g.endTime,
+    })) });
+  };
+  const pending = [];
+  const env = { GAMES_CACHE: kv };
+  const ctx = { waitUntil(promise) { pending.push(promise); } };
+  const started = await worker.fetch(new Request("https://worker.test/search/start", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ start: "alpha", target: "omega", searchId, range: "auto" }),
+  }), env, ctx);
+  assert.equal(started.status, 202);
+  const initial = (await started.json()).job;
+  assert.equal(initial.status, "queued");
+  assert.equal(initial.chain, null);
+  assert.equal(initial.policyVersion, "fresh-search-v1");
+  while (pending.length) await Promise.all(pending.splice(0));
+  const polled = await worker.fetch(new Request(`https://worker.test/search/job?id=${initial.id}`), env, ctx);
+  assert.equal(polled.status, 200);
+  const job = (await polled.json()).job;
+  while (pending.length) await Promise.all(pending.splice(0));
+  assert.equal(job.status, "found");
+  assert.equal(job.shortestVerified, false, "provider archives are not an atomic complete snapshot");
+  assert.equal(job.chain.hops.length, job.chain.path.length - 1);
+  for (const [i, hop] of job.chain.hops.entries()) {
+    assert.equal(hop.from, job.chain.path[i]);
+    assert.equal(hop.to, job.chain.path[i + 1]);
+    assert.ok(games.some(g => g.white === hop.from && g.black === hop.to && g.url === hop.url));
+  }
+  return { job, requested };
+}
+
 function searchJob(overrides = {}) {
   const now = Date.now();
   return __test.searchJobShape({
@@ -118,7 +183,7 @@ test("lease recovery leaves a valid owner untouched", async () => {
   const kv = new MemoryKV();
   const env = { GAMES_CACHE: kv };
   const job = searchJob({ processingUntil: Date.now() + 60000 });
-  await kv.put(`search:job:${job.id}`, JSON.stringify(job));
+  await kv.put(__test.searchJobKey(job.id), JSON.stringify(job));
 
   const recovered = await __test.recoverStaleSearchLease(env, job.id, job);
 
@@ -131,7 +196,7 @@ test("stale lease recovery retries the same frontier instead of skipping nodes",
   const kv = new MemoryKV();
   const env = { GAMES_CACHE: kv };
   const job = searchJob();
-  await kv.put(`search:job:${job.id}`, JSON.stringify(job));
+  await kv.put(__test.searchJobKey(job.id), JSON.stringify(job));
 
   const recovered = await __test.recoverStaleSearchLease(env, job.id, job);
 
@@ -326,7 +391,7 @@ test("search-start rate limits expose the JSON retry delay as Retry-After", asyn
   assert.ok(body.retryAfter >= 1);
 });
 
-test("health identifies the verified-share release", async () => {
+test("health identifies the fresh-search release", async () => {
   const result = await worker.fetch(
     new Request("https://worker.test/health"),
     { GAMES_CACHE: new MemoryKV() },
@@ -335,7 +400,7 @@ test("health identifies the verified-share release", async () => {
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-08-02-verified-shares-v6");
+  assert.equal(body.release, "2026-10-16-fresh-search-v1");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {
@@ -728,7 +793,7 @@ test("caller-owned job ids cannot be reused for another pair", async () => {
   assert.equal(mismatch.status, 409);
 });
 
-test("saved routes stay active so the client can receive a shorter connection", async () => {
+test("saved pair answers are absent from new jobs and fresh proofs find a shorter route", async () => {
   const kv = new MemoryKV();
   await kv.put("search:pair:v2:alpha:omega:auto", JSON.stringify({
     start: "alpha",
@@ -766,8 +831,15 @@ test("saved routes stay active so the client can receive a shorter connection", 
   const body = await result.json();
 
   assert.equal(result.status, 202);
-  assert.equal(body.job.status, "running");
-  assert.equal(body.job.chain.found, true);
+  assert.equal(body.job.status, "queued");
+  assert.equal(body.job.chain, null);
+  assert.equal(body.job.refreshCached, false);
+  assert.equal(body.job.policyVersion, "fresh-search-v1");
+  const { job } = await freshEndpointRoute(kv, [["alpha", "omega", 12]], "fresh-saved-pair");
+  assert.deepEqual(job.chain.path, ["alpha", "omega"]);
+  assert.equal(job.chain.hops[0].url, "https://www.chess.com/game/live/12");
+  assert.deepEqual(JSON.parse(await kv.get("search:pair:v2:alpha:omega:auto")).chain.path,
+    ["alpha", "beta", "omega"], "historical pair is retained but not promoted or overwritten");
 });
 
 test("direct wins beat longer exact fast-lane routes", async () => {
@@ -818,7 +890,7 @@ test("direct wins beat longer exact fast-lane routes", async () => {
   assert.deepEqual(result.chain.path, ["alpha", "omega"]);
 });
 
-test("a range-verified graph hint avoids a wide live crawl and remains an upper bound", async () => {
+test("stored graph hints cannot terminate a fresh search or hide a shorter raw-game route", async () => {
   const kv = new MemoryKV();
   const now = Date.now();
   const endTime = Math.floor(now / 1000) - 60;
@@ -909,19 +981,28 @@ test("a range-verified graph hint avoids a wide live crawl and remains an upper 
     stats,
   );
 
-  assert.equal(result.source, "verified-graph-hint");
-  assert.deepEqual(result.chain.path, ["alpha", "connector", "middle", "omega"]);
-  assert.equal(result.chain.hops.length, 3);
-  assert.equal(stats.requests, 4);
-  assert.equal(requested.length, 4);
-  assert.ok(stats.requests <= 5, `expected <=5 proof requests, got ${stats.requests}`);
-  assert.equal(__test.shouldKeepCheckingFastLane(result), true);
+  assert.equal(result, null);
+  assert.equal(stats.requests, 0);
+  assert.deepEqual(requested, [], "no exact-game graph-hint verification work");
+  const fresh = await freshEndpointRoute(kv, [
+    ["alpha", "short", 201], ["short", "omega", 202],
+    ["alpha", "connector", 100], ["connector", "middle", 101], ["middle", "omega", 102],
+  ], "fresh-graph-shorter");
+  assert.deepEqual(fresh.job.chain.path, ["alpha", "short", "omega"]);
+  assert.deepEqual(fresh.job.chain.hops.map(hop => hop.url), [
+    "https://www.chess.com/game/live/201", "https://www.chess.com/game/live/202",
+  ]);
+  assert.ok(fresh.requested.every(url => !url.includes("/callback/")));
+});
+
+test("historical fast-lane helper keeps its two-edge shorter-check boundary", () => {
   assert.equal(__test.shouldKeepCheckingFastLane({
-    source: result.source,
-    chain: {
-      path: ["alpha", "connector", "omega"],
-      hops: result.chain.hops.slice(0, 2),
-    },
+    source: "verified-graph-hint",
+    chain: { path: ["alpha", "connector", "middle", "omega"], hops: [{}, {}, {}] },
+  }), true);
+  assert.equal(__test.shouldKeepCheckingFastLane({
+    source: "verified-graph-hint",
+    chain: { path: ["alpha", "connector", "omega"], hops: [{}, {}] },
   }), false);
 });
 
@@ -1081,7 +1162,7 @@ test("graph rebuild selection is not trapped in the first 900 lexicographic keys
   assert.equal(plans.some((plan) => plan.username === "hikaru"), true);
 });
 
-test("a longer graph hint is skipped when a shorter verified lane is already loaded", async () => {
+test("both saved lanes and graph hints are ignored while raw-game traversal still completes", async () => {
   const kv = new MemoryKV();
   const now = Date.now();
   await kv.put("fastlane:v2:auto:omega", JSON.stringify({
@@ -1152,8 +1233,16 @@ test("a longer graph hint is skipped when a shorter verified lane is already loa
     { fetched: 0, requests: 0, cached: 0, expanded: 0 },
   );
 
-  assert.deepEqual(result.chain.path, ["alpha", "saved-one", "saved-two", "omega"]);
+  assert.equal(result, null);
   assert.equal(requests, 0);
+  const fresh = await freshEndpointRoute(kv, [
+    ["alpha", "connector", 310], ["connector", "omega", 314],
+  ], "fresh-no-route-hints");
+  assert.deepEqual(fresh.job.chain.path, ["alpha", "connector", "omega"]);
+  assert.deepEqual(fresh.job.chain.hops.map(hop => hop.url), [
+    "https://www.chess.com/game/live/310", "https://www.chess.com/game/live/314",
+  ]);
+  assert.ok(fresh.requested.every(url => !url.includes("/callback/")));
 });
 
 test("exact live-game proofs verify winners without scanning monthly archives", async () => {
@@ -1679,10 +1768,10 @@ test("background search drains consecutive local chunks without a browser poll",
       processingUntil: 0,
     });
 
-    await kv.put(`search:job:${running.id}`, JSON.stringify(running));
+    await kv.put(__test.searchJobKey(running.id), JSON.stringify(running));
     await __test.runSearchJob(env, running);
 
-    const finished = JSON.parse(await kv.get(`search:job:${running.id}`));
+    const finished = JSON.parse(await kv.get(__test.searchJobKey(running.id)));
     assert.equal(finished.status, "not_found");
     assert.equal(finished.stats.requests, 4);
     assert.equal(finished.stats.expanded, 4);

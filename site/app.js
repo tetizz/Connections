@@ -4110,8 +4110,11 @@
 
     const savedChain = precomputedChain(start, target);
     if (savedChain) {
+      const isDirectWin = window.SavedRoutes?.routeStepCount(savedChain) === 1;
       showStatus("done",
-        `showing a saved verified route to ${savedChain.display || target} while checking for a shorter route.`);
+        isDirectWin
+          ? `verified direct win against ${savedChain.display || target}. This is the shortest possible connection.`
+          : `showing a saved verified route to ${savedChain.display || target} while checking for a shorter route.`);
       const renderedChain = {
         target: savedChain.target,
         display: savedChain.display || nameOf(savedChain.target),
@@ -4131,6 +4134,11 @@
         durationMs: performance.now() - searchStartedAt,
       });
       document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+      if (isDirectWin) {
+        clearActiveJob();
+        btn.disabled = false;
+        return;
+      }
       const handledByServer = await runServerSearchFlow({
         start,
         target,

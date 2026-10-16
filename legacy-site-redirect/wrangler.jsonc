@@ -1,0 +1,8 @@
+{
+  "name": "c",
+  "main": "worker.mjs",
+  "account_id": "6a425c997213c6e3c183111a1e0f29d5",
+  "compatibility_date": "2026-10-06",
+  "workers_dev": true,
+  "preview_urls": false
+}

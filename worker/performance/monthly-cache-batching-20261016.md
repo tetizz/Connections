@@ -1,5 +1,7 @@
 # Monthly archive cache reads
 
+This report records the v4 batching release. The later [v5 failure-reporting repair](failure-outcomes-20261016.md) leaves batching unchanged; it is not a new timing qualification.
+
 The loader reads the first selected month individually, then awaits native KV JSON reads of up to four months. Records are consumed in their original order and checked for URL, schema, freshness and valid games. Downloads remain sequential. Bulk errors or unexpected results fall back to individual reads for that invocation; duplicate URLs retain individual reads. Saved connection answers remain excluded from fresh searches. Batching changes neither all-history coverage nor the shortest-path stopping rule.
 
 ## Accepted native KV component result

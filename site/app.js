@@ -19,8 +19,8 @@
   const LS_THEME_KEY = "chess-connections:theme";
   const LS_RANGE_KEY = "chess-connections:range";
   const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
-  const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v2:fresh-search";
-  const SEARCH_POLICY_VERSION = "fresh-search-v1";
+  const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v3:full-history-search";
+  const SEARCH_POLICY_VERSION = "fresh-search-v2";
   const CHAIN_PARAM = "chain";
   const SHORT_CHAIN_PARAM = "c";
   const LEGACY_SHARE_PARAM = "share";
@@ -4754,7 +4754,9 @@
     localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
     $("#search-range").value = "auto";
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
+    // Automatic search now traverses full histories under the current policy.
     localStorage.removeItem("chess-connections:active-search-job:v1");
+    localStorage.removeItem("chess-connections:active-search-job:v2:fresh-search");
     loadPlayerMetadata().then(async () => {
       const sharedLoaded = await loadSharedChainFromUrl();
       loadLeaderboardTargetsWhenVisible();

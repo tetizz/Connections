@@ -4,12 +4,12 @@ import { bindVerifiedJobSubmission } from "../src/verified-job-submit.js";
 
 function fixture() {
   const hop = { from: "alpha", to: "omega", url: "https://www.chess.com/game/live/12345", white: { username: "alpha", rating: 2000 } };
-  const job = { id: "actual-job", policyVersion: "fresh-search-v1", status: "found", outcome: "found",
+  const job = { id: "actual-job", policyVersion: "fresh-search-v2", status: "found", outcome: "found",
     start: "alpha", target: "omega", range: "auto", createdAt: 1000, updatedAt: 2000,
     search: { sinceMonth: "2026/01", incomplete: false }, chain: { found: true, path: ["alpha", "omega"], hops: [hop] } };
   const submission = { searchId: job.id, start: job.start, target: job.target, range: job.range,
     path: [...job.chain.path], hops: [{ from: hop.from, to: hop.to, url: hop.url, white: { username: "forged" } }], sinceMonth: "0000/01" };
-  const options = { submission, readSearchJob: async () => job, policyVersion: "fresh-search-v1",
+  const options = { submission, readSearchJob: async () => job, policyVersion: "fresh-search-v2",
     validSinceMonth: value => typeof value === "string" && /^\d{4}\/(?:0[1-9]|1[0-2])$/.test(value),
     maxAgeMs: 7200000, now: () => 3000 };
   return { job, submission, options, run: extra => bindVerifiedJobSubmission({ ...options, ...extra }) };

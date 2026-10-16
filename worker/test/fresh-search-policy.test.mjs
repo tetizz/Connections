@@ -6,11 +6,11 @@ const oldJob = { id: "test-search", start: "alpha", target: "omega", status: "fo
   chain: { found: true, path: ["alpha", "omega"], hops: [] } };
 
 test("fresh search policy uses reversible independent storage and Durable Object namespaces", () => {
-  assert.equal(__test.SEARCH_POLICY_VERSION, "fresh-search-v1");
-  assert.equal(__test.searchJobKey("id"), "search:job:fresh-search-v1:id");
-  assert.equal(__test.searchPublicJobKey("id"), "search:public:fresh-search-v1:id");
-  assert.equal(__test.searchDurableName("id"), "fresh-search-v1:id");
-  assert.equal(__test.searchJobShape(oldJob).policyVersion, "fresh-search-v1");
+  assert.equal(__test.SEARCH_POLICY_VERSION, "fresh-search-v2");
+  assert.equal(__test.searchJobKey("id"), "search:job:fresh-search-v2:id");
+  assert.equal(__test.searchPublicJobKey("id"), "search:public:fresh-search-v2:id");
+  assert.equal(__test.searchDurableName("id"), "fresh-search-v2:id");
+  assert.equal(__test.searchJobShape(oldJob).policyVersion, "fresh-search-v2");
   assert.equal(__test.publicSearchJobShape(oldJob), null);
 });
 

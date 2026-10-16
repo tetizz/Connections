@@ -15,8 +15,8 @@ import { bindVerifiedJobSubmission } from './verified-job-submit.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-16-fresh-search-v2";
-const SEARCH_POLICY_VERSION = "fresh-search-v1";
+const WORKER_RELEASE = "2026-10-16-fresh-search-v3";
+const SEARCH_POLICY_VERSION = "fresh-search-v2";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
 const searchDurableName = (id) => `${SEARCH_POLICY_VERSION}:${id}`;
@@ -1381,7 +1381,8 @@ function createSearchEdgeReader(env, job, stats) {
             return { deferred: true, reason: "chunk-request-limit" };
           }
           freshRequestsThisChunk++;
-          edges = await readOrFetchEdges(env, { username: key, archiveLimit, sinceMonth, signal }, stats);
+          edges = await readOrFetchEdges(env, { username: key, archiveLimit, sinceMonth,
+            directTarget: key === job.start ? job.target : null, signal }, stats);
         }
       }
       const outcome = {
@@ -1391,6 +1392,12 @@ function createSearchEdgeReader(env, job, stats) {
       return outcome;
     } catch (error) {
       if (signal?.aborted) throw error;
+      if (error instanceof DirectWinFound && key === job.start) {
+        const game = error.game;
+        const proof = { from: job.start, to: job.target, url: game.url,
+          ...proofDetailsFromGame(game, job.start, job.target) };
+        return { directProof: proof, edges: edgesFromGames(key, [game]) };
+      }
       if (isMissingArchivesError(error)) {
         const outcome = { edges: { beatenByMe: new Map(), beatMe: new Map() } };
         edgesCache.set(key, outcome);
@@ -1439,7 +1446,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
   // Provider archives are individually cached, rather than an atomic snapshot.
   // A complete BFS layer gives the best observed route without claiming that
   // every current Chess.com game has already reached its public archive.
-  result.shortestVerified = false;
+  result.shortestVerified = result.status === "found" && result.chain?.path?.length === 2;
   return result;
 }
 
@@ -1605,6 +1612,10 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
       processed++;
       const node = item.node;
       const edges = item.edges;
+      if (item.directProof && node === job.start && item.directProof.to === job.target) {
+        syncSearch();
+        return { status: "found", chain: { path: [job.start, job.target], hops: [item.directProof] } };
+      }
       if (search.activeSide === "forward") {
         for (const [opponent, urls] of edges.beatenByMe) {
           if (forwardVisited.has(opponent)) continue;
@@ -2644,6 +2655,38 @@ async function readOrFetchEdges(env, parsed, stats = null) {
   if (!parsed.forceFresh) {
     const cachedEdges = await readCachedEdges(env, parsed, stats);
     if (cachedEdges && !cachedEdges.truncated) return cachedEdges;
+  }
+  if (validSinceMonth(parsed.sinceMonth)) {
+    const cachedGames = !parsed.forceFresh ? await readCachedGames(env, parsed, stats) : null;
+    if (cachedGames) {
+      const edges = edgesFromGames(parsed.username, cachedGames);
+      await putEdgesCache(env.GAMES_CACHE, key, parsed, edges);
+      return edges;
+    }
+    const activeLimit = await readRateLimit(env.GAMES_CACHE);
+    if (activeLimit) throw new UpstreamHTTPError(429, `${CHESS_API}${parsed.username}/games/archives`, activeLimit.retryAfter);
+    const edges = { beatenByMe: new Map(), beatMe: new Map() };
+    try {
+      if (stats) stats.requests++;
+      await fetchGames({ ...parsed, collectGames: false,
+        onGames: games => {
+          const month = edgesFromGames(parsed.username, games);
+          for (const direction of ['beatenByMe', 'beatMe']) {
+            for (const [opponent, urls] of month[direction]) {
+              if (!edges[direction].has(opponent) && urls[0]) edges[direction].set(opponent, [urls[0]]);
+            }
+          }
+          parsed.onGames?.(games);
+        },
+        onCoverage: coverage => { attachArchiveCoverage(edges, coverage); parsed.onCoverage?.(coverage); },
+      }, env);
+      if (stats) stats.fetched++;
+      await putEdgesCache(env.GAMES_CACHE, key, parsed, edges);
+      return edges;
+    } catch (error) {
+      if (isRateLimitError(error)) await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
+      throw error;
+    }
   }
   const games = await readOrFetchGames(env, parsed, stats);
   const edges = edgesFromGames(parsed.username, games);
@@ -5408,7 +5451,7 @@ async function readArchiveList(env, username, {signal = null, metrics = null} = 
   check(); return record;
 }
 async function sharedSinceMonth(env, start, target, range, options = {}) {
-  if (range === 'all') return '0000/01';
+  if (range === 'all' || range === 'auto') return '0000/01';
   const count = archiveLimitForRange(range);
   const lists = await Promise.all([readArchiveList(env,start,options),readArchiveList(env,target,options)]);
   const oldest = lists.flatMap(list => list.archives.slice(-count).map(archiveMonthFromUrl)).sort();
@@ -5423,12 +5466,32 @@ function sharedCoverageFresh(record, parsed) {
   return record?.coverage?.sinceMonth === parsed.sinceMonth && validSinceMonth(parsed.sinceMonth) &&
     Number.isFinite(record.coverage.expiresAt) && record.coverage.expiresAt > Date.now();
 }
-async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null }, env = null) {
+export class DirectWinFound extends Error {
+  constructor(game) {
+    super('Verified direct win found in completed monthly archive');
+    this.name = 'DirectWinFound';
+    this.game = JSON.parse(JSON.stringify(game));
+  }
+}
+function checkDirectArchiveWin(games, username, directTarget) {
+  if (!directTarget || cleanUsername(directTarget) !== directTarget || directTarget === username) return;
+  const game = games.find(game => {
+    const wins = (game.white === username && game.black === directTarget && game.whiteResult === 'win') ||
+      (game.black === username && game.white === directTarget && game.blackResult === 'win');
+    const match = typeof game.url === 'string' && game.url.match(/^https:\/\/www\.chess\.com\/game\/live\/([1-9]\d*)$/i);
+    return wins && game.timeClass !== 'daily' && match && Number.isSafeInteger(Number(match[1]));
+  });
+  if (game) throw new DirectWinFound(game);
+}
+async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null }, env = null) {
   const checkAbort = () => { if (signal?.aborted) throw abortSignalError(signal); };
   checkAbort();
   const list = await readArchiveList(env, username, { signal, metrics });
   checkAbort();
-  const selected = selectSharedArchives(list.archives, sinceMonth, archiveLimit);
+  const directScan = Boolean(directTarget && cleanUsername(directTarget) === directTarget && directTarget !== username);
+  const selected = [...selectSharedArchives(list.archives, sinceMonth, archiveLimit)];
+  const newestFirst = directScan || collectGames === false;
+  if (newestFirst) selected.reverse();
   let expiresAt = Math.min(list.ts + ARCHIVE_LIST_CACHE_TTL_SECONDS * 1000, Date.now() + TTL_SECONDS * 1000);
   const rows = await runThrottled(selected.map((url) => async () => {
     checkAbort();
@@ -5437,7 +5500,10 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     checkAbort();
     if (cached?.schema === 1 && cached.url === url && Number.isFinite(cached.expiresAt) &&
         cached.expiresAt > Date.now() && Array.isArray(cached.games) && cached.games.every(validSanitizedArchiveGame)) {
-      expiresAt = Math.min(expiresAt, cached.expiresAt); return cached.games;
+      expiresAt = Math.min(expiresAt, cached.expiresAt);
+      checkDirectArchiveWin(cached.games, username, directTarget);
+      onGames?.(cached.games);
+      return collectGames === false ? [] : cached.games;
     }
     let providerTTL = 0;
     let data;
@@ -5472,13 +5538,15 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
       schema: 1, url, expiresAt: Date.now() + ttl * 1000, games,
     }), { expirationTtl: Math.floor(ttl) }).catch(() => {});
     checkAbort();
-    return games;
+    checkDirectArchiveWin(games, username, directTarget);
+    onGames?.(games);
+    return collectGames === false ? [] : games;
   }), ARCHIVE_CONCURRENCY);
   checkAbort();
   // No aggregate is returned until EVERY selected month has completed.
   const coverage = { sinceMonth, expiresAt };
   onCoverage?.(coverage);
-  return attachArchiveCoverage(rows.flat(), sinceMonth == null ? null : coverage);
+  return attachArchiveCoverage((newestFirst ? rows.reverse() : rows).flat(), sinceMonth == null ? null : coverage);
 }
 
 function validArchiveURL(value, username) {
@@ -6305,6 +6373,8 @@ class UpstreamHTTPError extends Error {
 }
 
 export const __test = Object.freeze({
+  DirectWinFound,
+  checkDirectArchiveWin,
   readArchiveList,
   sharedSinceMonth,
   selectSharedArchives,

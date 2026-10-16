@@ -55,6 +55,81 @@ test('current-month no-store never becomes seven-day scoped aggregate coverage',
   assert.equal(env.GAMES_CACHE.values.has(`edges:alice:since:${month}`),false);
   await api.readOrFetchGames(env,parsed);assert.equal(monthlyCalls,2);
 });
+test('auto is full history and older-than-six-month direct proof stops without aggregate coverage, then reuses months',async()=>{
+  const env={GAMES_CACHE:new KV()};
+  const months=['2019/12','2020/01','2020/02','2020/03','2020/04','2020/05','2020/06','2020/07','2020/08'];
+  const calls=[];let coverageCalls=0;
+  globalThis.fetch=async raw=>{
+    const value=String(raw);calls.push(value);
+    if(value.endsWith('/archives'))return new Response(JSON.stringify({archives:months.map(month=>url('alice',month))}));
+    const month=value.slice(-7);const direct=month==='2020/01';
+    return new Response(JSON.stringify({games:[{rules:'chess',white:{username:'alice',result:'win'},
+      black:{username:direct?'bob':'other',result:'resigned'},url:`https://www.chess.com/game/live/${direct?123:456}`,
+      time_class:'blitz',end_time:1700000000}]}));
+  };
+  assert.equal(await api.sharedSinceMonth(env,'alice','bob','auto'),'0000/01');
+  assert.equal(calls.length,0,'full-history boundary needs no endpoint list round trips');
+  const parsed={username:'alice',sinceMonth:'0000/01',directTarget:'bob',onCoverage:()=>{coverageCalls++;}};
+  let savedGame;
+  await assert.rejects(api.readOrFetchGames(env,parsed),error=>{
+    assert.ok(error instanceof api.DirectWinFound);savedGame=error.game;
+    assert.equal(error.game.url,'https://www.chess.com/game/live/123');return true;
+  });
+  assert.deepEqual(calls.slice(1),months.slice(1).reverse().map(month=>url('alice',month)));
+  assert.equal(calls.includes(url('alice','2019/12')),false,'older unneeded month is not downloaded after absolute-minimum proof');
+  assert.equal(coverageCalls,0);
+  assert.equal(env.GAMES_CACHE.values.has('games:alice:since:0000/01'),false);
+  assert.equal(env.GAMES_CACHE.values.has('edges:alice:since:0000/01'),false);
+  assert.equal([...env.GAMES_CACHE.values.keys()].filter(key=>key.startsWith('archive:games:')).length,8);
+  // The carried proof is detached from persisted sanitized monthly bytes.
+  savedGame.white='changed';
+  assert.equal(JSON.parse(env.GAMES_CACHE.values.get('archive:games:v1:alice:2020/01')).games[0].white,'alice');
+  const before=calls.length;
+  await assert.rejects(api.readOrFetchGames(env,parsed),error=>error instanceof api.DirectWinFound && error.game.white==='alice');
+  assert.equal(calls.length,before,'retry uses retained list and complete months');
+  assert.equal(coverageCalls,0);
+});
+test('direct scan rejects reversed win, daily and invalid proof URL',()=>{
+  for(const game of [
+    {white:'bob',black:'alice',whiteResult:'win',blackResult:'resigned',timeClass:'blitz',url:'https://www.chess.com/game/live/123'},
+    {white:'alice',black:'bob',whiteResult:'win',timeClass:'daily',url:'https://www.chess.com/game/live/123'},
+    {white:'alice',black:'bob',whiteResult:'win',timeClass:'blitz',url:'https://example.org/game/live/123'},
+  ]) assert.doesNotThrow(()=>api.checkDirectArchiveWin([game],'alice','bob'));
+});
+test('scoped edge streaming visits every month newest-first, keeps one newest proof and no aggregate games',async()=>{
+  const env={GAMES_CACHE:new KV()};const months=['2020/01','2020/02','2020/03'];const seen=[];
+  globalThis.fetch=async raw=>{
+    const value=String(raw);
+    if(value.endsWith('/archives'))return new Response(JSON.stringify({archives:months.map(month=>url('alice',month))}));
+    const month=value.slice(-7);const id=Number(month.slice(-2));seen.push(month);
+    return new Response(JSON.stringify({games:[{rules:'chess',white:{username:'alice',result:'win'},
+      black:{username:'bob',result:'resigned'},url:`https://www.chess.com/game/live/${id}`,time_class:'blitz',end_time:1700000000+id}]}));
+  };
+  const stats={requests:0,fetched:0,cached:0};
+  const edges=await api.readOrFetchEdges(env,{username:'alice',sinceMonth:'0000/01'},stats);
+  assert.deepEqual(seen,['2020/03','2020/02','2020/01']);
+  assert.deepEqual([...edges.beatenByMe],[['bob',['https://www.chess.com/game/live/3']]]);
+  assert.equal(stats.requests,1);assert.equal(stats.fetched,1);
+  assert.equal(env.GAMES_CACHE.values.has('games:alice:since:0000/01'),false);
+  assert.equal(env.GAMES_CACHE.values.has('edges:alice:since:0000/01'),true);
+  assert.equal([...env.GAMES_CACHE.values.keys()].filter(key=>key.startsWith('archive:games:')).length,3);
+  assert.deepEqual((await api.readCachedEdges(env,{username:'alice',sinceMonth:'0000/01'})).archiveCoverage,edges.archiveCoverage);
+});
+test('streaming failure retains completed month but publishes no partial edge or aggregate cache',async()=>{
+  const env={GAMES_CACHE:new KV()};const controller=new AbortController();
+  globalThis.fetch=async raw=>{
+    const value=String(raw);
+    if(value.endsWith('/archives'))return new Response(JSON.stringify({archives:['2020/01','2020/02'].map(month=>url('alice',month))}));
+    if(value.endsWith('/01')){controller.abort(new DOMException('owned stop','AbortError'));throw controller.signal.reason;}
+    return new Response(JSON.stringify({games:[]}));
+  };
+  const stats={requests:0,fetched:0,cached:0};
+  await assert.rejects(api.readOrFetchEdges(env,{username:'alice',sinceMonth:'0000/01',signal:controller.signal},stats),{name:'AbortError'});
+  assert.equal(stats.requests,1);assert.equal(stats.fetched,0);
+  assert.equal(env.GAMES_CACHE.values.has('archive:games:v1:alice:2020/02'),true);
+  assert.equal(env.GAMES_CACHE.values.has('edges:alice:since:0000/01'),false);
+  assert.equal(env.GAMES_CACHE.values.has('games:alice:since:0000/01'),false);
+});
 
 test('a listed missing month cannot masquerade as complete shared-window history',async()=>{
   const env={GAMES_CACHE:new KV()};

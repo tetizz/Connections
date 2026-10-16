@@ -72,7 +72,7 @@ function fixture({ chains = publicData } = {}) {
     updateShareButton: chain => shares.push(chain),
     runServerSearchFlow: async options => { serverCalls.push(options); return true; },
     fetch: () => { throw new Error("Unexpected HTTP in controller fixture"); },
-    pollServerSearchJob: async id => { context.polled = id; return { id, policyVersion: "fresh-search-v1", status: "found", chain: { found: true } }; },
+    pollServerSearchJob: async id => { context.polled = id; return { id, policyVersion: "fresh-search-v2", status: "found", chain: { found: true } }; },
     renderSearchQueue: () => {}, finishSearchQueue: () => {},
     applyServerChain: async job => { context.applied = job; },
     Date,
@@ -96,7 +96,7 @@ function fixture({ chains = publicData } = {}) {
   };
 }
 
-const activeKey = "chess-connections:active-search-job:v2:fresh-search";
+const activeKey = "chess-connections:active-search-job:v3:full-history-search";
 
 test("all ordinary pairs discard saved answers and enter one fresh server search", async t => {
   for (const [start, target] of [["fredalsup", "pianoskater"], ["trixize1234", "pianoskater"], ["public-a", "public-b"]]) {
@@ -134,11 +134,12 @@ test("old policy records are invalidated without polling or rendering", async ()
   await f.context.resumeActiveSearchJob();
   assert.equal(f.context.polled,undefined);assert.equal(f.storage.has(activeKey),false);assert.equal(f.renders.length,0);
   assert.match(appSource,/localStorage\.removeItem\("chess-connections:active-search-job:v1"\)/);
+  assert.match(appSource,/localStorage\.removeItem\("chess-connections:active-search-job:v2:fresh-search"\)/);
 });
 
 test("fresh policy jobs retain resume reliability and policy-bound persistence", async () => {
   const f=fixture();f.context.saveActiveJob({id:"fresh",searchId:"fresh",start:"fredalsup",target:"pianoskater",range:"auto"});
-  assert.equal(JSON.parse(f.storage.get(activeKey)).policyVersion,"fresh-search-v1");
+  assert.equal(JSON.parse(f.storage.get(activeKey)).policyVersion,"fresh-search-v2");
   await f.context.resumeActiveSearchJob();assert.equal(f.context.polled,"fresh");assert.equal(f.context.applied.id,"fresh");assert.equal(f.storage.has(activeKey),false);
 });
 

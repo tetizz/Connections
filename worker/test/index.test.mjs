@@ -125,14 +125,14 @@ async function freshEndpointRoute(kv, edges, searchId) {
   const initial = (await started.json()).job;
   assert.equal(initial.status, "queued");
   assert.equal(initial.chain, null);
-  assert.equal(initial.policyVersion, "fresh-search-v1");
+  assert.equal(initial.policyVersion, "fresh-search-v2");
   while (pending.length) await Promise.all(pending.splice(0));
   const polled = await worker.fetch(new Request(`https://worker.test/search/job?id=${initial.id}`), env, ctx);
   assert.equal(polled.status, 200);
   const job = (await polled.json()).job;
   while (pending.length) await Promise.all(pending.splice(0));
   assert.equal(job.status, "found");
-  assert.equal(job.shortestVerified, false, "provider archives are not an atomic complete snapshot");
+  assert.equal(job.shortestVerified, job.chain.path.length === 2, "only a verified direct win is an unconditional minimum");
   assert.equal(job.chain.hops.length, job.chain.path.length - 1);
   for (const [i, hop] of job.chain.hops.entries()) {
     assert.equal(hop.from, job.chain.path[i]);
@@ -400,7 +400,7 @@ test("health identifies the fresh-search release", async () => {
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-10-16-fresh-search-v2");
+  assert.equal(body.release, "2026-10-16-fresh-search-v3");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {
@@ -834,7 +834,7 @@ test("saved pair answers are absent from new jobs and fresh proofs find a shorte
   assert.equal(body.job.status, "queued");
   assert.equal(body.job.chain, null);
   assert.equal(body.job.refreshCached, false);
-  assert.equal(body.job.policyVersion, "fresh-search-v1");
+  assert.equal(body.job.policyVersion, "fresh-search-v2");
   const { job } = await freshEndpointRoute(kv, [["alpha", "omega", 12]], "fresh-saved-pair");
   assert.deepEqual(job.chain.path, ["alpha", "omega"]);
   assert.equal(job.chain.hops[0].url, "https://www.chess.com/game/live/12");

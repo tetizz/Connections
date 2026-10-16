@@ -1,3 +1,4 @@
+import {certificateAction, certificateScope, eligibleCertificateJob, startCertificateCollector, unpackCertificate, TwoHopWitness} from './two-hop-certificate.js';
 import {createPerformanceMetrics, requestDimensions} from './performance-metrics.js';
 import { bindVerifiedJobSubmission } from './verified-job-submit.js';
 
@@ -148,6 +149,10 @@ export class SearchJobObject {
   }
 
   async applyAction(action, body = {}) {
+    if (action === 'twohop-commit' || action === 'twohop-read') {
+      try { return {status:200, body:await certificateAction(this.state.storage, action, body)}; }
+      catch { return {status:200, body:{accepted:false}}; }
+    }
     if (action === "read") {
       return { status: 200, body: { job: await this.readJob() } };
     }
@@ -1342,6 +1347,98 @@ function shouldRunShorterBfs(job) {
   return Number.isFinite(savedSteps) && savedSteps > 2;
 }
 
+const INTERNAL_TWO_HOP = Symbol('job-owned-two-hop-input');
+
+function monthlyWinProofs(username, games, getMonthEdges = null) {
+  const proofs = new Map();
+  for (const game of games) {
+    if (!validSanitizedArchiveGame(game)) return null;
+    if (game.timeClass === 'daily') continue;
+    const opponent = game.white === username ? game.black : game.black === username ? game.white : '';
+    const winner = game.whiteResult === 'win' ? game.white : game.blackResult === 'win' ? game.black : '';
+    if (winner !== username) continue;
+    if (!opponent || cleanUsername(opponent) !== opponent || opponent === username) return null;
+    const matchingGame = directArchiveWinGame([game], username, opponent);
+    if (!matchingGame) return null;
+    const proof = {from:username,to:opponent,url:matchingGame.url,...proofDetailsFromGame(matchingGame,username,opponent)};
+    proofs.set(`${opponent}>${proof.url}`, proof);
+  }
+  const ordered = [];
+  for (const [opponent, urls] of (getMonthEdges ? getMonthEdges() : edgesFromGames(username, games)).beatenByMe) {
+    const proof = proofs.get(`${opponent}>${urls[0]}`);
+    if (!proof) return null;
+    ordered.push(proof);
+  }
+  return ordered;
+}
+
+async function twoHopRequest(env, job, action, payload, signal) {
+  if (signal?.aborted) throw abortSignalError(signal);
+  const input = {scope:certificateScope(job),token:job.processingToken,...payload};
+  let body;
+  try {
+    const local = env.__SEARCH_JOB_LOCAL;
+    if (local?.id === job.id && local.object) body = (await local.object.applyAction(action,input)).body;
+    else {
+      if (!env.SEARCH_JOBS) return {accepted:false};
+      // Await the exact request to settlement. A parent abort cannot detach a
+      // native certificate transaction; it is checked again after settlement.
+      const response = await env.SEARCH_JOBS.getByName(searchDurableName(job.id)).fetch(`https://search-job/${action}`, {
+        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input),
+      });
+      body = response.ok ? await response.json() : {accepted:false};
+    }
+  } catch { body = {accepted:false}; }
+  if (signal?.aborted) throw abortSignalError(signal);
+  return body || {accepted:false};
+}
+
+async function twoHopHooks(env, job, username, signal) {
+  if (!eligibleCertificateJob(job) || (!env.SEARCH_JOBS && env.__SEARCH_JOB_LOCAL?.id !== job.id)) return null;
+  if (username === job.start) {
+    const collector = startCertificateCollector(job,monthlyWinProofs,games=>games.every(validSanitizedArchiveGame));
+    return {begin:(list,selected)=>collector.begin(list,selected),month:row=>collector.month(row),finish:async()=>{
+      const pkg = await collector.finish();
+      if (pkg) {
+        const committed = await twoHopRequest(env,job,'twohop-commit',{package:pkg},signal);
+        if (committed.accepted) job.search.twoHopInputReady = true;
+      }
+    }};
+  }
+  if (username !== job.target || job.search.twoHopInputReady !== true) return null;
+  const result = await twoHopRequest(env,job,'twohop-read',{},signal);
+  if (!result.accepted) return null;
+  const certificate = await unpackCertificate(result.package);
+  if (!certificate) return null;
+  const list = await readArchiveList(env,job.start,{signal});
+  const selected = [...selectSharedArchives(list.archives,job.search.sinceMonth,Infinity)].reverse();
+  if (JSON.stringify(selected) !== JSON.stringify(certificate.manifest.selected)) return null;
+  const winners = new Map(certificate.proofs.map(proof=>[proof.to,proof]));
+  return {begin:()=>{},finish:async()=>{},month:row=>{
+    if (signal?.aborted) throw abortSignalError(signal);
+    const m = certificate.manifest;
+    if (Date.now() >= m.scope.createdAt + SEARCH_JOB_TTL_SECONDS*1000 ||
+        Date.now() >= m.indexTs + ARCHIVE_LIST_CACHE_TTL_SECONDS*1000 ||
+        new Date().toISOString().slice(0,7).replace('-', '/') !== m.month ||
+        m.months.some(item=>item.kind==='historical'&&item.expiresAt<=Date.now())) return;
+    // Full target coverage is unnecessary for an existential two-hop witness;
+    // complete observed start absence establishes the lower bound, not a frontier.
+    const targetProofs = new Map();
+    for (const game of row.games) {
+      if (!validSanitizedArchiveGame(game) || game.timeClass==='daily') continue;
+      const opponent = game.white===job.target ? game.black : game.black===job.target ? game.white : '';
+      if (!winners.has(opponent)) continue;
+      const proofs = monthlyWinProofs(opponent,[game]);
+      if (proofs?.[0]?.to===job.target) targetProofs.set(`${opponent}>${proofs[0].url}`,proofs[0]);
+    }
+    for (const [opponent,urls] of row.getMonthEdges().beatMe) {
+      const second = targetProofs.get(`${opponent}>${urls[0]}`), first = winners.get(opponent);
+      if (first && second && opponent!==job.start && opponent!==job.target) {
+        throw new TwoHopWitness({path:[job.start,opponent,job.target],hops:[first,second]});
+      }
+    }
+  }};
+}
 function createSearchEdgeReader(env, job, stats) {
   const archiveLimit = archiveLimitForRange(job.range);
   const sinceMonth = job.policyVersion === SEARCH_POLICY_VERSION ? job.search?.sinceMonth : null;
@@ -1381,8 +1478,13 @@ function createSearchEdgeReader(env, job, stats) {
             return { deferred: true, reason: "chunk-request-limit" };
           }
           freshRequestsThisChunk++;
+          const certificateHooks = await twoHopHooks(env,job,key,signal).catch(error=>{
+            if (signal?.aborted) throw error;
+            return null; // Certificate unavailability never blocks ordinary search.
+          });
           edges = await readOrFetchEdges(env, { username: key, archiveLimit, sinceMonth,
-            directTarget: key === job.start ? job.target : null, signal }, stats);
+            directTarget: key === job.start ? job.target : null, signal,
+            [INTERNAL_TWO_HOP]:certificateHooks }, stats);
         }
       }
       const outcome = {
@@ -1392,6 +1494,9 @@ function createSearchEdgeReader(env, job, stats) {
       return outcome;
     } catch (error) {
       if (signal?.aborted) throw error;
+      if (error instanceof TwoHopWitness && key === job.target) {
+        return {twoHopWitness:error.chain,edges:{beatenByMe:new Map(),beatMe:new Map()}};
+      }
       if (error instanceof DirectWinFound && key === job.start) {
         const game = error.game;
         const proof = { from: job.start, to: job.target, url: game.url,
@@ -1612,6 +1717,10 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
       processed++;
       const node = item.node;
       const edges = item.edges;
+      if (item.twoHopWitness && node === job.target) {
+        syncSearch();
+        return {status:'found',chain:item.twoHopWitness};
+      }
       if (item.directProof && node === job.start && item.directProof.to === job.target) {
         syncSearch();
         return { status: "found", chain: { path: [job.start, job.target], hops: [item.directProof] } };
@@ -2669,8 +2778,8 @@ async function readOrFetchEdges(env, parsed, stats = null) {
     try {
       if (stats) stats.requests++;
       await fetchGames({ ...parsed, collectGames: false,
-        onGames: games => {
-          const month = edgesFromGames(parsed.username, games);
+        onGames: (games, getMonthEdges) => {
+          const month = getMonthEdges();
           for (const direction of ['beatenByMe', 'beatMe']) {
             for (const [opponent, urls] of month[direction]) {
               if (!edges[direction].has(opponent) && urls[0]) edges[direction].set(opponent, [urls[0]]);
@@ -5064,6 +5173,7 @@ function searchStateShape(state, start, target) {
     stalledChunks: cleanNonNegativeNumber(state.stalledChunks, SEARCH_MAX_STALLED_CHUNKS) || 0,
     incomplete: Boolean(state.incomplete),
     sinceMonth: validSinceMonth(state.sinceMonth) ? state.sinceMonth : null,
+    ...(state.twoHopInputReady === true ? {twoHopInputReady:true} : {}),
     shortestVerified: Boolean(state.shortestVerified),
   };
 }
@@ -5473,7 +5583,7 @@ export class DirectWinFound extends Error {
     this.game = JSON.parse(JSON.stringify(game));
   }
 }
-function checkDirectArchiveWin(games, username, directTarget) {
+function directArchiveWinGame(games, username, directTarget) {
   if (!directTarget || cleanUsername(directTarget) !== directTarget || directTarget === username) return;
   const game = games.find(game => {
     const wins = (game.white === username && game.black === directTarget && game.whiteResult === 'win') ||
@@ -5481,10 +5591,25 @@ function checkDirectArchiveWin(games, username, directTarget) {
     const match = typeof game.url === 'string' && game.url.match(/^https:\/\/www\.chess\.com\/game\/live\/([1-9]\d*)$/i);
     return wins && game.timeClass !== 'daily' && match && Number.isSafeInteger(Number(match[1]));
   });
+  return game;
+}
+function checkDirectArchiveWin(games, username, directTarget) {
+  const game = directArchiveWinGame(games, username, directTarget);
   if (game) throw new DirectWinFound(game);
 }
-async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null }, env = null) {
+async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null, [INTERNAL_TWO_HOP]: certificateHooks = null }, env = null) {
   const checkAbort = () => { if (signal?.aborted) throw abortSignalError(signal); };
+  const optionalCertificateHook = async (name, ...args) => {
+    if (!certificateHooks) return;
+    try { await certificateHooks[name](...args); }
+    catch (error) {
+      checkAbort();
+      if (error instanceof TwoHopWitness) throw error;
+      // Optional evidence must never discard a successful ordinary traversal.
+      // Every hook is awaited before disabling it; no rejected task is detached.
+      certificateHooks = null;
+    }
+  };
   checkAbort();
   const list = await readArchiveList(env, username, { signal, metrics });
   checkAbort();
@@ -5492,6 +5617,7 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
   const selected = [...selectSharedArchives(list.archives, sinceMonth, archiveLimit)];
   const newestFirst = directScan || collectGames === false;
   if (newestFirst) selected.reverse();
+  if (certificateHooks) await optionalCertificateHook('begin',list,selected);
   let expiresAt = Math.min(list.ts + ARCHIVE_LIST_CACHE_TTL_SECONDS * 1000, Date.now() + TTL_SECONDS * 1000);
   // One awaited group at a time: no cache lookahead survives a direct win.
   // Duplicate URLs retain original per-occurrence reads and callback identity.
@@ -5528,7 +5654,9 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
         cached.expiresAt > Date.now() && Array.isArray(cached.games) && cached.games.every(validSanitizedArchiveGame)) {
       expiresAt = Math.min(expiresAt, cached.expiresAt);
       checkDirectArchiveWin(cached.games, username, directTarget);
-      onGames?.(cached.games);
+      let monthEdges; const getMonthEdges = () => monthEdges ??= edgesFromGames(username, cached.games);
+      if (certificateHooks) await optionalCertificateHook('month',{url,index,games:cached.games,getMonthEdges,expiresAt:cached.expiresAt,observedAt:Date.now(),source:'cache'});
+      onGames?.(cached.games, getMonthEdges);
       return collectGames === false ? [] : cached.games;
     }
     let providerTTL = 0;
@@ -5559,15 +5687,20 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     // Historical files remain refreshable under existing 7-day maximum; never
     // claim immutable history. Current/future month requires provider freshness.
     const ttl = archiveMonthFromUrl(url) < currentMonth ? TTL_SECONDS : providerTTL;
-    expiresAt = Math.min(expiresAt, Date.now() + ttl * 1000);
+    const observedExpiresAt = Date.now() + ttl * 1000;
+    expiresAt = Math.min(expiresAt, observedExpiresAt);
     if (env && ttl >= 60 && games.every(validSanitizedArchiveGame)) await env.GAMES_CACHE.put(key, JSON.stringify({
       schema: 1, url, expiresAt: Date.now() + ttl * 1000, games,
     }), { expirationTtl: Math.floor(ttl) }).catch(() => {});
     checkAbort();
     checkDirectArchiveWin(games, username, directTarget);
-    onGames?.(games);
+    let monthEdges; const getMonthEdges = () => monthEdges ??= edgesFromGames(username, games);
+    if (certificateHooks) await optionalCertificateHook('month',{url,index,games,getMonthEdges,expiresAt:observedExpiresAt,observedAt:Date.now(),source:'provider'});
+    onGames?.(games, getMonthEdges);
     return collectGames === false ? [] : games;
   }), ARCHIVE_CONCURRENCY);
+  checkAbort();
+  if (certificateHooks) await optionalCertificateHook('finish');
   checkAbort();
   // No aggregate is returned until EVERY selected month has completed.
   const coverage = { sinceMonth, expiresAt };
@@ -6399,6 +6532,7 @@ class UpstreamHTTPError extends Error {
 }
 
 export const __test = Object.freeze({
+  createSearchEdgeReader,
   DirectWinFound,
   checkDirectArchiveWin,
   readArchiveList,

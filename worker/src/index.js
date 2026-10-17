@@ -16,7 +16,7 @@ import { bindVerifiedJobSubmission } from './verified-job-submit.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-16-failure-outcomes-v5";
+const WORKER_RELEASE = "2026-10-17-partial-history-v6";
 const SEARCH_POLICY_VERSION = "fresh-search-v2";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
@@ -1348,6 +1348,7 @@ function shouldRunShorterBfs(job) {
 }
 
 const INTERNAL_TWO_HOP = Symbol('job-owned-two-hop-input');
+const INTERNAL_ALLOW_PARTIAL_HISTORY = Symbol('job-owned-partial-history');
 
 function monthlyWinProofs(username, games, getMonthEdges = null) {
   const proofs = new Map();
@@ -1447,6 +1448,8 @@ function createSearchEdgeReader(env, job, stats) {
   let freshRequestsThisChunk = 0;
   const read = async (username, signal = null) => {
     const key = username.toLowerCase();
+    let incomplete = false;
+    const markIncomplete = () => { incomplete = true; job.search.incomplete = true; };
     if (edgesCache.has(key)) return edgesCache.get(key);
     const cachedShorterCheck = Boolean(job.refreshCached && job.chain?.found);
     const routeWasJustVerified = cachedShorterCheck &&
@@ -1484,24 +1487,26 @@ function createSearchEdgeReader(env, job, stats) {
           });
           edges = await readOrFetchEdges(env, { username: key, archiveLimit, sinceMonth,
             directTarget: key === job.start ? job.target : null, signal,
-            [INTERNAL_TWO_HOP]:certificateHooks }, stats);
+            [INTERNAL_TWO_HOP]:certificateHooks,
+            [INTERNAL_ALLOW_PARTIAL_HISTORY]: job.policyVersion === SEARCH_POLICY_VERSION ? markIncomplete : null }, stats);
         }
       }
       const outcome = {
         edges: edges || { beatenByMe: new Map(), beatMe: new Map() },
+        incomplete,
       };
       edgesCache.set(key, outcome);
       return outcome;
     } catch (error) {
       if (signal?.aborted) throw error;
       if (error instanceof TwoHopWitness && key === job.target) {
-        return {twoHopWitness:error.chain,edges:{beatenByMe:new Map(),beatMe:new Map()}};
+        return {twoHopWitness:error.chain,incomplete,edges:{beatenByMe:new Map(),beatMe:new Map()}};
       }
       if (error instanceof DirectWinFound && key === job.start) {
         const game = error.game;
         const proof = { from: job.start, to: job.target, url: game.url,
           ...proofDetailsFromGame(game, job.start, job.target) };
-        return { directProof: proof, edges: edgesFromGames(key, [game]) };
+        return { directProof: proof, incomplete, edges: edgesFromGames(key, [game]) };
       }
       if (isMissingArchivesError(error)) {
         const outcome = { edges: { beatenByMe: new Map(), beatMe: new Map() } };
@@ -1708,6 +1713,7 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
 
     const deferred = [];
     for (const item of edgeBatch) {
+      if (item?.incomplete) search.incomplete = true;
       if (item?.deferred) {
         deferred.push(item);
         continue;
@@ -2777,7 +2783,12 @@ async function readOrFetchEdges(env, parsed, stats = null) {
     const edges = { beatenByMe: new Map(), beatMe: new Map() };
     try {
       if (stats) stats.requests++;
+      let incomplete = false;
       await fetchGames({ ...parsed, collectGames: false,
+        [INTERNAL_ALLOW_PARTIAL_HISTORY]: typeof parsed[INTERNAL_ALLOW_PARTIAL_HISTORY] === 'function' ? () => {
+          incomplete = true;
+          parsed[INTERNAL_ALLOW_PARTIAL_HISTORY]();
+        } : null,
         onGames: (games, getMonthEdges) => {
           const month = getMonthEdges();
           for (const direction of ['beatenByMe', 'beatMe']) {
@@ -2790,7 +2801,7 @@ async function readOrFetchEdges(env, parsed, stats = null) {
         onCoverage: coverage => { attachArchiveCoverage(edges, coverage); parsed.onCoverage?.(coverage); },
       }, env);
       if (stats) stats.fetched++;
-      await putEdgesCache(env.GAMES_CACHE, key, parsed, edges);
+      if (!incomplete) await putEdgesCache(env.GAMES_CACHE, key, parsed, edges);
       return edges;
     } catch (error) {
       if (isRateLimitError(error)) await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
@@ -5008,13 +5019,16 @@ function publicSearchJob(job) {
     range: shaped.range,
     status: shaped.status,
     outcome: shaped.outcome,
-    progress: shaped.progress,
+    progress: shaped.search?.incomplete
+      ? `${shaped.progress.slice(0, 135)} Some game history was not fully checked.`
+      : shaped.progress,
     error: shaped.error,
     ...(shaped.missingPlayer ? { missingPlayer: shaped.missingPlayer } : {}),
     stats: shaped.stats,
     chain: shaped.chain,
     players: shaped.players,
     shortestVerified: shaped.shortestVerified,
+    incomplete: Boolean(shaped.search?.incomplete),
     refreshCached: shaped.refreshCached,
     cachedAt: shaped.cachedAt,
     createdAt: shaped.createdAt,
@@ -5053,6 +5067,7 @@ function publicSearchJobShape(job) {
     chain: job.chain && typeof job.chain === "object" ? publicSearchJob({ ...job, start, target }).chain : null,
     players: job.players && typeof job.players === "object" ? job.players : {},
     shortestVerified: Boolean(job.shortestVerified || job.search?.shortestVerified),
+    incomplete: Boolean(job.incomplete || job.search?.incomplete),
     refreshCached: Boolean(job.refreshCached),
     cachedAt: Number.isFinite(job.cachedAt) ? job.cachedAt : null,
     createdAt: Number.isFinite(job.createdAt) ? job.createdAt : Date.now(),
@@ -5597,7 +5612,8 @@ function checkDirectArchiveWin(games, username, directTarget) {
   const game = directArchiveWinGame(games, username, directTarget);
   if (game) throw new DirectWinFound(game);
 }
-async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null, [INTERNAL_TWO_HOP]: certificateHooks = null }, env = null) {
+async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null, [INTERNAL_TWO_HOP]: certificateHooks = null, [INTERNAL_ALLOW_PARTIAL_HISTORY]: onIncomplete = null }, env = null) {
+  let incomplete = false;
   const checkAbort = () => { if (signal?.aborted) throw abortSignalError(signal); };
   const optionalCertificateHook = async (name, ...args) => {
     if (!certificateHooks) return;
@@ -5667,6 +5683,12 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     catch (error) {
       // Missing responses are never persisted as completed monthly coverage.
       if (isMissingMonthlyArchiveError(error)) {
+        if (sinceMonth !== null && typeof onIncomplete === 'function') {
+          incomplete = true;
+          expiresAt = 0;
+          onIncomplete();
+          return [];
+        }
         if (sinceMonth !== null) throw error;
         expiresAt = 0;
         return [];
@@ -5700,9 +5722,10 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     return collectGames === false ? [] : games;
   }), ARCHIVE_CONCURRENCY);
   checkAbort();
-  if (certificateHooks) await optionalCertificateHook('finish');
+  if (certificateHooks && !incomplete) await optionalCertificateHook('finish');
   checkAbort();
-  // No aggregate is returned until EVERY selected month has completed.
+  // Strict callers require every month; job-owned partial input has expiry0
+  // and cannot publish an aggregate or a complete absence certificate.
   const coverage = { sinceMonth, expiresAt };
   onCoverage?.(coverage);
   return attachArchiveCoverage((newestFirst ? rows.reverse() : rows).flat(), sinceMonth == null ? null : coverage);

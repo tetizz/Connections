@@ -3555,20 +3555,18 @@
         showedInstantChain = true;
         instantChainKey = chainKey(job.chain.path || []);
         await applyServerChain(job, analyticsBase, {
-          checking: false,
-          recordOutcome: "saved",
-          submit: true,
+          checking: true,
+          recordOutcome: null,
+          submit: false,
           isCurrent,
         });
         logLine("found a verified connection; checking for a shorter route");
-        showStatus("done",
-          `✓ found a verified connection — ${esc(start)} connects to ${esc(target)} in ` +
-          `${stepText((job.chain.path || []).length - 1)}. Checking for a shorter route in the background.`);
         btn.disabled = false;
         pollServerSearchJob(job.id, {
           analyticsBase,
           logLine,
           background: true,
+          initialChain: job.chain,
           isCurrent,
         })
           .then(async (finished) => {
@@ -3578,7 +3576,7 @@
             if (finished?.chain?.found) {
               const finalChainKey = chainKey(finished.chain.path || []);
               await applyServerChain(finished, analyticsBase, {
-                recordOutcome: finalChainKey === instantChainKey ? "saved" : "found",
+                recordOutcome: "found",
                 scroll: finalChainKey !== instantChainKey,
                 isCurrent,
               });
@@ -3679,11 +3677,13 @@
     analyticsBase = null,
     logLine = null,
     background = false,
+    initialChain = null,
     isCurrent = () => true,
   } = {}) {
     const remoteBase = workerBase();
     if (!remoteBase || !id) return null;
     let job = null;
+    let displayedChain = initialChain;
     let attempt = 0;
     let consecutiveFailures = 0;
     const pollStartedAt = Date.now();
@@ -3736,6 +3736,18 @@
       if (!background) showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
       if (TERMINAL_SEARCH_STATUSES.has(job.status)) return job;
+      const nextChain = job.chain;
+      if (job.id === id && nextChain?.found && Array.isArray(nextChain.path) &&
+          nextChain.path.length >= 2 && nextChain.path[0] === job.start &&
+          nextChain.path.at(-1) === job.target &&
+          (!displayedChain || nextChain.path.length < displayedChain.path.length ||
+            (chainKey(nextChain.path) === chainKey(displayedChain.path) &&
+              serverChainIdentity(nextChain) !== serverChainIdentity(displayedChain)))) {
+        const applied = await applyServerChain(job, analyticsBase, {
+          checking: true, recordOutcome: null, submit: false, scroll: false, isCurrent,
+        });
+        if (applied) displayedChain = nextChain;
+      }
       await wait(attempt < 5 ? 350 : Math.min(1500, 500 + attempt * 75));
       attempt++;
     }
@@ -3851,9 +3863,16 @@
   }
 
   function searchOptimalityNote(job) {
+    if (job?.incomplete && job?.shortestVerified !== true) {
+      return "Some game history was not fully checked. This route may not be the shortest.";
+    }
     return job?.shortestVerified === true
       ? "Shortest route verified for this search."
       : "Shortest route has not been verified.";
+  }
+  // Route/proof identity excludes changing counters and display metadata.
+  function serverChainIdentity(chain) {
+    return chain?.found ? JSON.stringify([chain.path || [], (chain.hops || []).map(hop => hop.url || "")]) : "";
   }
   async function applyServerChain(job, analyticsBase, options = {}) {
     const {
@@ -3865,6 +3884,8 @@
     } = options;
     if (!isCurrent()) return false;
     const chain = job.chain;
+    const reuseVisible = Boolean(state.currentChain?.found &&
+      serverChainIdentity(state.currentChain) === serverChainIdentity(chain));
     state.players = state.players || {};
     for (const [username, profile] of Object.entries(job.players || {})) {
       const key = username.toLowerCase();
@@ -3875,10 +3896,15 @@
       };
     }
     // Publish this already verified route before optional display enrichment.
-    const isDisplayed = () => isCurrent() && state.currentChain === chain;
+    // A same-proof terminal snapshot replaces provisional metadata without
+    // invalidating its still-running player enrichment. Superseded proofs cannot
+    // refresh the new display; callbacks always read the latest accepted object.
+    const isDisplayed = () => isCurrent() &&
+      serverChainIdentity(state.currentChain) === serverChainIdentity(chain);
     if (checking) {
       showStatus("working",
-        `Found a verified connection — checking for a shorter route.`);
+        `Found a verified connection — checking for a shorter route. ` +
+        searchOptimalityNote(job));
     } else {
       showStatus("done",
         `✓ found it — ` +
@@ -3887,19 +3913,21 @@
         (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ". " + searchOptimalityNote(job));
     }
     setActiveChip(job.target);
-    renderChain(chain);
+    if (!reuseVisible) renderChain(chain);
+    else state.currentChain = chain;
     const initialShareUrl = $("#copy-share")?.dataset.shareUrl;
+    if (reuseVisible) refreshVisibleChainMetadata(chain, initialShareUrl);
     // Keep the graph/card containers and their original finite animations alive.
-    void hydratePlayers(chain.path || [], {
+    if (!reuseVisible) void hydratePlayers(chain.path || [], {
       fetchJSON: (url) => fetch(url, { headers: { "Accept": "application/json" } }).then((res) => res.json()),
       API: "https://api.chess.com/pub/player/",
     }).then(() => {
-      if (isDisplayed()) refreshVisibleChainMetadata(chain, initialShareUrl);
+      if (isDisplayed()) refreshVisibleChainMetadata(state.currentChain, initialShareUrl);
     }).catch(() => {
       // Optional metadata failure must not retract verified public game proof.
     });
     if (submit) submitLeaderboardChain(job.start, job.target, chain, job.range || analyticsBase?.range || "auto", job.id);
-    recordSearchEvent(recordOutcome, {
+    if (recordOutcome !== null) recordSearchEvent(recordOutcome, {
       ...analyticsBase,
       jobId: job.id,
       length: chain.length,
@@ -3912,7 +3940,7 @@
       cached: job.stats?.cached,
       quality: qualityFromChain(chain),
     });
-    if (scroll) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+    if (scroll && !reuseVisible) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
     return true;
   }
 
@@ -3949,6 +3977,8 @@
     const cards = $("#cards")?.querySelectorAll('.card') || [];
     (chain.hops || []).forEach((hop,index) => {
       const card = cards[index];if (!card) return;
+      const details = card.querySelector('.card__sub');
+      if (details) details.textContent = proofDetails(hop, index, chain.hops.length).join(" · ");
       const winner = card.querySelector('.winner'), loser = card.querySelector('.loser');
       if (winner) winner.textContent = nameOf(hop.from);
       if (loser) loser.textContent = nameOf(hop.to);

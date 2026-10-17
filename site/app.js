@@ -1,6 +1,6 @@
 /* ============================================================
    Chess Connections — app.js
-   - Loads a precomputed showcase (data/chains.json)
+   - Searches each requested pair using verified game histories
    - Lets the visitor enter their own username + target and runs
      the BFS search live in the browser (engine.js)
    - Saves the username in localStorage for next visit
@@ -10,13 +10,17 @@
 (() => {
   "use strict";
 
+  // Element-scoped failed URLs suppress only redundant final-batch retries.
+  const failedAvatarURLs = new WeakMap();
+
   const SVG_NS = "http://www.w3.org/2000/svg";
   const DATA_BASE = new URL("./data/", document.baseURI).href;
   const LS_KEY = "chess-connections:username";
   const LS_THEME_KEY = "chess-connections:theme";
   const LS_RANGE_KEY = "chess-connections:range";
   const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
-  const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v1";
+  const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v3:full-history-search";
+  const SEARCH_POLICY_VERSION = "fresh-search-v2";
   const CHAIN_PARAM = "chain";
   const SHORT_CHAIN_PARAM = "c";
   const LEGACY_SHARE_PARAM = "share";
@@ -62,7 +66,7 @@
   ];
 
   const state = {
-    chains: null,
+    chains: { chains: [] },
     players: null,
     activeTarget: null,
     currentChain: null,
@@ -233,6 +237,10 @@
         error.retryAfterMs = retryAfterMs(response);
         error.retryable = response.status === 408 || response.status === 425 ||
           response.status === 429 || response.status >= 500;
+        if (response.status === 429 && options.stopOnRateLimit) {
+          error.retryable = false;
+          error.retryAfterMs = Math.max(error.retryAfterMs,Math.min(300000,Math.max(0,Number(data?.retryAfter || 0)*1000)));
+        }
         throw error;
       } catch (error) {
         const normalized = error?.name === "AbortError"
@@ -254,30 +262,15 @@
   }
 
   // ---------- data load ----------
-  async function loadShowcase() {
+  async function loadPlayerMetadata() {
+    state.chains = { chains: [] };
     try {
-      const [chainsRes, playersRes] = await Promise.all([
-        fetch(DATA_BASE + "chains.json"),
-        fetch(DATA_BASE + "players.json"),
-      ]);
-      if (!chainsRes.ok) throw new Error("chains.json " + chainsRes.status);
-      state.chains = await chainsRes.json();
-      state.players = playersRes.ok ? await playersRes.json() : {};
-    } catch (e) {
-      console.error(e);
-      $("#graph-hint").textContent =
-        "no example loaded yet — try the search above to see your own connection";
-      return;
+      const response = await fetch(DATA_BASE + "players.json");
+      state.players = response.ok ? await response.json() : {};
+    } catch {
+      state.players = {};
     }
-    renderShowcaseTabs();
-    // show an example chain so the page isn't blank on first visit
-    const first =
-      state.chains.chains.find((c) => c.found && c.target === DEFAULT_TARGET) ||
-      state.chains.chains.find((c) => c.found) ||
-      state.chains.chains[0];
-    if (first) selectTarget(first.target);
   }
-
   function renderShowcaseTabs() {
     // we keep a lightweight showcase selector below the search for quick swaps
     // (built dynamically only if showcase chains exist)
@@ -1404,6 +1397,7 @@
     target,
     chain,
     range = $("#search-range")?.value || "auto",
+    serverSearchId = undefined,
   ) {
     if (!window.Leaderboard || !chain?.found || !Array.isArray(chain.path)) return;
     if (isBlockedUsername(start) || isBlockedUsername(target) || pathHasBlockedUser(chain.path)) return;
@@ -1414,6 +1408,7 @@
       chain.path,
       chain.hops || [],
       range,
+      serverSearchId,
     )
       .then(() => window.Leaderboard && window.Leaderboard.load());
   }
@@ -2032,8 +2027,8 @@
     }
     if (!chain.found || !Array.isArray(chain.path) || !chain.path.length) {
       const target = chain.display || chain.target || "that player";
-      summary.textContent = `No verified connection to ${target} is available for this search.`;
-      svg.setAttribute("aria-label", `No verified connection to ${target}`);
+      summary.textContent = chain.pending ? `Searching for a verified connection to ${target}.` : `No verified connection to ${target} is available for this search.`;
+      svg.setAttribute("aria-label", chain.pending ? `Searching for a connection to ${target}` : `No verified connection to ${target}`);
       return;
     }
     const route = chain.path.map((username) => nameOf(username)).join(" then ");
@@ -2083,10 +2078,10 @@
         x: viewWidth / 2, y: 180, "text-anchor": "middle",
         fill: "#63685f", "font-size": compactGraph ? "14" : "18", "font-family": "ui-sans-serif, system-ui, sans-serif",
       });
-      t.textContent = `couldn't find a connection to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} steps.`;
+      t.textContent = chain.pending ? `searching for a connection to ${chain.display || chain.target}...` : `couldn't find a connection to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} steps.`;
       svg.appendChild(t);
       $("#graph-hint").textContent =
-        "try a different target, or pick someone who plays a lot of games.";
+        chain.pending ? "Checking public game connections." : "try a different target, or pick someone who plays a lot of games.";
       return;
     }
 
@@ -2153,6 +2148,7 @@
           "clip-path": "url(#clip)", preserveAspectRatio: "xMidYMid slice",
         });
         img.addEventListener("error", () => {
+          if (img.parentNode === g) failedAvatarURLs.set(g, av);
           img.remove();
         });
         img.addEventListener("load", () => fallback.remove(), { once: true });
@@ -2955,12 +2951,14 @@
       img.dataset.profileTrigger = "";
       img.referrerPolicy = "no-referrer";
       img.addEventListener("error", () => {
+        if (!img.parentNode) return;
         const fb = document.createElement("div");
         fb.className = "card__avatar-fallback";
         fb.textContent = (nameOf(username)[0] || "?").toUpperCase();
         fb.dataset.profileUser = username.toLowerCase();
         fb.dataset.profileTrigger = "";
         fb.tabIndex = 0;
+        failedAvatarURLs.set(fb, av);
         img.replaceWith(fb);
       });
       return img;
@@ -3151,6 +3149,7 @@
     if (!key) return null;
     const existing = state.players?.[key];
     if (existing?.profileComplete) return existing;
+    if (Number(existing?.profileRetryAt || 0) > Date.now()) return existing;
     if (state.profilePromises.has(key)) return state.profilePromises.get(key);
 
     const promise = (async () => {
@@ -3161,10 +3160,22 @@
           const { data } = await fetchJsonWithRetry(
             `${remoteBase}/profile?username=${encodeURIComponent(key)}`,
             { headers: { "Accept": "application/json" } },
-            { attempts: 2, timeoutMs: 7000 }
+            { attempts: 2, timeoutMs: 7000, stopOnRateLimit: true }
           );
           profile = data?.profile || null;
-        } catch {
+          if (profile && data?.stale) profile = {...profile,enrichment:{
+            stats:profile.enrichment?.stats === "unavailable" ? "unavailable" : "stale",
+            recentGames:profile.enrichment?.recentGames === "unavailable" ? "unavailable" : "stale",
+            retryAfterSeconds:Math.max(60,Number(data.retryAfter || 60)),
+          }};
+        } catch (error) {
+          if (error?.status === 429) {
+            state.players = state.players || {};
+            state.players[key] = {...(existing || {username:key}),profileComplete:false,
+              profilePartial:true,enrichment:existing?.enrichment || {stats:"unavailable",recentGames:"unavailable"},
+              profileRetryAt:Date.now()+Math.max(60000,Number(error.retryAfterMs || 0))};
+            return state.players[key];
+          }
           // fall through to Chess.com direct lookup
         }
       }
@@ -3187,7 +3198,10 @@
         ...(state.players[key] || {}),
         ...shaped,
         profileExists: true,
-        profileComplete: true,
+        profileComplete: !profile.enrichment || (profile.enrichment.stats === "fresh" && profile.enrichment.recentGames === "fresh"),
+        profilePartial: !!profile.enrichment && (profile.enrichment.stats !== "fresh" || profile.enrichment.recentGames !== "fresh"),
+        profileRetryAt: profile.enrichment && (profile.enrichment.stats !== "fresh" || profile.enrichment.recentGames !== "fresh")
+          ? Date.now() + Math.max(60000, Number(profile.enrichment.retryAfterSeconds || 60)*1000) : 0,
       };
       refreshGraphProfileNodes(key);
       return state.players[key];
@@ -3234,9 +3248,18 @@
           "clip-path": "url(#clip)",
           preserveAspectRatio: "xMidYMid slice",
         });
-        img.addEventListener("error", () => img.remove());
         const icon = node.querySelector(".node__icon");
-        if (icon) icon.replaceWith(img);
+        img.addEventListener("load", () => {
+          // A late image must not remove a different fallback or replacement node.
+          if (icon && img.parentNode === node && icon.parentNode === node &&
+              node.querySelector(".node__icon") === icon) icon.remove();
+        }, { once: true });
+        const avatarURL = profile.avatar;
+        img.addEventListener("error", () => {
+          if (img.parentNode === node) failedAvatarURLs.set(node, avatarURL);
+          img.remove();
+        }, { once: true });
+        if (icon?.parentNode === node) node.insertBefore(img, icon.nextSibling);
         else node.appendChild(img);
       }
       node.classList.add("is-profile-loaded");
@@ -3267,8 +3290,10 @@
       ? `<span class="profile-popover__status${String(profile.status).toLowerCase() === "premium" ? " is-premium" : ""}">${esc(profileStatusLabel(profile.status))}</span>`
       : "";
     const url = profile?.url || `https://www.chess.com/member/${encodeURIComponent(handle)}`;
-    const stats = renderProfileStats(profile?.stats);
+    const stats = renderProfileStats(profile?.stats, profile?.enrichment?.stats === "unavailable");
     const recentGames = renderProfileRecentGames(profile?.recentGames);
+    const partialNotice = profile?.profilePartial
+      ? `<p class="profile-popover__loading" role="status">Some player details could not refresh. ${profile.enrichment?.stats === "stale" || profile.enrichment?.recentGames === "stale" ? "Showing previously saved details." : "Ratings or recent games are temporarily unavailable."} Try again shortly.</p>` : "";
 
     pop.innerHTML = `
       <button class="profile-popover__close" type="button" data-profile-close aria-label="Close player details">Close</button>
@@ -3280,6 +3305,7 @@
         </span>
       </div>
       <div class="profile-popover__meta">${country}${followers}${joined}${online}${location}${fide}${status}</div>
+      ${partialNotice}
       ${stats}
       ${recentGames}
       <a class="profile-popover__open" href="${esc(url)}" target="_blank" rel="noopener">Open Chess.com profile</a>
@@ -3346,7 +3372,7 @@
       .replace(/\b\w/g, (char) => char.toUpperCase());
   }
 
-  function renderProfileStats(stats) {
+  function renderProfileStats(stats, unavailable = false) {
     const modes = [
       ["rapid", "Rapid"],
       ["blitz", "Blitz"],
@@ -3355,7 +3381,7 @@
     const cells = modes.map(([key, label]) => {
       const stat = stats?.[key];
       if (!stat?.rating) {
-        return `<div class="profile-stat"><span>${label}</span><strong>--</strong><small>No rating</small></div>`;
+        return `<div class="profile-stat"><span>${label}</span><strong>--</strong><small>${unavailable ? "Unavailable" : "No rating"}</small></div>`;
       }
       const games = Number.isFinite(stat.games) ? `${plainNumber(stat.games)} games` : "rated";
       const best = Number.isFinite(stat.best) ? `best ${plainNumber(stat.best)}` : games;
@@ -3420,38 +3446,6 @@
       status.className = "search__status is-working";
       logEl.hidden = false;
       logEl.innerHTML = "";
-      showStatus("working", "checking both Chess.com usernames...");
-      const validation = await validateSearchPlayers(start, target);
-      if (!isCurrent()) return true;
-      if (!validation.valid) {
-        if (knownChain?.found) {
-          logLine(`profile lookup could not refresh ${validation.missing}; keeping the saved proof visible`);
-          showStatus("done",
-            `✓ showing the saved verified route — Chess.com no longer returned the ` +
-            `${esc(validation.missing)} profile, but the proof games remain available.`);
-          return true;
-        }
-        showStatus("error",
-          `couldn't find “${esc(validation.missing)}” on Chess.com. ` +
-          "Check the spelling or paste the member profile link.");
-        renderChain({
-          target,
-          display: target,
-          found: false,
-          length: null,
-          path: [],
-          hops: [],
-        });
-        recordSearchEvent("not_found", {
-          ...analyticsBase,
-          error: `player not found: ${validation.missing}`,
-        });
-        return true;
-      }
-      if (validation.uncertain) {
-        logLine("Chess.com profile lookup was slow; the search service will verify the handles");
-      }
-
       showStatus("working", "starting server search...");
       logLine(`queued ${start} -> ${target} (${mode.label})`);
 
@@ -3468,13 +3462,14 @@
             knownChain,
           }),
         },
-        { attempts: 3, timeoutMs: 12000 }
+        { attempts: 3, timeoutMs: 12000, stopOnRateLimit: true }
       );
       if (!isCurrent()) return true;
       const job = data?.job;
-      if (!job?.id) throw new Error("job start failed");
+      if (job?.policyVersion !== SEARCH_POLICY_VERSION) throw Object.assign(new Error("Start a new fresh search."), { code: "SEARCH_POLICY_EXPIRED" });
+      if (!job?.id) throw Object.assign(new Error("job start failed"), { code: "SEARCH_PROTOCOL_ERROR" });
       activeJob = job;
-      saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId });
+      saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId, policyVersion: job.policyVersion });
       renderSearchQueue(job);
       if (knownChain?.found) {
         let displayedChain = knownChain;
@@ -3517,7 +3512,7 @@
           return true;
         }
 
-        logLine("loaded saved verified route instantly; checking for a shorter route");
+        logLine("found a verified route; checking for a shorter route");
         showSavedRoute("Checking for a shorter route in the background.");
         btn.disabled = false;
         pollServerSearchJob(job.id, {
@@ -3560,20 +3555,18 @@
         showedInstantChain = true;
         instantChainKey = chainKey(job.chain.path || []);
         await applyServerChain(job, analyticsBase, {
-          checking: false,
-          recordOutcome: "saved",
-          submit: true,
+          checking: true,
+          recordOutcome: null,
+          submit: false,
           isCurrent,
         });
-        logLine("loaded saved connection instantly; checking for a shorter route");
-        showStatus("done",
-          `✓ loaded saved connection — ${esc(start)} connects to ${esc(target)} in ` +
-          `${stepText((job.chain.path || []).length - 1)}. Checking for a shorter route in the background.`);
+        logLine("found a verified connection; checking for a shorter route");
         btn.disabled = false;
         pollServerSearchJob(job.id, {
           analyticsBase,
           logLine,
           background: true,
+          initialChain: job.chain,
           isCurrent,
         })
           .then(async (finished) => {
@@ -3583,7 +3576,7 @@
             if (finished?.chain?.found) {
               const finalChainKey = chainKey(finished.chain.path || []);
               await applyServerChain(finished, analyticsBase, {
-                recordOutcome: finalChainKey === instantChainKey ? "saved" : "found",
+                recordOutcome: "found",
                 scroll: finalChainKey !== instantChainKey,
                 isCurrent,
               });
@@ -3616,7 +3609,10 @@
           (finished?.status === "timeout" ? "timeout" :
             finished?.status === "not_found" ? "not_found" : "error");
         const outcome = ["timeout", "not_found"].includes(rawOutcome) ? rawOutcome : "error";
-        showStatus("error", finished?.progress ||
+        const missing = cleanUsernameInput(finished?.missingPlayer);
+        showStatus("error", missing
+          ? `couldn't find “${esc(missing)}” on Chess.com. Check the spelling or paste the member profile link.`
+          : finished?.progress ||
           (finished?.status === "expired"
             ? "This saved search expired. Start it again to get a fresh result."
             : "no connection found in this search."));
@@ -3643,6 +3639,11 @@
       if (error?.code === "SEARCH_SUPERSEDED") return true;
       if (!isCurrent()) return true;
       logLine(`server search unavailable: ${error.message}`);
+      if (error?.status === 410 || error?.code === "SEARCH_POLICY_EXPIRED") {
+        clearActiveJob(activeJob?.id || "");
+        showStatus("error", "This search has expired. Start a new search.");
+        return true;
+      }
       if (activeJob?.id) {
         if (knownChain?.found) {
           showStatus("done",
@@ -3655,6 +3656,17 @@
           "Reload this page to resume the same search instead of starting over.");
         return true;
       }
+      const unavailable = error?.code !== "SEARCH_PROTOCOL_ERROR" &&
+        (error?.status == null || [404, 405, 502, 503, 504].includes(error.status));
+      if (!unavailable) {
+        showStatus("error", error?.status === 429
+          ? "The search service is cooling down. Try again after its rate limit clears."
+          : "The search service could not accept this search. Try again later.");
+        recordSearchEvent("error", { ...analyticsBase, error: error.message });
+        return true;
+      }
+      // Only an unavailable Worker falls through to the existing legacy
+      // engine, whose own profile lookup runs with newly created controllers.
       return false;
     } finally {
       if (isCurrent()) btn.disabled = false;
@@ -3665,11 +3677,13 @@
     analyticsBase = null,
     logLine = null,
     background = false,
+    initialChain = null,
     isCurrent = () => true,
   } = {}) {
     const remoteBase = workerBase();
     if (!remoteBase || !id) return null;
     let job = null;
+    let displayedChain = initialChain;
     let attempt = 0;
     let consecutiveFailures = 0;
     const pollStartedAt = Date.now();
@@ -3713,11 +3727,27 @@
         continue;
       }
 
+      if (data?.job?.policyVersion !== SEARCH_POLICY_VERSION) {
+        clearActiveJob(id);
+        throw Object.assign(new Error("This search belongs to an older policy. Start a new search."), { code: "SEARCH_POLICY_EXPIRED" });
+      }
       job = mergeSearchJobSnapshot(data?.job);
       if (!job) throw new Error("job missing");
       if (!background) showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
       if (TERMINAL_SEARCH_STATUSES.has(job.status)) return job;
+      const nextChain = job.chain;
+      if (job.id === id && nextChain?.found && Array.isArray(nextChain.path) &&
+          nextChain.path.length >= 2 && nextChain.path[0] === job.start &&
+          nextChain.path.at(-1) === job.target &&
+          (!displayedChain || nextChain.path.length < displayedChain.path.length ||
+            (chainKey(nextChain.path) === chainKey(displayedChain.path) &&
+              serverChainIdentity(nextChain) !== serverChainIdentity(displayedChain)))) {
+        const applied = await applyServerChain(job, analyticsBase, {
+          checking: true, recordOutcome: null, submit: false, scroll: false, isCurrent,
+        });
+        if (applied) displayedChain = nextChain;
+      }
       await wait(attempt < 5 ? 350 : Math.min(1500, 500 + attempt * 75));
       attempt++;
     }
@@ -3832,6 +3862,18 @@
     return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
   }
 
+  function searchOptimalityNote(job) {
+    if (job?.incomplete && job?.shortestVerified !== true) {
+      return "Some game history was not fully checked. This route may not be the shortest.";
+    }
+    return job?.shortestVerified === true
+      ? "Shortest route verified for this search."
+      : "Shortest route has not been verified.";
+  }
+  // Route/proof identity excludes changing counters and display metadata.
+  function serverChainIdentity(chain) {
+    return chain?.found ? JSON.stringify([chain.path || [], (chain.hops || []).map(hop => hop.url || "")]) : "";
+  }
   async function applyServerChain(job, analyticsBase, options = {}) {
     const {
       checking = false,
@@ -3842,6 +3884,8 @@
     } = options;
     if (!isCurrent()) return false;
     const chain = job.chain;
+    const reuseVisible = Boolean(state.currentChain?.found &&
+      serverChainIdentity(state.currentChain) === serverChainIdentity(chain));
     state.players = state.players || {};
     for (const [username, profile] of Object.entries(job.players || {})) {
       const key = username.toLowerCase();
@@ -3851,25 +3895,39 @@
         profileComplete: Boolean(profile?.stats),
       };
     }
-    await hydratePlayers(chain.path || [], {
-      fetchJSON: (url) => fetch(url, { headers: { "Accept": "application/json" } }).then((res) => res.json()),
-      API: "https://api.chess.com/pub/player/",
-    });
-    if (!isCurrent()) return false;
+    // Publish this already verified route before optional display enrichment.
+    // A same-proof terminal snapshot replaces provisional metadata without
+    // invalidating its still-running player enrichment. Superseded proofs cannot
+    // refresh the new display; callbacks always read the latest accepted object.
+    const isDisplayed = () => isCurrent() &&
+      serverChainIdentity(state.currentChain) === serverChainIdentity(chain);
     if (checking) {
       showStatus("working",
-        `loaded saved connection instantly — checking for a shorter route.`);
+        `Found a verified connection — checking for a shorter route. ` +
+        searchOptimalityNote(job));
     } else {
       showStatus("done",
-        `${job.progress && /saved connection/i.test(job.progress) ? "✓" : "✓ found it"} — ` +
+        `✓ found it — ` +
         `${esc(job.start)} connects to ${esc(job.target)} in ${stepText((chain.path || []).length - 1)}. ` +
         `checked ${Number(job.stats?.expanded || 0)} players, made ${Number(job.stats?.requests || 0)} requests` +
-        (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ".");
+        (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ". " + searchOptimalityNote(job));
     }
     setActiveChip(job.target);
-    renderChain(chain);
-    if (submit) submitLeaderboardChain(job.start, job.target, chain, job.range || analyticsBase?.range || "auto");
-    recordSearchEvent(recordOutcome, {
+    if (!reuseVisible) renderChain(chain);
+    else state.currentChain = chain;
+    const initialShareUrl = $("#copy-share")?.dataset.shareUrl;
+    if (reuseVisible) refreshVisibleChainMetadata(chain, initialShareUrl);
+    // Keep the graph/card containers and their original finite animations alive.
+    if (!reuseVisible) void hydratePlayers(chain.path || [], {
+      fetchJSON: (url) => fetch(url, { headers: { "Accept": "application/json" } }).then((res) => res.json()),
+      API: "https://api.chess.com/pub/player/",
+    }).then(() => {
+      if (isDisplayed()) refreshVisibleChainMetadata(state.currentChain, initialShareUrl);
+    }).catch(() => {
+      // Optional metadata failure must not retract verified public game proof.
+    });
+    if (submit) submitLeaderboardChain(job.start, job.target, chain, job.range || analyticsBase?.range || "auto", job.id);
+    if (recordOutcome !== null) recordSearchEvent(recordOutcome, {
       ...analyticsBase,
       jobId: job.id,
       length: chain.length,
@@ -3882,13 +3940,65 @@
       cached: job.stats?.cached,
       quality: qualityFromChain(chain),
     });
-    if (scroll) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+    if (scroll && !reuseVisible) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
     return true;
   }
 
+  function refreshVisibleChainMetadata(chain, initialShareUrl) {
+    if (state.currentChain !== chain || chain.tree || !chain.found) return;
+    const path = chain.path || [];
+    const shareButton = $("#copy-share");
+    if (initialShareUrl && shareButton?.dataset.shareUrl === initialShareUrl) {
+      shareButton.dataset.shareUrl = buildLongShareUrl(chain);
+    }
+    updateGraphSummary(chain);
+    const svg = $("#graph");
+    if (svg) svg.querySelectorAll('.node[data-profile-user]').forEach((node) => {
+      const username = node.dataset.profileUser;
+      if (!path.includes(username)) return;
+      // Existing avatars keep their placement/profile animation state.
+      if (state.players?.[username]?.avatar && !node.querySelector('.node__img') &&
+          failedAvatarURLs.get(node) !== state.players[username].avatar) {
+        refreshGraphProfileNodes(username);
+      }
+      const isStart = node.classList.contains("is-start"), isTarget = node.classList.contains("is-target");
+      const title = titleOf(username);
+      const label = node.querySelector('.node__label');
+      if (label) label.textContent = compactGraphLabel(nameOf(username), path.length > 7 ? 11 : 15);
+      const meta = title ? [title, isTarget ? "TARGET" : ""] : [isTarget ? "TARGET" : isStart ? "YOU" : ""];
+      node.setAttribute('aria-label', [nameOf(username), ...meta, "profile"].filter(Boolean).join(' '));
+      let tag = node.querySelector('.node__title');
+      const titleText = title ? title + (isTarget ? ' · TARGET' : '') : isTarget ? 'TARGET' : isStart ? 'YOU' : '';
+      if (titleText) {
+        if (!tag) { tag = el('text', {class:'node__title',x:0,y:76});node.appendChild(tag); }
+        tag.textContent = titleText;
+      } else tag?.remove();
+    });
+    const cards = $("#cards")?.querySelectorAll('.card') || [];
+    (chain.hops || []).forEach((hop,index) => {
+      const card = cards[index];if (!card) return;
+      const details = card.querySelector('.card__sub');
+      if (details) details.textContent = proofDetails(hop, index, chain.hops.length).join(" · ");
+      const winner = card.querySelector('.winner'), loser = card.querySelector('.loser');
+      if (winner) winner.textContent = nameOf(hop.from);
+      if (loser) loser.textContent = nameOf(hop.to);
+      const avatars = card.querySelectorAll('.card__avatars [data-profile-user]');
+      [hop.from,hop.to].forEach((username,i) => {
+        const current = avatars[i];if (!current) return;
+        const avatar = avatarOf(username);
+        if (current.tagName === 'IMG' && avatar && current.getAttribute('src') === avatar) {
+          current.alt = nameOf(username);
+          current.classList.toggle('is-titled', Boolean(titleOf(username)));
+        } else if (current.classList.contains('card__avatar-fallback') &&
+            (!avatar || failedAvatarURLs.get(current) === avatar)) {
+          current.textContent = (nameOf(username)[0] || '?').toUpperCase();
+        } else current.replaceWith(avatarEl(username));
+      });
+    });
+  }
   function saveActiveJob(job) {
     try {
-      localStorage.setItem(LS_ACTIVE_JOB_KEY, JSON.stringify({ ...job, ts: Date.now() }));
+      localStorage.setItem(LS_ACTIVE_JOB_KEY, JSON.stringify({ ...job, policyVersion: SEARCH_POLICY_VERSION, ts: Date.now() }));
     } catch {
       // Non-critical.
     }
@@ -3911,7 +4021,7 @@
     } catch {
       clearActiveJob();
     }
-    if (!record?.id || Date.now() - Number(record.ts || 0) > 2 * 60 * 60 * 1000) {
+    if (!record?.id || record.policyVersion !== SEARCH_POLICY_VERSION || Date.now() - Number(record.ts || 0) > 2 * 60 * 60 * 1000) {
       clearActiveJob();
       return;
     }
@@ -3970,6 +4080,11 @@
       }
     } catch (error) {
       if (!ownsResume()) return;
+      if (error?.status === 410 || error?.code === "SEARCH_POLICY_EXPIRED") {
+        clearActiveJob(record.id);
+        showStatus("error", "This search has expired. Start a new search.");
+        return;
+      }
       saveActiveJob(record);
       if (!ownsResume()) return;
       showStatus("error",
@@ -4031,44 +4146,10 @@
     localStorage.setItem(LS_RANGE_KEY, range);
     $("#setting-username").value = start;
 
-    const savedChain = precomputedChain(start, target);
-    if (savedChain) {
-      showStatus("done",
-        `showing a saved verified route to ${savedChain.display || target} while checking for a shorter route.`);
-      const renderedChain = {
-        target: savedChain.target,
-        display: savedChain.display || nameOf(savedChain.target),
-        found: savedChain.found,
-        length: savedChain.length,
-        path: savedChain.path,
-        hops: savedChain.hops,
-      };
-      renderChain(renderedChain);
-      setActiveChip(target);
-      submitLeaderboardChain(start, target, renderedChain);
-      recordSearchEvent("saved", {
-        ...analyticsBase,
-        length: renderedChain.length,
-        steps: Math.max(0, renderedChain.path.length - 1),
-        path: renderedChain.path,
-        durationMs: performance.now() - searchStartedAt,
-      });
-      document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
-      const handledByServer = await runServerSearchFlow({
-        start,
-        target,
-        range,
-        analyticsBase,
-        mode,
-        btn,
-        status,
-        logEl,
-        knownChain: renderedChain,
-      });
-      if (handledByServer) return;
-      return;
-    }
-
+    clearActiveJob();
+    state.chains = { chains: [] };
+    renderChain({ target, display: nameOf(target), found: false, pending: true, length: null, path: [], hops: [] });
+    showStatus("working", "starting fresh search...");
     const handledByServer = await runServerSearchFlow({
       start,
       target,
@@ -4346,7 +4427,10 @@
       fide: p.fide,
       stats: p.stats,
       recentGames: Array.isArray(p.recentGames) ? p.recentGames : [],
-      profileComplete: Boolean(p.profileComplete || p.stats),
+      enrichment: p.enrichment,
+      profilePartial: p.profilePartial,
+      profileRetryAt: p.profileRetryAt,
+      profileComplete: !p.profilePartial && (!p.enrichment || (p.enrichment.stats === "fresh" && p.enrichment.recentGames === "fresh")) && Boolean(p.profileComplete || p.stats),
     };
   }
 
@@ -4700,10 +4784,10 @@
     localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
     $("#search-range").value = "auto";
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
-    const scheduleCacheWarm = () => warmSharedCaches();
-    if (typeof requestIdleCallback === "function") requestIdleCallback(scheduleCacheWarm, { timeout: 3000 });
-    else setTimeout(scheduleCacheWarm, 1200);
-    loadShowcase().then(async () => {
+    // Automatic search now traverses full histories under the current policy.
+    localStorage.removeItem("chess-connections:active-search-job:v1");
+    localStorage.removeItem("chess-connections:active-search-job:v2:fresh-search");
+    loadPlayerMetadata().then(async () => {
       const sharedLoaded = await loadSharedChainFromUrl();
       loadLeaderboardTargetsWhenVisible();
       if (!sharedLoaded) resumeActiveSearchJob();

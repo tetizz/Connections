@@ -8,7 +8,7 @@
 
 window.Leaderboard = (() => {
   const WORKER_URL = String(
-    window.CONNECTIONS_CACHE_API || "https://connections-cache.tetizz.workers.dev"
+    window.CONNECTIONS_CACHE_API || "https://tetizz-connections-api.pages.dev"
   ).replace(/\/+$/, "");
   const BLOCKED_USERNAMES = new Set([String.fromCharCode(108, 111, 117, 105, 115, 95, 102, 108, 111, 121, 100)]);
   let activeCategory = "connectors";
@@ -16,13 +16,13 @@ window.Leaderboard = (() => {
   let initialLoadObserver = null;
 
   /** Auto-submit a found chain. Fire-and-forget; never blocks the UI. */
-  async function submit(start, target, length, path, hops = [], range = "auto") {
+  async function submit(start, target, length, path, hops = [], range = "auto", serverSearchId = undefined) {
     try {
       await fetch(WORKER_URL + "/submit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         keepalive: true,
-        body: JSON.stringify({ start, target, length, path, hops, range }),
+        body: JSON.stringify({ start, target, length, path, hops, range, ...(serverSearchId ? { serverSearchId } : {}) }),
       });
     } catch (e) {
       // worker not deployed yet, or offline — fail silently

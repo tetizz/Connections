@@ -400,7 +400,7 @@ test("health identifies the fresh-search release", async () => {
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-10-17-partial-history-v6");
+  assert.equal(body.release, "2026-10-17-proof-bound-search-v7");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {

@@ -115,7 +115,22 @@ for (const stage of ['begin','month','finish','digest']) test(`optional ${stage}
    if(row?.from==='alice'&&row?.to==='player0000'){injected++;throw new Error('fixture finish failure');}
    return values.call(this);
   });
- }else t.mock.method(crypto.subtle,'digest',async()=>{injected++;throw new Error('fixture digest failure');});
+ }else {
+  const nativeDigest=crypto.subtle.digest.bind(crypto.subtle);
+  t.mock.method(crypto.subtle,'digest',async(algorithm,bytes)=>{
+   const payload=new TextDecoder().decode(bytes);
+   // Select certificate proof semantics independently of proof enumeration order.
+   let rows;try{rows=JSON.parse(payload);}catch{}
+   const certificateChunk=Array.isArray(rows)&&rows.length>0&&rows.every(row=>
+    row&&typeof row==='object'&&row.from==='alice'&&/^player\d{4}$/.test(row.to)&&
+    /^https:\/\/www\.chess\.com\/game\/live\/[1-9]\d*$/.test(row.url)&&
+    row.result==='win'&&['white','black'].includes(row.color)&&row.timeClass==='blitz');
+   if(certificateChunk&&injected===0){
+    injected++;throw new Error('fixture digest failure');
+   }
+   return nativeDigest(algorithm,bytes);
+  });
+ }
  const result=await f.advance();
  assert.equal(injected,1,'the requested optional stage was actually reached once');
  assert.equal(result.status,'running');assert.equal(f.job().search.forwardFrontier.length,800);

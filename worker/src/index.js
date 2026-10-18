@@ -1,4 +1,6 @@
-import {certificateAction, certificateScope, eligibleCertificateJob, startCertificateCollector, unpackCertificate, TwoHopWitness} from './two-hop-certificate.js';
+import {rootBoundAction,rootBoundFresh,unpackRootBound,createTargetNegativeCollector,ThreeHopWitness,rootBoundDigest} from './root-three-hop-bound.js';
+import {monthHistoryAction,createMonthHistoryHooks} from './month-history-checkpoint.js';
+import {certificateAction, certificateScope, eligibleCertificateJob, startCertificateCollector, unpackCertificate, TwoHopWitness, certificateDigest} from './two-hop-certificate.js';
 import {createPerformanceMetrics, requestDimensions} from './performance-metrics.js';
 import { bindVerifiedJobSubmission } from './verified-job-submit.js';
 
@@ -16,7 +18,7 @@ import { bindVerifiedJobSubmission } from './verified-job-submit.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-17-partial-history-v6";
+const WORKER_RELEASE = "2026-10-17-proof-bound-search-v7";
 const SEARCH_POLICY_VERSION = "fresh-search-v2";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
@@ -149,6 +151,14 @@ export class SearchJobObject {
   }
 
   async applyAction(action, body = {}) {
+    if (['root-three-start-commit','root-three-start-read','root-three-read','root-three-commit'].includes(action)) {
+      try { return {status:200,body:await rootBoundAction(this.state.storage,action,body)}; }
+      catch { return {status:200,body:{accepted:false}}; }
+    }
+    if (action === 'month-history-read' || action === 'month-history-commit') {
+      try { return {status:200,body:await monthHistoryAction(this.state.storage,action,body)}; }
+      catch { return {status:200,body:{accepted:false}}; }
+    }
     if (action === 'twohop-commit' || action === 'twohop-read') {
       try { return {status:200, body:await certificateAction(this.state.storage, action, body)}; }
       catch { return {status:200, body:{accepted:false}}; }
@@ -1349,6 +1359,8 @@ function shouldRunShorterBfs(job) {
 
 const INTERNAL_TWO_HOP = Symbol('job-owned-two-hop-input');
 const INTERNAL_ALLOW_PARTIAL_HISTORY = Symbol('job-owned-partial-history');
+const INTERNAL_MONTH_HISTORY = Symbol('job-owned-month-history');
+const INTERNAL_THREE_HOP = Symbol('job-owned-root-three-hop');
 
 function monthlyWinProofs(username, games, getMonthEdges = null) {
   const proofs = new Map();
@@ -1394,15 +1406,45 @@ async function twoHopRequest(env, job, action, payload, signal) {
   return body || {accepted:false};
 }
 
+// Conservative negative-only supported outcomes; existential graph rules unchanged.
+function validNegativeGames(username,games){
+ const losses=new Set(['resigned','checkmated','timeout','abandoned','lose']);
+ const draws=new Set(['agreed','repetition','stalemate','insufficient','50move','timevsinsufficient']);
+ return games.every(g=>{if(!validSanitizedArchiveGame(g)||(g.white!==username&&g.black!==username)||!g.white||!g.black||cleanUsername(g.white)!==g.white||cleanUsername(g.black)!==g.black||g.white===g.black||!['bullet','blitz','rapid','daily'].includes(g.timeClass))return false;
+   if(g.timeClass!=='daily'&&!/^https:\/\/www\.chess\.com\/game\/live\/[1-9]\d*$/.test(g.url))return false;
+   if(g.whiteResult==='win')return losses.has(g.blackResult);if(g.blackResult==='win')return losses.has(g.whiteResult);
+   return draws.has(g.whiteResult)&&draws.has(g.blackResult);
+ });
+}
+// Strict negative input: all decisive games must be supported directed wins.
+function monthlyLossProofs(username,games,getMonthEdges) {
+ if(!validNegativeGames(username,games))return null;
+ for(const game of games){if(game.white!==username&&game.black!==username)return null;const wins=Number(game.whiteResult==='win')+Number(game.blackResult==='win');if(wins>1)return null;if(wins===1&&game.timeClass!=='daily'){const winner=game.whiteResult==='win'?game.white:game.black,loser=winner===game.white?game.black:game.white;if(!directArchiveWinGame([game],winner,loser))return null;}}
+ const byURL=new Map();for(const game of games)if(!byURL.has(game.url))byURL.set(game.url,game);
+ const proofs=[];for(const [opponent,urls]of getMonthEdges().beatMe){const game=byURL.get(urls[0]);const matched=game&&directArchiveWinGame([game],opponent,username);if(!matched)return null;proofs.push({from:opponent,to:username,url:matched.url,...proofDetailsFromGame(matched,opponent,username)});}return proofs;
+}
+async function rootBoundIndexesMatch(env,job,authority,signal) {
+ if(!rootBoundFresh(authority,job)||!env.GAMES_CACHE)return false;
+ const results=await Promise.all([job.start,job.target].map(n=>env.GAMES_CACHE.get(`archives:fetch:v1:${n}`,{type:'json'}).catch(()=>null)));
+ if(signal?.aborted)throw abortSignalError(signal);
+ return rootBoundFresh(authority,job)&&results.every((list,i)=>{const m=(i?authority.target:authority.start).manifest,n=i?job.target:job.start;return list?.schema===1&&list.ts===m.indexTs&&Array.isArray(list.archives)&&list.archives.every(u=>validArchiveURL(u,n))&&JSON.stringify([...selectSharedArchives(list.archives,job.search.sinceMonth,Infinity)].reverse())===JSON.stringify(m.selected);});
+}
 async function twoHopHooks(env, job, username, signal) {
   if (!eligibleCertificateJob(job) || (!env.SEARCH_JOBS && env.__SEARCH_JOB_LOCAL?.id !== job.id)) return null;
   if (username === job.start) {
     const collector = startCertificateCollector(job,monthlyWinProofs,games=>games.every(validSanitizedArchiveGame));
-    return {begin:(list,selected)=>collector.begin(list,selected),month:row=>collector.month(row),finish:async()=>{
+    let strictScan=null,strictInvalid=false;
+    return {begin:(list,selected)=>{collector.begin(list,selected);strictScan={version:1,scope:certificateScope(job),month:new Date().toISOString().slice(0,7).replace('-','/'),indexTs:list.ts,selected:[...selected],months:[]};},month:row=>{
+      collector.month(row);if(!strictScan||row.negativeInputValid!==true||!validNegativeGames(job.start,row.games)||row.url!==strictScan.selected[strictScan.months.length])strictInvalid=true;
+      if(!strictInvalid)strictScan.months.push({url:row.url,gamesCount:row.games.length,observedAt:row.observedAt,expiresAt:row.expiresAt});
+    },finish:async()=>{
       const pkg = await collector.finish();
       if (pkg) {
         const committed = await twoHopRequest(env,job,'twohop-commit',{package:pkg},signal);
-        if (committed.accepted) job.search.twoHopInputReady = true;
+        if (committed.accepted) {
+          job.search.twoHopInputReady = true;
+          if(!strictInvalid&&strictScan?.months.length===strictScan?.selected.length)await twoHopRequest(env,job,'root-three-start-commit',{scan:strictScan,startDigest:await rootBoundDigest(pkg)},signal);
+        }
       }
     }};
   }
@@ -1415,7 +1457,12 @@ async function twoHopHooks(env, job, username, signal) {
   const selected = [...selectSharedArchives(list.archives,job.search.sinceMonth,Infinity)].reverse();
   if (JSON.stringify(selected) !== JSON.stringify(certificate.manifest.selected)) return null;
   const winners = new Map(certificate.proofs.map(proof=>[proof.to,proof]));
-  return {begin:()=>{},finish:async()=>{},month:row=>{
+  const strictStart=await twoHopRequest(env,job,'root-three-start-read',{},signal);
+  const negative=strictStart.accepted?createTargetNegativeCollector(job,result.package,strictStart.startScan,monthlyLossProofs,games=>validNegativeGames(job.target,games)):null;
+  return {begin:(list,selected)=>negative?.begin(list,selected),finish:async()=>{
+    const pkg=await negative?.finish();if(!pkg)return;const authority=await unpackRootBound(result.package,pkg,strictStart.startScan);
+    if(authority&&await rootBoundIndexesMatch(env,job,authority,signal))await twoHopRequest(env,job,'root-three-commit',{package:pkg},signal);
+  },month:row=>{
     if (signal?.aborted) throw abortSignalError(signal);
     const m = certificate.manifest;
     if (Date.now() >= m.scope.createdAt + SEARCH_JOB_TTL_SECONDS*1000 ||
@@ -1438,6 +1485,7 @@ async function twoHopHooks(env, job, username, signal) {
         throw new TwoHopWitness({path:[job.start,opponent,job.target],hops:[first,second]});
       }
     }
+    negative?.month(row);
   }};
 }
 function createSearchEdgeReader(env, job, stats) {
@@ -1446,6 +1494,33 @@ function createSearchEdgeReader(env, job, stats) {
   const edgesCache = new Map();
   const primed = new Map();
   let freshRequestsThisChunk = 0;
+  let rootAuthorityPromise=null;
+  const readRootAuthority=signal=>rootAuthorityPromise??=(async()=>{
+    if(job.search?.twoHopInputReady!==true)return null;
+    const result=await twoHopRequest(env,job,'root-three-read',{},signal);if(!result.accepted)return null;
+    const authority=await unpackRootBound(result.startPackage,result.targetPackage,result.startScan);
+    if(!authority||!await rootBoundIndexesMatch(env,job,authority,signal))return null;
+    authority.winners=new Map(authority.start.proofs.map(p=>[p.to,p]));authority.predecessors=new Map(authority.target.proofs.map(p=>[p.from,p]));return authority;
+  })().catch(error=>{if(signal?.aborted)throw error;return null;});
+  const streamThree=async(key,signal)=>{
+    if(key===job.start||key===job.target||!eligibleCertificateJob(job))return null;
+    const authority=await readRootAuthority(signal);if(!authority)return null;
+    const {winners,predecessors}=authority;
+    return (games,getMonthEdges)=>{
+      if(signal?.aborted)throw abortSignalError(signal);
+      if(!rootBoundFresh(authority,job)||!games.every(validSanitizedArchiveGame))return;
+      const month=getMonthEdges(),byURL=new Map();for(const game of games)if(!byURL.has(game.url))byURL.set(game.url,game);
+      for(const forward of [true,false]){
+        if(forward?!winners.has(key):!predecessors.has(key))continue;
+        const direction=forward?month.beatenByMe:month.beatMe;
+        for(const [opponent,urls]of direction){const a=forward?key:opponent,b=forward?opponent:key;if(!winners.has(a)||!predecessors.has(b)||new Set([job.start,a,b,job.target]).size!==4)continue;
+          const game=byURL.get(urls[0]),matched=game&&validNegativeGames(key,[game])&&directArchiveWinGame([game],a,b);if(!matched)continue;
+          const middle={from:a,to:b,url:matched.url,...proofDetailsFromGame(matched,a,b)};
+          throw new ThreeHopWitness({path:[job.start,a,b,job.target],hops:[winners.get(a),middle,predecessors.get(b)]},authority);
+        }
+      }
+    };
+  };
   const read = async (username, signal = null) => {
     const key = username.toLowerCase();
     let incomplete = false;
@@ -1485,7 +1560,15 @@ function createSearchEdgeReader(env, job, stats) {
             if (signal?.aborted) throw error;
             return null; // Certificate unavailability never blocks ordinary search.
           });
+          // Root/target need raw games for direct and two-hop certificate hooks.
+          // Reuse only interior adjacency; no BFS node completes until fetchGames ends.
+          const monthHistory = key !== job.start && key !== job.target && eligibleCertificateJob(job) &&
+            (env.SEARCH_JOBS || env.__SEARCH_JOB_LOCAL?.id === job.id)
+            ? createMonthHistoryHooks(job,key,(action,payload)=>twoHopRequest(env,job,action,payload,signal),signal) : null;
+          const threeHopMonth=await streamThree(key,signal);
           edges = await readOrFetchEdges(env, { username: key, archiveLimit, sinceMonth,
+            [INTERNAL_THREE_HOP]:threeHopMonth,
+            [INTERNAL_MONTH_HISTORY]:monthHistory,
             directTarget: key === job.start ? job.target : null, signal,
             [INTERNAL_TWO_HOP]:certificateHooks,
             [INTERNAL_ALLOW_PARTIAL_HISTORY]: job.policyVersion === SEARCH_POLICY_VERSION ? markIncomplete : null }, stats);
@@ -1499,6 +1582,7 @@ function createSearchEdgeReader(env, job, stats) {
       return outcome;
     } catch (error) {
       if (signal?.aborted) throw error;
+      if (error instanceof ThreeHopWitness) return {threeHopWitness:error.chain,rootAuthority:error.authority,incomplete};
       if (error instanceof TwoHopWitness && key === job.target) {
         return {twoHopWitness:error.chain,incomplete,edges:{beatenByMe:new Map(),beatMe:new Map()}};
       }
@@ -1533,7 +1617,11 @@ function createSearchEdgeReader(env, job, stats) {
       }
     }), CACHED_SHORTER_CHECK_CONCURRENCY);
   };
-  return { read, prime, outcomes: edgesCache };
+  const hasCompletePrimed = (nodes) => nodes.every(username => {
+    const outcome = edgesCache.get(username.toLowerCase());
+    return Boolean(outcome?.edges && !outcome.deferred && !outcome.incomplete && !outcome.edges.truncated);
+  });
+  return { read, prime, hasCompletePrimed, outcomes: edgesCache };
 }
 
 async function advanceServerSearch(env, job, search, stats, progress, options = {}) {
@@ -1560,6 +1648,20 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
   return result;
 }
 
+// Scheduling metadata never enters visited maps or completeness certificates.
+function interleaveHistoryPending(pending, retries) {
+  const retrySet = new Set(retries);
+  const upcoming = pending.filter(node => !retrySet.has(node));
+  const pendingSet = new Set(pending);
+  const retryQueue = retries.filter(node => pendingSet.has(node));
+  const out = []; let fresh = 0, retry = 0;
+  while (fresh < upcoming.length || retry < retryQueue.length) {
+    for (let count = 0; count < 2 && fresh < upcoming.length; count++) out.push(upcoming[fresh++]);
+    if (retry < retryQueue.length) out.push(retryQueue[retry++]);
+  }
+  return out;
+}
+
 async function advanceBidirectionalSearch(env, job, search, stats, progress, options = {}) {
   const archiveLimit = archiveLimitForRange(job.range);
   const expansionBudget = Math.max(1, Number(options.expansionBudget) || SEARCH_CHUNK_EXPANSIONS);
@@ -1569,6 +1671,10 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
   const forwardVisited = visitedObjectToMap(search.forwardVisited);
   const backwardVisited = visitedObjectToMap(search.backwardVisited);
   let processed = 0;
+  const pendingAtResume = new Set(search.activeFrontier.slice(search.activeCursor));
+  let historyRetries = uniqueUsernameList(search.historyRetryNodes || [], SEARCH_FRONTIER_LIMIT)
+    .filter(node => pendingAtResume.has(node));
+  search.historyRetryNodes = historyRetries;
   let meeting = cleanUsername(search.bestMeeting);
   let meetingLength = meeting ? cleanNonNegativeNumber(search.bestMeetingLength, SEARCH_MAX_DEPTH * 2 + 2) || Number.POSITIVE_INFINITY : Number.POSITIVE_INFINITY;
 
@@ -1632,6 +1738,7 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
     const selected = uniqueUsernameList(source, SEARCH_FRONTIER_LIMIT);
     if (!selected.length) return false;
 
+    search.historyRetryNodes = historyRetries = [];
     search.activeSide = side;
     search.activeFrontier = selected;
     search.activeCursor = 0;
@@ -1644,6 +1751,7 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
     return true;
   };
   const finishLayer = async () => {
+    search.historyRetryNodes = historyRetries = [];
     const next = uniqueUsernameList(search.activeNextFrontier, SEARCH_NEXT_FRONTIER_LIMIT);
     if (search.activeSide === "forward") search.forwardFrontier = next;
     if (search.activeSide === "backward") search.backwardFrontier = next;
@@ -1691,12 +1799,21 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
       expansionBudget - processed,
       search.activeFrontier.length - search.activeCursor,
     );
+    const hasHistoryRetries = job.policyVersion === SEARCH_POLICY_VERSION && historyRetries.length > 0;
+    // Preserve the original wide cache-only priming. Confirmed complete hits
+    // consume no fresh-history slots and can keep their original wide batch.
     const batchSize = Math.max(1, Math.min(job.policyVersion === SEARCH_POLICY_VERSION ? CACHED_SHORTER_CHECK_CONCURRENCY : expansionConcurrency, remainingBudget));
     const batchStart = search.activeCursor;
-    const batch = search.activeFrontier.slice(batchStart, batchStart + batchSize).filter(Boolean);
+    let batch = search.activeFrontier.slice(batchStart, batchStart + batchSize).filter(Boolean);
     if (!batch.length) continue;
 
     if (job.policyVersion === SEARCH_POLICY_VERSION) await reader.prime(batch);
+    if (hasHistoryRetries && !(typeof reader.hasCompletePrimed === "function" && reader.hasCompletePrimed(batch))) {
+      // An unconfirmed/missing/deferred item keeps the reserved first three.
+      // The other primed records stay owned by this reader for later iterations;
+      // no provider request has been started speculatively for them.
+      batch = batch.slice(0, SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK);
+    }
     const edgeBatch = await runThrottled(batch.map((node) => async () => {
       try {
         return {
@@ -1717,6 +1834,15 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
       if (item?.deferred) {
         deferred.push(item);
         continue;
+      }
+      if(item?.threeHopWitness){
+        const confirmation=await twoHopRequest(env,job,'root-three-read',{},null);
+        const confirmed=confirmation.accepted?await unpackRootBound(confirmation.startPackage,confirmation.targetPackage,confirmation.startScan):null;
+        if(confirmed&&confirmed.digest===item.rootAuthority.digest&&rootBoundFresh(confirmed,job)&&await rootBoundIndexesMatch(env,job,confirmed,null)&&Date.now()<confirmation.leaseUntil){
+          const chain=meeting&&meetingLength<=3?reconstructServerPath(meeting,forwardVisited,backwardVisited):item.threeHopWitness;
+          syncSearch();return{status:'found',chain};
+        }
+        deferred.push({node:item.node,deferred:true,reason:'root-bound-expired'});continue;
       }
       if (!item?.node || !item.edges) continue;
       stats.expanded++;
@@ -1767,11 +1893,20 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
     if (deferred.length) {
       const prefix = search.activeFrontier.slice(0, batchStart);
       const tail = search.activeFrontier.slice(batchStart + batch.length);
-      search.activeFrontier = [
-        ...prefix,
-        ...deferred.map((item) => item.node).filter(Boolean),
-        ...tail,
-      ];
+      const pending = [...deferred.map(item => item.node).filter(Boolean), ...tail];
+      if (job.policyVersion === SEARCH_POLICY_VERSION) {
+        const pendingSet = new Set(pending);
+        const failed = deferred.filter(item => item.reason === "upstream-timeout" || item.reason === "upstream-error")
+          .map(item => item.node).filter(Boolean);
+        const failedSet = new Set(failed);
+        // Failed attempts go behind earlier unattempted retries, while each
+        // queue retains its relative order. Rate/cache/budget-only deferrals
+        // are not misclassified as completed provider attempts.
+        historyRetries = [...historyRetries.filter(node => pendingSet.has(node) && !failedSet.has(node)), ...failed];
+        search.historyRetryNodes = historyRetries;
+        const globallyPaused = deferred.some(item => item.reason === "rate-limited");
+        search.activeFrontier = [...prefix, ...(globallyPaused ? pending : interleaveHistoryPending(pending, historyRetries))];
+      } else search.activeFrontier = [...prefix, ...pending];
       search.activeCursor = batchStart;
       syncSearch();
       if (meetingCannotImprove()) {
@@ -1801,6 +1936,8 @@ async function advanceBidirectionalSearch(env, job, search, stats, progress, opt
       };
     }
 
+    historyRetries = historyRetries.filter(node => !batch.includes(node));
+    search.historyRetryNodes = historyRetries;
     search.activeCursor = batchStart + batch.length;
     if (meeting && (meetingCannotImprove() || search.activeCursor >= search.activeFrontier.length)) {
       syncSearch();
@@ -2796,6 +2933,7 @@ async function readOrFetchEdges(env, parsed, stats = null) {
               if (!edges[direction].has(opponent) && urls[0]) edges[direction].set(opponent, [urls[0]]);
             }
           }
+          parsed[INTERNAL_THREE_HOP]?.(games,getMonthEdges);
           parsed.onGames?.(games);
         },
         onCoverage: coverage => { attachArchiveCoverage(edges, coverage); parsed.onCoverage?.(coverage); },
@@ -5160,6 +5298,7 @@ function initialSearchState(start, target) {
     bestMeetingLength: 0,
     stalledChunks: 0,
     incomplete: false,
+    historyRetryNodes: [],
   };
 }
 
@@ -5171,6 +5310,8 @@ function searchStateShape(state, start, target) {
   if (!forwardVisited[start]) forwardVisited[start] = { prev: "", hopUrl: "" };
   if (!backwardVisited[target]) backwardVisited[target] = { next: "", hopUrl: "" };
   const activeSide = ["forward", "backward"].includes(state.activeSide) ? state.activeSide : "";
+  const pendingHistoryNodes = new Set(activeSide ? cleanUsernameList(state.activeFrontier, SEARCH_FRONTIER_LIMIT)
+    .slice(cleanNonNegativeNumber(state.activeCursor, SEARCH_FRONTIER_LIMIT) || 0) : []);
   return {
     profileChecked: Boolean(state.profileChecked),
     fastLaneChecked: Boolean(state.fastLaneChecked),
@@ -5187,6 +5328,8 @@ function searchStateShape(state, start, target) {
     bestMeetingLength: activeSide ? cleanNonNegativeNumber(state.bestMeetingLength, SEARCH_MAX_DEPTH * 2 + 2) || 0 : 0,
     stalledChunks: cleanNonNegativeNumber(state.stalledChunks, SEARCH_MAX_STALLED_CHUNKS) || 0,
     incomplete: Boolean(state.incomplete),
+    historyRetryNodes: cleanUsernameList(state.historyRetryNodes, SEARCH_FRONTIER_LIMIT)
+      .filter(node => pendingHistoryNodes.has(node)),
     sinceMonth: validSinceMonth(state.sinceMonth) ? state.sinceMonth : null,
     ...(state.twoHopInputReady === true ? {twoHopInputReady:true} : {}),
     shortestVerified: Boolean(state.shortestVerified),
@@ -5612,7 +5755,7 @@ function checkDirectArchiveWin(games, username, directTarget) {
   const game = directArchiveWinGame(games, username, directTarget);
   if (game) throw new DirectWinFound(game);
 }
-async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null, [INTERNAL_TWO_HOP]: certificateHooks = null, [INTERNAL_ALLOW_PARTIAL_HISTORY]: onIncomplete = null }, env = null) {
+async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null, [INTERNAL_TWO_HOP]: certificateHooks = null, [INTERNAL_ALLOW_PARTIAL_HISTORY]: onIncomplete = null, [INTERNAL_MONTH_HISTORY]: monthHistory = null }, env = null) {
   let incomplete = false;
   const checkAbort = () => { if (signal?.aborted) throw abortSignalError(signal); };
   const optionalCertificateHook = async (name, ...args) => {
@@ -5634,6 +5777,13 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
   const newestFirst = directScan || collectGames === false;
   if (newestFirst) selected.reverse();
   if (certificateHooks) await optionalCertificateHook('begin',list,selected);
+  // An optional storage failure must never change provider/retry behavior.
+  const checkpoint = async (name,...args) => {
+    if (!monthHistory || certificateHooks || directTarget || collectGames !== false) return null;
+    try { const result=await monthHistory[name](...args); checkAbort(); return result; }
+    catch(error) { checkAbort(); monthHistory=null; return null; }
+  };
+  await checkpoint('begin',list,selected);
   let expiresAt = Math.min(list.ts + ARCHIVE_LIST_CACHE_TTL_SECONDS * 1000, Date.now() + TTL_SECONDS * 1000);
   // One awaited group at a time: no cache lookahead survives a direct win.
   // Duplicate URLs retain original per-occurrence reads and callback identity.
@@ -5664,6 +5814,13 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
   const rows = await runThrottled(selected.map((url, index) => async () => {
     checkAbort();
     const key = `archive:games:v1:${username}:${archiveMonthFromUrl(url)}`;
+    const resumed = await checkpoint('read',url);
+    checkAbort();
+    if (resumed && resumed.expiresAt > Date.now()) {
+      expiresAt=Math.min(expiresAt,resumed.expiresAt);
+      onGames?.([],()=>resumed.edges);
+      return [];
+    }
     const cached = await readMonthCache(key, index);
     checkAbort();
     if (cached?.schema === 1 && cached.url === url && Number.isFinite(cached.expiresAt) &&
@@ -5671,8 +5828,9 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
       expiresAt = Math.min(expiresAt, cached.expiresAt);
       checkDirectArchiveWin(cached.games, username, directTarget);
       let monthEdges; const getMonthEdges = () => monthEdges ??= edgesFromGames(username, cached.games);
-      if (certificateHooks) await optionalCertificateHook('month',{url,index,games:cached.games,getMonthEdges,expiresAt:cached.expiresAt,observedAt:Date.now(),source:'cache'});
+      if (certificateHooks) await optionalCertificateHook('month',{url,index,games:cached.games,getMonthEdges,expiresAt:cached.expiresAt,observedAt:Date.now(),source:'cache',negativeInputValid:await validMonthlyNegativeProvenance(cached,username,url).catch(()=>false)});
       onGames?.(cached.games, getMonthEdges);
+      if(monthHistory?.active===true && !certificateHooks && !directTarget && collectGames===false && cached.games.every(validSanitizedArchiveGame))await checkpoint('month',{url,edges:getMonthEdges(),expiresAt:cached.expiresAt,observedAt:Date.now()});
       return collectGames === false ? [] : cached.games;
     }
     let providerTTL = 0;
@@ -5697,6 +5855,9 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     }
     checkAbort();
     if (!Array.isArray(data.games)) throw new Error("Invalid monthly archive");
+    // Negative-only raw provenance. Legacy sanitized cache rows cannot attest
+    // that malformed raw rules were not discarded; they remain positive-only.
+    const negativeInputValid=data.games.every(g=>g&&typeof g.rules==='string'&&['chess','chess960','bughouse','crazyhouse','kingofthehill','threecheck'].includes(g.rules));
     const games = data.games.filter((game) => game.rules === "chess").map((game) => ({
       white: (game.white?.username || "").toLowerCase(),
       black: (game.black?.username || "").toLowerCase(),
@@ -5711,14 +5872,22 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     const ttl = archiveMonthFromUrl(url) < currentMonth ? TTL_SECONDS : providerTTL;
     const observedExpiresAt = Date.now() + ttl * 1000;
     expiresAt = Math.min(expiresAt, observedExpiresAt);
-    if (env && ttl >= 60 && games.every(validSanitizedArchiveGame)) await env.GAMES_CACHE.put(key, JSON.stringify({
-      schema: 1, url, expiresAt: Date.now() + ttl * 1000, games,
-    }), { expirationTtl: Math.floor(ttl) }).catch(() => {});
+    if (env && ttl >= 60 && games.every(validSanitizedArchiveGame)) {
+      const cachedMonth={schema:1,url,expiresAt:observedExpiresAt,games};
+      // Complete raw-envelope validation; hashes detect corruption, not malicious KV writes.
+      if(negativeInputValid && validNegativeGames(username,games)) {
+        const provenance=await createMonthlyNegativeProvenance(cachedMonth,username,Date.now()).catch(()=>null);
+        if(provenance)cachedMonth.negativeProvenance=provenance;
+      }
+      checkAbort();
+      await env.GAMES_CACHE.put(key,JSON.stringify(cachedMonth),{expirationTtl:Math.floor(ttl)}).catch(()=>{});
+    }
     checkAbort();
     checkDirectArchiveWin(games, username, directTarget);
     let monthEdges; const getMonthEdges = () => monthEdges ??= edgesFromGames(username, games);
-    if (certificateHooks) await optionalCertificateHook('month',{url,index,games,getMonthEdges,expiresAt:observedExpiresAt,observedAt:Date.now(),source:'provider'});
+    if (certificateHooks) await optionalCertificateHook('month',{url,index,games,getMonthEdges,expiresAt:observedExpiresAt,observedAt:Date.now(),source:'provider',negativeInputValid});
     onGames?.(games, getMonthEdges);
+    if(monthHistory?.active===true && !certificateHooks && !directTarget && collectGames===false && games.every(validSanitizedArchiveGame))await checkpoint('month',{url,edges:getMonthEdges(),expiresAt:observedExpiresAt,observedAt:Date.now()});
     return collectGames === false ? [] : games;
   }), ARCHIVE_CONCURRENCY);
   checkAbort();
@@ -5727,8 +5896,34 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
   // Strict callers require every month; job-owned partial input has expiry0
   // and cannot publish an aggregate or a complete absence certificate.
   const coverage = { sinceMonth, expiresAt };
+  // Existing expiry validation controls aggregate caching. A historical input
+  // that expires while scanning cannot be promoted by checkpoint reuse.
   onCoverage?.(coverage);
   return attachArchiveCoverage((newestFirst ? rows.reverse() : rows).flat(), sinceMonth == null ? null : coverage);
+}
+
+// Existing manifest observedAt records this job's cache read, not a new provider observation.
+// Provider observation and original expiry are preserved in validated provenance.
+const MONTHLY_NEGATIVE_MAX_BYTES=2*1024*1024;
+function monthlyNegativePayload(row,username,observedAt){
+ return JSON.stringify({version:1,validator:'raw-rules-and-outcomes-v1',username,url:row.url,
+   schema:row.schema,providerObservedAt:observedAt,expiresAt:row.expiresAt,games:row.games});
+}
+async function createMonthlyNegativeProvenance(row,username,providerObservedAt){
+ if(row?.schema!==1||!validArchiveURL(row.url,username)||!Number.isFinite(providerObservedAt)||providerObservedAt>Date.now()||
+    !Number.isFinite(row.expiresAt)||row.expiresAt<=Date.now()||row.expiresAt<=providerObservedAt||
+    row.expiresAt-providerObservedAt>TTL_SECONDS*1000||!Array.isArray(row.games)||!validNegativeGames(username,row.games))return null;
+ const payload=monthlyNegativePayload(row,username,providerObservedAt);
+ const bytes=new TextEncoder().encode(payload).length;if(bytes>MONTHLY_NEGATIVE_MAX_BYTES)return null;
+ return {version:1,validator:'raw-rules-and-outcomes-v1',username,url:row.url,schema:1,
+   providerObservedAt,expiresAt:row.expiresAt,bytes,sha256:await certificateDigest(payload)};
+}
+async function validMonthlyNegativeProvenance(row,username,url){
+ const p=row?.negativeProvenance;
+ if(!p||p.version!==1||p.validator!=='raw-rules-and-outcomes-v1'||p.username!==username||p.url!==url||
+    row.url!==url||p.schema!==1||p.expiresAt!==row.expiresAt)return false;
+ const expected=await createMonthlyNegativeProvenance(row,username,p.providerObservedAt);
+ return Boolean(expected&&expected.bytes===p.bytes&&expected.sha256===p.sha256&&row.expiresAt>Date.now());
 }
 
 function validArchiveURL(value, username) {

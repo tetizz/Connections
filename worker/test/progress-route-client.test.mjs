@@ -116,3 +116,10 @@ test('a server start network failure reports unavailable without requesting a li
  assert.match(f.statuses.at(-1).text,/full search service could not connect/);
  assert.match(f.statuses.at(-1).text,/no limited search was substituted/);
 });
+
+test('an accepted ordinary search releases the submit button so a new foreground pair can replace its live updates',async()=>{
+ const f=fixture(),done=f.run();await f.reply(job());
+ try {assert.equal(f.element('button').disabled,false,'only the initial POST is exclusive; accepted server work must not block another pair');}
+ finally {f.state.activeSearchOwner='search:newer-pair';await f.reply(job(chain()));await done;}
+ assert.equal(f.renders.length,0);assert.equal(f.events.length,0);assert.ok(f.requests.every(request=>!request.url.includes('/cancel')));
+});

@@ -743,7 +743,6 @@
         source: item.player?.source || "live",
         slotCount: Math.max(1, Number(item.player?.slotCount) || 1),
         slots: item.player?.slots || [],
-        ms: item.ms,
         serverSearchId: item.job.id,
         shortestVerified: item.job.shortestVerified === true,
       }));
@@ -751,8 +750,10 @@
     const root = cleanUsernameInput(start || found[0].path?.[0]);
     const targets = found.map((chain) => chain.target);
     const shortest = found.reduce((best, chain) => !best || topTraceStepCount(chain) < topTraceStepCount(best) ? chain : best, null);
-    const targetCount = Math.max(results.length, topTraceLeaderboardSlotCount());
-    const foundSlotCount = topTraceFoundSlotCount(foundItems);
+    // A player can occupy several leaderboard slots. Count the deduplicated
+    // targets in this batch, independent of whether live rankings have loaded.
+    const targetCount = results.length;
+    const foundSlotCount = found.length;
     if (!progressive) void hydrateTopTracePlayers(foundItems).catch(() => {});
     $("#search-target").value = shortest?.target || targets[0] || $("#search-target").value;
     setActiveChip($("#search-target").value);
@@ -761,7 +762,7 @@
       found: true,
       root,
       target: shortest?.target || targets[0],
-      display: `${foundSlotCount} of ${targetCount} top-player targets`,
+      display: `${foundSlotCount} of ${targetCount} top players`,
       branchCount: found.length,
       targetCount,
       foundSlotCount,
@@ -772,7 +773,7 @@
     });
     if (!progressive) submitTopTraceLeaderboardBranches(root, found);
     showStatus(progressive ? "working" : "done",
-      `${progressive ? "building" : "✓ built"} a top-player tree — ${esc(root)} has ${plainNumber(foundSlotCount)} of ${plainNumber(targetCount)} leaderboard targets found across ${plainNumber(found.length)} merged branches.`);
+      `${progressive ? "building" : "✓ built"} a top-player tree — ${esc(root)} has verified routes to ${plainNumber(foundSlotCount)} of ${plainNumber(targetCount)} top players.`);
     if (scroll) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
   }
 
@@ -2085,14 +2086,17 @@
       const root = chain.root || chain.path?.[0] || "the starting player";
       const found = chain.foundSlotCount || chain.branchCount || 0;
       const total = chain.targetCount || chain.branchCount || 0;
-      summary.textContent = `Connection tree from ${root}. ${found} of ${total} leaderboard targets have verified routes. Open the proof ledger below for each game.`;
+      summary.textContent = `Connection tree from ${root}. ${found} of ${total} top players have verified routes. Open the proof ledger below for each game.`;
       svg.setAttribute("aria-label", `Connection tree from ${root}`);
       return;
     }
     if (!chain.found || !Array.isArray(chain.path) || !chain.path.length) {
       const target = chain.display || chain.target || "that player";
-      summary.textContent = chain.pending ? `Searching for a verified connection to ${target}.` : `No verified connection to ${target} is available for this search.`;
-      svg.setAttribute("aria-label", chain.pending ? `Searching for a connection to ${target}` : `No verified connection to ${target}`);
+      summary.textContent = chain.pending ? `Searching for a verified connection to ${target}.`
+        : chain.searchComplete === true ? `No verified connection to ${target} was found in the completed search.`
+          : `The full search for ${target} has not completed.`;
+      svg.setAttribute("aria-label", chain.pending ? `Searching for a connection to ${target}`
+        : chain.searchComplete === true ? `No verified connection to ${target}` : `Search for ${target} not completed`);
       return;
     }
     const route = chain.path.map((username) => nameOf(username)).join(" then ");
@@ -2142,10 +2146,12 @@
         x: viewWidth / 2, y: 180, "text-anchor": "middle",
         fill: "#63685f", "font-size": compactGraph ? "14" : "18", "font-family": "ui-sans-serif, system-ui, sans-serif",
       });
-      t.textContent = chain.pending ? `searching for a connection to ${chain.display || chain.target}...` : `couldn't find a connection to ${chain.display || chain.target} within ${state.chains?.max_depth || 4} steps.`;
+      t.textContent = chain.pending ? `searching for a connection to ${chain.display || chain.target}...`
+        : chain.searchComplete === true ? `No verified connection was found for ${chain.display || chain.target} in the completed search.`
+          : `The full search for ${chain.display || chain.target} has not completed.`;
       svg.appendChild(t);
       $("#graph-hint").textContent =
-        chain.pending ? "Checking public game connections." : "try a different target, or pick someone who plays a lot of games.";
+        chain.pending ? "Checking public game connections." : chain.searchComplete === true ? "The completed search found no verified connection." : "The search has not finished; this is not a no-connection result.";
       return;
     }
 
@@ -2841,7 +2847,12 @@
       return;
     }
     if (!chain.found) {
-      wrap.innerHTML = `<p style="color:var(--text-faint)">no connection found for ${esc(chain.display || chain.target)}.</p>`;
+      const message = chain.pending
+        ? `Searching for a verified connection to ${esc(chain.display || chain.target)}. Proof games will appear here as routes are found.`
+        : chain.searchComplete === true
+          ? `No verified connection was found in the completed search for ${esc(chain.display || chain.target)}.`
+          : "Search updates have not completed. Proof games will appear here when a verified route is available.";
+      wrap.innerHTML = `<p style="color:var(--text-faint)">${message}</p>`;
       return;
     }
     chain.hops.forEach((hop, i) => {
@@ -2946,7 +2957,7 @@
       meta.innerHTML = `
         <span>${esc(slotLabel)}</span>
         <span>${plainNumber(Math.max(0, (branch.path || []).length - 1))} links</span>
-        ${Number.isFinite(branch.ms) ? `<span>${plainNumber(branch.ms)}ms</span>` : ""}
+        <span>${branch.shortestVerified === true ? "Shortest route verified" : "Shortest route not yet verified"}</span>
       `;
       body.appendChild(meta);
       const path = document.createElement("div");
@@ -3543,6 +3554,9 @@
       activeJob = job;
       saveActiveJob({ id: job.id, start, target, range, searchId: analyticsBase.searchId, policyVersion: job.policyVersion });
       renderSearchQueue(job);
+      // Only starting a request is exclusive. Once accepted, this durable job
+      // can continue while the visitor submits another pair.
+      btn.disabled = false;
       if (knownChain?.found) {
         let displayedChain = knownChain;
         let improvedByServer = false;
@@ -3704,6 +3718,7 @@
           target,
           display: target,
           found: false,
+          searchComplete: isSearchComplete(finished),
           length: null,
           path: [],
           hops: [],
@@ -4160,6 +4175,7 @@
           target: record.target,
           display: record.target,
           found: false,
+          searchComplete: isSearchComplete(job),
           length: null,
           path: [],
           hops: [],

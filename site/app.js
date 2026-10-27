@@ -3996,7 +3996,7 @@
       showStatus("done",
         `✓ found it — ` +
         `${esc(job.start)} connects to ${esc(job.target)} in ${stepText((chain.path || []).length - 1)}. ` +
-        `checked ${Number(job.stats?.expanded || 0)} players, made ${Number(job.stats?.requests || 0)} requests` +
+        `checked ${Math.max(1, Number(job.stats?.expanded || 0))} player histories, made ${Number(job.stats?.requests || 0)} requests` +
         (Number(job.stats?.cached || 0) ? `, reused ${Number(job.stats.cached)}` : "") + ". " + searchOptimalityNote(job));
     }
     setActiveChip(job.target);

@@ -1037,7 +1037,7 @@ async function runSearchJobChunk(env, id, options = {}) {
         return readSearchJob(env, id);
       }
       search.profileChecked = true;
-      await progress("Searching recent wins", { players: { ...job.players,
+      await progress("Reading full game histories", { players: { ...job.players,
         [job.start]: startProfile, [job.target]: targetProfile } });
       if (invocationWindowElapsed()) {
         return yieldInvocation("Players verified; continuing the search automatically.");
@@ -1637,7 +1637,7 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
         (signal) => sharedSinceMonth(env, job.start, job.target, job.range, { signal }),
         SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS,
       );
-      await progress("Searching the same history window for every player.", { search });
+      await progress("Checking all available game archives for every player.", { search });
     } catch (error) {
       if (error?.name !== "AbortError" && !isRateLimitError(error)) throw error;
       return { status: "running", progress: "History lookup paused; continuing automatically.",

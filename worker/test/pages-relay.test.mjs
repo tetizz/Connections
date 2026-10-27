@@ -41,8 +41,21 @@ for(const relay of relays){
   assert.equal(result,upgrade);assert.equal(result.webSocket,socket);
  });
 
- test(`${relay.name}: service rejection propagates without synthetic fallback`,async()=>{
+ test(`${relay.name}: service rejection stays retryable without hiding the backend failure`,async()=>{
   const error=new Error('fixed service failure');
-  await assert.rejects(async()=>proxy.fetch(new Request('https://public.pages.dev/fail'),{[relay.binding]:{fetch:async()=>{throw error;}}}),actual=>actual===error);
+  const invoke=()=>proxy.fetch(new Request('https://public.pages.dev/fail',{headers:{origin:'https://tetizz-connections.pages.dev'}}),{[relay.binding]:{fetch:async()=>{throw error;}}});
+  if(relay.name==='legacy leaderboard') {
+   await assert.rejects(invoke,actual=>actual===error);
+   return;
+  }
+  const response=await invoke();
+  assert.equal(response.status,503);
+  assert.equal(response.headers.get('Access-Control-Allow-Origin'),'*');
+  assert.equal(response.headers.get('Cache-Control'),'no-store');
+  assert.ok(Number(response.headers.get('Retry-After'))>0);
+  const body=await response.json();
+  assert.equal(body.retryable,true);
+  assert.equal(body.code,'SEARCH_SERVICE_UNAVAILABLE');
+  assert.doesNotMatch(JSON.stringify(body),/fixed service failure/);
  });
 }

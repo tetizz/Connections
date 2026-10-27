@@ -1705,7 +1705,7 @@ async function advancePagedServerSearch(env,job,search,stats,progress,options={}
       if(outcome.deferred||!outcome.edges||outcome.edges.truncated) {
         const deferred=await act('full-bfs-defer',{version:work.version,node:work.node});
         if(deferred.accepted)resultOf(deferred);
-        return{status:'running',chain:deferred.best||work.best||null,progress:outcome.retryAfter?'Chess.com is throttling requests; full search will resume automatically.':'An archive is unavailable; retaining this player and continuing automatically.',pauseMs:outcome.retryAfter?outcome.retryAfter*1000:1000};
+        return{status:'running',chain:deferred.best||work.best||null,progress:outcome.retryAfter?'Chess.com is throttling requests; full search will resume automatically.':outcome.reason==='upstream-timeout'?'Reading a large game history; saved months will be reused in the next background chunk.':'An archive is unavailable; retaining this player and continuing automatically.',pauseMs:outcome.retryAfter?outcome.retryAfter*1000:1000};
       }
       const map=work.side==='forward'?outcome.edges.beatenByMe:outcome.edges.beatMe;
       const staged=await act('full-bfs-stage',{version:work.version,node:work.node,
@@ -6003,7 +6003,7 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     if (!Array.isArray(data.games)) throw new Error("Invalid monthly archive");
     // Negative-only raw provenance. Legacy sanitized cache rows cannot attest
     // that malformed raw rules were not discarded; they remain positive-only.
-    const negativeInputValid=data.games.every(g=>g&&typeof g.rules==='string'&&['chess','chess960','bughouse','crazyhouse','kingofthehill','threecheck'].includes(g.rules));
+    const negativeInputValid=data.games.every(g=>g&&typeof g.rules==='string'&&['chess','chess960','bughouse','crazyhouse','kingofthehill','threecheck','oddschess'].includes(g.rules));
     const games = data.games.filter((game) => game.rules === "chess").map((game) => ({
       white: (game.white?.username || "").toLowerCase(),
       black: (game.black?.username || "").toLowerCase(),

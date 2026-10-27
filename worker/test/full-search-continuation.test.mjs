@@ -100,3 +100,14 @@ test('old unproven terminal routes resume full traversal while proven terminals 
   const result=await api.readSearchJob(env,job.id);assert.equal(result.status,verified?'found':'running');assert.equal(result.shortestVerified,verified);assert.deepEqual(result.chain.path,saved.chain.path);assert.equal(result.search.pagedSearchRequested,!verified);
  }
 });
+
+test('known odds chess is excluded from routes without blocking complete standard-chess coverage',async()=>{
+ const kv=new KV(),month='https://api.chess.com/pub/player/middle/games/2020/01';
+ globalThis.fetch=async input=>Response.json(String(input).endsWith('/archives')?{archives:[month]}:{games:[
+  {rules:'chess',white:{username:'middle',result:'win'},black:{username:'bridge',result:'resigned'},time_class:'blitz',url:'https://www.chess.com/game/live/700'},
+  {rules:'oddschess',white:{username:'middle',result:'win'},black:{username:'omega',result:'resigned'},time_class:'blitz',url:'https://www.chess.com/game/live/701'}
+ ]},{headers:{'Cache-Control':'public, max-age=300'}});
+ const job=api.searchJobShape({id:'known-odds-variant',start:'alpha',target:'omega',range:'all',status:'running',search:{...api.initialSearchState('alpha','omega'),sinceMonth:'0000/01',pagedSearch:true}});
+ const result=await api.createSearchEdgeReader({GAMES_CACHE:kv},job,{}).read('middle');
+ assert.equal(result.incomplete,false);assert.equal(result.edges.archiveCoverage.negativeComplete,true);assert.ok(result.edges.beatenByMe.has('bridge'));assert.equal(result.edges.beatenByMe.has('omega'),false);
+});

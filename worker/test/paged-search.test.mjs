@@ -56,3 +56,24 @@ test('wrong or expired native lease cannot create or change search records',asyn
   const job=await f.storage.get('job');job.processingUntil=Date.now()-1;await f.storage.put('job',job);
   assert.equal((await f.action('full-bfs-load')).accepted,false);assert.equal(f.storage.values.size,1);
 });
+
+test('a traversal three-hop witness proves shortest on its first page after both roots complete',async()=>{
+ const roots=Array.from({length:100},(_,i)=>[`left${i}`,url(1000+i)]),backs=Array.from({length:100},(_,i)=>[`right${i}`,url(2000+i)]);
+ const f=await fixture({'forward:alpha':roots,'backward:omega':backs});
+ await f.step();await f.step();await f.step();await f.step();
+ let w=await f.action('full-bfs-load');assert.equal(w.depth,1);
+ const side=w.side,opposite=side==='forward'?'right0':'left0';
+ const staged=await f.action('full-bfs-stage',{version:w.version,node:w.node,edges:[[opposite,url(3000)],...Array.from({length:130},(_,i)=>[`extra${i}`,url(4000+i)])]});
+ const r=await f.action('full-bfs-advance',{version:staged.version});
+ assert.equal(r.terminal?.shortestVerified,true);assert.equal(r.best.hops.length,3);
+ assert.ok((await f.storage.get('full-bfs:v1:meta')).staged,'proof does not wait for unrelated remaining adjacency pages');
+});
+
+test('partial frontiers cannot prove a three-hop candidate while shorter discovery layers remain incomplete',async()=>{
+ const f=await fixture({'backward:omega':[['bridge',url(8001)]]});let w=await f.action('full-bfs-load');
+ let s=await f.action('full-bfs-stage',{version:w.version,node:w.node,edges:[['middle',url(8000)]],incomplete:true});await f.action('full-bfs-advance',{version:s.version});
+ await f.step();w=await f.action('full-bfs-load');
+ if(w.node==='alpha'){s=await f.action('full-bfs-stage',{version:w.version,node:w.node,edges:[['middle',url(8000)]],incomplete:true});await f.action('full-bfs-advance',{version:s.version});w=await f.action('full-bfs-load');}
+ s=await f.action('full-bfs-stage',{version:w.version,node:w.node,edges:[['middle',url(8002)]],incomplete:true});const candidate=await f.action('full-bfs-advance',{version:s.version});
+ assert.equal(candidate.best?.hops.length,3);assert.equal(candidate.terminal,null);
+});

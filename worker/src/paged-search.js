@@ -172,6 +172,12 @@ export async function pagedSearchAction(storage, action, input = {}) {
       }
       meta.active='';
     }
+    // Current depths are fully discovered radii: only complete histories move
+    // a layer forward. Any shorter path must intersect those two discovered
+    // balls, so a witnessed path within their sum plus one is already optimal.
+    // Pending histories at the current radii cannot hide a shorter path.
+    if(meta.best&&meta.best.length<=meta.layers.forward.depth+meta.layers.backward.depth+1)
+      meta.terminal={status:'found',shortestVerified:true};
     meta.version++;await storage.put({...updates,[metaKey]:meta});return result(meta);
   });
 }

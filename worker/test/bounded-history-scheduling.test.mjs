@@ -43,9 +43,9 @@ test('mixed timeout and chunk deferrals retain queues and joining while429 keeps
  const r=await f.step({edgeReader:{async prime(){},async read(node){try{return{deferred:true,reason:reasons[f.names.indexOf(node)],retryAfter:node==='frontier5'?90:0};}finally{done.push(node);}}}});
  assert.equal(r.pauseMs,90000);assert.deepEqual(f.job.search.activeFrontier,f.names);assert.deepEqual(f.job.search.historyRetryNodes,['frontier1','frontier3']);assert.deepEqual(done,f.names);assert.equal(f.stats.requests,0);partition(f);
 });
-test('unchanged actual global cap remains terminal with exact pending/completed partition and no false completeness',async()=>{
+test('cumulative provider work beyond160 remains resumable with exact pending/completed partition',async()=>{
  const f=fixture(bounded,{permanent:true,route:false});let r;for(let i=0;i<100;i++){r=await f.step();if(r.status!=='running')break;}
- assert.equal(r.status,'timeout');assert.equal(r.shortestVerified,false);assert.ok(f.stats.requests>=160&&f.stats.requests<=161);assert.ok(f.attempts.get('frontier1')>=2);partition(f);
+ assert.equal(r.status,'running');assert.equal(r.shortestVerified,false);assert.ok(f.stats.requests>160);assert.ok(f.attempts.get('frontier1')>=2);partition(f);
  const pending=f.job.search.activeFrontier.slice(f.job.search.activeCursor),completed=f.names.filter(n=>f.attempts.has(n)&&!f.failed.has(n));assert.equal(completed.length,f.stats.expanded);assert.equal(pending.length,279-f.stats.expanded);assert.deepEqual([...pending,...completed].sort(),[...f.names].sort());assert.ok(f.job.search.incomplete);
 });
 

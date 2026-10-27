@@ -104,7 +104,7 @@ test('certified warm roots establish3hop without root provider reads or expiry e
  assert.deepEqual(cachedTarget(f),original);noPartial(f);
 });
 for(const kind of ['legacy','digest','games','username','url','schema','observation-missing','observation-future','expiry-missing','expiry-extended','bytes','validator','expired','ttl-zero'])
- test(`warm ${kind} cannot authorize negative root bound`,async()=>{
+ test(`warm ${kind} cannot authorize negative root bound`,async t=>{
   const f=await healthy();await warm(f);const row=cachedTarget(f),p=row.negativeProvenance;assert.ok(p);
   if(kind==='legacy')delete row.negativeProvenance;
   if(kind==='digest')p.sha256='0'.repeat(64);
@@ -113,7 +113,12 @@ for(const kind of ['legacy','digest','games','username','url','schema','observat
   if(kind==='observation-missing')delete p.providerObservedAt;if(kind==='observation-future')p.providerObservedAt=Date.now()+60000;
   if(kind==='expiry-missing')delete p.expiresAt;if(kind==='expiry-extended')row.expiresAt+=1000;
   if(kind==='bytes')p.bytes++;if(kind==='validator')p.validator='unvalidated';
-  if(kind==='expired'||kind==='ttl-zero'){row.expiresAt=kind==='expired'?Date.now()-1:Date.now();f.statuses.set(url('bob','2020/03'),404);}
+  if(kind==='expired'||kind==='ttl-zero'){
+   row.expiresAt=kind==='expired'?Date.now()-1:Date.now();f.statuses.set(url('bob','2020/03'),404);
+   // Expire the bounded recent raw response as well, so this case really
+   // exercises missing refreshed input and cannot mint negative authority.
+   const realNow=Date.now;t.mock.method(Date,'now',()=>realNow()+2100);
+  }
   await f.advance();await f.advance();assert.equal(await f.storage.get('root-three:v1:manifest'),undefined);
   if(kind!=='expired'&&kind!=='ttl-zero')assert.equal(f.calls.includes(url('bob','2020/03')),false);
  });

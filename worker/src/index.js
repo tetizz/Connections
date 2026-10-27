@@ -3,6 +3,8 @@ import {monthHistoryAction,createMonthHistoryHooks} from './month-history-checkp
 import {certificateAction, certificateScope, eligibleCertificateJob, startCertificateCollector, unpackCertificate, TwoHopWitness, certificateDigest} from './two-hop-certificate.js';
 import {createPerformanceMetrics, requestDimensions} from './performance-metrics.js';
 import { bindVerifiedJobSubmission } from './verified-job-submit.js';
+import { pagedSearchAction } from './paged-search.js';
+import { shareArchiveFetch } from './shared-archive-fetch.js';
 
 /**
  * Chess Connections Cloudflare Worker
@@ -18,7 +20,7 @@ import { bindVerifiedJobSubmission } from './verified-job-submit.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-17-proof-bound-search-v7";
+const WORKER_RELEASE = "2026-10-26-full-history-paged-search-v8";
 const SEARCH_POLICY_VERSION = "fresh-search-v2";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
@@ -83,6 +85,7 @@ const SEARCH_CACHE_EDGE_LOOKUP_TIMEOUT_MS = 350;
 const SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS = 12000;
 const SEARCH_FRESH_EDGE_REQUEST_LIMIT = 160;
 const SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK = 3;
+const SEARCH_INDEX_VALIDATIONS_PER_CHUNK = 12;
 const SEARCH_EDGE_MAP_LIMIT = 800;
 const EDGE_CACHE_MAX_BYTES = 600000;
 const GAME_CACHE_SEARCH_MAX_BYTES = 2000000;
@@ -104,7 +107,7 @@ const PAIR_CHAIN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const START_NO_WINS_TTL_SECONDS = 30 * 60;
 const SHARE_TTL_SECONDS = 90 * 24 * 60 * 60;
 const SHARE_ID_LENGTH = 8;
-const SEARCH_JOB_TTL_SECONDS = 2 * 60 * 60;
+const SEARCH_JOB_TTL_SECONDS = 7 * 24 * 60 * 60;
 const SEARCH_PUBLIC_JOB_TTL_SECONDS = SEARCH_JOB_TTL_SECONDS;
 const SEARCH_DURABLE_READ_TIMEOUT_MS = 700;
 const SEARCH_DURABLE_WRITE_TIMEOUT_MS = 2500;
@@ -151,6 +154,9 @@ export class SearchJobObject {
   }
 
   async applyAction(action, body = {}) {
+    if (['full-bfs-load','full-bfs-stage','full-bfs-advance','full-bfs-defer'].includes(action)) {
+      return {status:200,body:await pagedSearchAction(this.state.storage,action,body)};
+    }
     if (['root-three-start-commit','root-three-start-read','root-three-read','root-three-commit'].includes(action)) {
       try { return {status:200,body:await rootBoundAction(this.state.storage,action,body)}; }
       catch { return {status:200,body:{accepted:false}}; }
@@ -231,7 +237,7 @@ export class SearchJobObject {
     if (raw?.policyVersion !== SEARCH_POLICY_VERSION) return null;
     const job = searchJobShape(raw);
     if (!job) return null;
-    if (Date.now() - Number(job.createdAt || 0) < SEARCH_JOB_TTL_SECONDS * 1000) {
+    if (Date.now() - Number(job.updatedAt || job.createdAt || 0) < SEARCH_JOB_TTL_SECONDS * 1000) {
       return job;
     }
     await this.state.storage.deleteAll();
@@ -245,7 +251,7 @@ export class SearchJobObject {
 
   async scheduleAlarm(job) {
     if (typeof this.state.storage.setAlarm === "function") {
-      const expiresAt = Number(job.createdAt || Date.now()) + SEARCH_JOB_TTL_SECONDS * 1000;
+      const expiresAt = Number(job.updatedAt || job.createdAt || Date.now()) + SEARCH_JOB_TTL_SECONDS * 1000;
       const processingUntil = Number(job.processingUntil || 0);
       const resumeAt = isActiveSearchStatus(job.status)
         ? Math.max(Date.now() + 1000, processingUntil)
@@ -625,6 +631,7 @@ async function handleSearchStart(request, env, ctx) {
     }), { expirationTtl: SEARCH_WINDOW_SECONDS * 2 });
   }
 
+  const incumbent = await readVerifiedPairForDisplay(env, start, target, range).catch(() => null);
   const job = searchJobShape({
     id,
     start,
@@ -632,13 +639,13 @@ async function handleSearchStart(request, env, ctx) {
     range,
     // Every new-policy search starts without a historical route answer.
     status: "queued",
-    progress: "Queued",
+    progress: incumbent ? "Showing the last verified route; queued a full search for a shorter one." : "Queued full-history search",
     stats: { fetched: 0, requests: 0, cached: 0, expanded: 0 },
-    chain: null,
-    players: {},
+    chain: incumbent?.chain || null,
+    players: incumbent?.players || {},
     refreshCached: false,
-    cachedAt: null,
-    search: { ...initialSearchState(start, target), fastLaneChecked: true },
+    cachedAt: incumbent?.verifiedAt || null,
+    search: { ...initialSearchState(start, target), fastLaneChecked: true, pagedSearchRequested: true },
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
@@ -1163,45 +1170,28 @@ async function runSearchJobChunk(env, id, options = {}) {
       chunkStartedAt: Date.now(),
     });
 
-    if (result?.status !== "found" && result?.chain?.path?.length && job.policyVersion === SEARCH_POLICY_VERSION) {
+    if (result?.status !== "found" && result?.chain?.path?.length && job.policyVersion === SEARCH_POLICY_VERSION &&
+        (!job.chain?.found || result.chain.path.length < job.chain.path.length)) {
       job.chain = { target: job.target, display: job.target, found: true,
         length: result.chain.path.length - 1, path: result.chain.path, hops: result.chain.hops };
+      await writePairChain(env,job).catch(()=>{});
     }
     if (result?.status === "running") {
       if (searchProgressMarker(search, stats) === beforeAdvanceMarker) {
         search.stalledChunks = Number(search.stalledChunks || 0) + 1;
-        if (search.stalledChunks >= SEARCH_MAX_STALLED_CHUNKS) {
-          const keepSaved = Boolean(job.chain?.found);
-          await completeSearchJob(env, job, {
-            status: job.policyVersion === SEARCH_POLICY_VERSION ? "timeout" : keepSaved ? "found" : "timeout",
-            outcome: job.policyVersion === SEARCH_POLICY_VERSION ? "timeout" : keepSaved ? "found" : "timeout",
-            progress: job.policyVersion === SEARCH_POLICY_VERSION
-              ? "Search paused after repeated upstream stalls; shorter paths remain unchecked."
-              : keepSaved
-              ? "Saved connection kept; the shorter-route check paused after upstream stalls."
-              : "Search paused after repeated upstream stalls. Try again shortly.",
-            chain: keepSaved ? job.chain : null,
-            players: keepSaved ? (job.players || {}) : {},
-            stats,
-            search,
-            processingUntil: 0,
-            processingToken: "",
-            durationMs: Date.now() - startedAt,
-          }, ownerToken);
-          return readSearchJob(env, id);
-        }
         return updateOwnedSearchJob(env, id, ownerToken, {
           status: "running",
           progress: result.progress || "Search paused briefly and will retry the same players.",
           stats,
           search,
-          processingUntil: searchPauseUntil(result.pauseMs),
+          chain: job.chain,
+          processingUntil: searchPauseUntil(Math.max(Number(result.pauseMs)||0, Math.min(300000, 1000 * 2 ** Math.min(search.stalledChunks,8)))),
           processingToken: "",
           startedAt,
         });
       }
       search.stalledChunks = 0;
-      if (job.chain?.found && job.refreshCached && Number(stats.expanded || 0) >= CACHED_SHORTER_CHECK_EXPANSIONS) {
+      if (job.policyVersion !== SEARCH_POLICY_VERSION && job.chain?.found && job.refreshCached && Number(stats.expanded || 0) >= CACHED_SHORTER_CHECK_EXPANSIONS) {
         await completeSearchJob(env, job, {
           status: "found",
           outcome: "found",
@@ -1320,14 +1310,14 @@ async function runSearchJobChunk(env, id, options = {}) {
       hops: await enrichHopsFromCache(env, chainResult.hops, archiveLimitForRange(job.range), stats, search.sinceMonth),
     };
     chain.quality = routeQuality(chain, stats, cachedChain ? "shorter-check" : "fresh-search");
-    const useCached = job.policyVersion !== SEARCH_POLICY_VERSION && cachedChain && chainStepCount(cachedChain) <= chainStepCount(chain);
+    const useCached = cachedChain && chainStepCount(cachedChain) <= chainStepCount(chain);
     const finalChain = useCached ? cachedChain : chain;
     const finalPlayers = useCached ? { ...players, ...(job.players || {}) } : { ...(job.players || {}), ...players };
 
     await completeSearchJob(env, job, {
       status: "found",
       outcome: "found",
-      shortestVerified: Boolean(result.shortestVerified),
+      shortestVerified: Boolean(result.shortestVerified && chainStepCount(finalChain) === chainStepCount(chain)),
       progress: job.policyVersion === SEARCH_POLICY_VERSION
         ? `Found ${job.start} to ${job.target}. ${result.progress || ""}`
         : useCached
@@ -1494,6 +1484,7 @@ function createSearchEdgeReader(env, job, stats) {
   const edgesCache = new Map();
   const primed = new Map();
   let freshRequestsThisChunk = 0;
+  let indexValidationsThisChunk = 0;
   let rootAuthorityPromise=null;
   const readRootAuthority=signal=>rootAuthorityPromise??=(async()=>{
     if(job.search?.twoHopInputReady!==true)return null;
@@ -1538,6 +1529,14 @@ function createSearchEdgeReader(env, job, stats) {
       (key === job.start || key === job.target);
     try {
       let edges = null;
+      let revalidatedArchiveList=null,indexDigest=null;
+      if(job.search?.pagedSearch===true) {
+        if(indexValidationsThisChunk>=SEARCH_INDEX_VALIDATIONS_PER_CHUNK)
+          return{deferred:true,reason:'chunk-request-limit'};
+        indexValidationsThisChunk++;
+        revalidatedArchiveList=await readArchiveList(env,key,{signal,minObservedAt:job.search.pagedStartedAt||job.createdAt});
+        indexDigest=revalidatedArchiveList.missing?null:await archiveIndexDigest(revalidatedArchiveList,sinceMonth,archiveLimit).catch(()=>null);
+      }
       if (mayRefreshKnownRoute) {
         edges = await readOrFetchEdges(env, {
           username: key,
@@ -1546,20 +1545,22 @@ function createSearchEdgeReader(env, job, stats) {
           signal,
         }, stats);
       } else {
-        const cached = primed.get(key) || await readCachedExpansionEdges(env, { username: key, archiveLimit, sinceMonth }, stats);
+        const cached = primed.get(key) || await readCachedExpansionEdges(env, { username: key, archiveLimit, sinceMonth, requireNegativeProof: job.search?.pagedSearch===true, indexDigest }, stats);
         edges = cached.edges;
         if (cached.source === "miss" && !cachedShorterCheck) {
-          if (Number(stats.requests || 0) >= SEARCH_FRESH_EDGE_REQUEST_LIMIT) {
+          if (job.policyVersion !== SEARCH_POLICY_VERSION && Number(stats.requests || 0) >= SEARCH_FRESH_EDGE_REQUEST_LIMIT) {
             return { deferred: true, reason: "search-request-limit" };
           }
           if (freshRequestsThisChunk >= SEARCH_FRESH_EDGE_REQUESTS_PER_CHUNK) {
             return { deferred: true, reason: "chunk-request-limit" };
           }
           freshRequestsThisChunk++;
-          const certificateHooks = await twoHopHooks(env,job,key,signal).catch(error=>{
+          const nativeRootReady = job.search?.pagedSearch !== true || key === job.start ||
+            (job.search?.pagedStartNegativeComplete === true && Number(job.search?.pagedRootExpiresAt)>Date.now());
+          const certificateHooks = nativeRootReady ? await twoHopHooks(env,job,key,signal).catch(error=>{
             if (signal?.aborted) throw error;
             return null; // Certificate unavailability never blocks ordinary search.
-          });
+          }) : null;
           // Root/target need raw games for direct and two-hop certificate hooks.
           // Reuse only interior adjacency; no BFS node completes until fetchGames ends.
           const monthHistory = key !== job.start && key !== job.target && eligibleCertificateJob(job) &&
@@ -1567,6 +1568,8 @@ function createSearchEdgeReader(env, job, stats) {
             ? createMonthHistoryHooks(job,key,(action,payload)=>twoHopRequest(env,job,action,payload,signal),signal) : null;
           const threeHopMonth=await streamThree(key,signal);
           edges = await readOrFetchEdges(env, { username: key, archiveLimit, sinceMonth,
+            requireNegativeProof: job.search?.pagedSearch===true,
+            indexDigest,revalidatedArchiveList,minIndexObservedAt:job.search.pagedStartedAt||job.createdAt,
             [INTERNAL_THREE_HOP]:threeHopMonth,
             [INTERNAL_MONTH_HISTORY]:monthHistory,
             directTarget: key === job.start ? job.target : null, signal,
@@ -1605,11 +1608,14 @@ function createSearchEdgeReader(env, job, stats) {
     }
   };
   const prime = async (nodes) => {
+    // New full searches must validate the advertised archive index inside the
+    // budgeted reader before a complete cached adjacency can prove absence.
+    if(job.search?.pagedSearch===true)return;
     await runThrottled(nodes.map((username) => async () => {
       const key = username.toLowerCase();
       if (edgesCache.has(key) || primed.has(key)) return;
       try {
-        const cached = await readCachedExpansionEdges(env, { username: key, archiveLimit, sinceMonth }, stats);
+        const cached = await readCachedExpansionEdges(env, { username: key, archiveLimit, sinceMonth, requireNegativeProof: job.search?.pagedSearch===true }, stats);
         primed.set(key, cached);
         if (cached.source !== "miss") edgesCache.set(key, { edges: cached.edges });
       } catch {
@@ -1638,6 +1644,12 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
         pauseMs: isRateLimitError(error) ? clampRetryAfter(error.retryAfter) * 1000 : 1000 };
     }
   }
+  if ((search.pagedSearchRequested || search.pagedSearch) &&
+      (env.SEARCH_JOBS || typeof env.__SEARCH_JOB_LOCAL?.object?.state?.storage?.transaction === 'function') &&
+      job.policyVersion === SEARCH_POLICY_VERSION) {
+    const paged = await advancePagedServerSearch(env,job,search,stats,progress,options);
+    if (paged) return paged;
+  }
   // All expanded players use this persisted boundary. Saved route answers and
   // their derived graph indexes never participate in a new search.
   const result = await advanceBidirectionalSearch(env, { ...job, search }, search, stats, progress, options);
@@ -1646,6 +1658,71 @@ async function advanceServerSearch(env, job, search, stats, progress, options = 
   // every current Chess.com game has already reached its public archive.
   result.shortestVerified = result.status === "found" && result.chain?.path?.length === 2;
   return result;
+}
+
+async function advancePagedServerSearch(env,job,search,stats,progress,options={}) {
+  const deadline=Date.now()+(Number(options.timeBudgetMs)||SEARCH_CHUNK_TIME_MS);
+  const reader=options.edgeReader||createSearchEdgeReader(env,{...job,search},stats);
+  const act=(action,payload={})=>twoHopRequest(env,job,action,payload,null);
+  let work=await act('full-bfs-load');
+  if(!work.accepted) {
+    return{status:'running',progress:'Stored search is temporarily unavailable; retrying automatically.',pauseMs:2000};
+  }
+  if(!search.pagedSearch){search.pagedSearch=true;search.pagedStartedAt=Date.now();search.pagedExpansionBase=Number(stats.expanded||0);}
+  const resultOf=work=>{
+    search.pagedVersion=Number(work.version||0);
+    stats.expanded=Number(search.pagedExpansionBase||0)+Number(work.expanded||0);
+    search.incomplete=Boolean(work.incomplete);
+    if(work.terminal)return{...work.terminal,chain:work.best||null,nativeFullSearch:true,
+      progress:work.terminal.status==='found'?'All shorter breadth-first layers were checked.':'All reachable full-history layers were checked.'};
+    return null;
+  };
+  const commitBudget=Math.max(1,Math.min(SEARCH_CHUNK_EXPANSIONS,Number(options.expansionBudget)||SEARCH_CHUNK_EXPANSIONS));
+  for(let commits=0;commits<commitBudget&&Date.now()<deadline;commits++) {
+    const done=resultOf(work);if(done)return done;
+    if(work.waiting)return{status:'running',chain:work.best||null,progress:'Missing game history is retained for a full retry.',pauseMs:5000};
+    if(!work.staged) {
+      await reader.prime([work.node]);
+      let outcome;
+      try{outcome=await withAbortTimeout(signal=>reader.read(work.node,signal),SEARCH_FRESH_EDGE_LOOKUP_TIMEOUT_MS);}
+      catch{outcome={deferred:true,reason:'upstream-timeout'};}
+      if(work.node===job.start&&outcome.edges) {
+        search.pagedStartNegativeComplete=outcome.edges.archiveCoverage?.negativeComplete===true;
+        search.pagedRootExpiresAt=Number(outcome.edges.archiveCoverage?.expiresAt||0);
+      }
+      if(outcome.directProof)return{status:'found',shortestVerified:true,chain:{path:[job.start,job.target],hops:[outcome.directProof]},nativeFullSearch:true};
+      if(outcome.twoHopWitness)return{status:'found',shortestVerified:true,chain:outcome.twoHopWitness,nativeFullSearch:true};
+      if(outcome.threeHopWitness) {
+        const confirmation=await act('root-three-read');
+        const authority=confirmation.accepted?await unpackRootBound(confirmation.startPackage,confirmation.targetPackage,confirmation.startScan):null;
+        if(authority&&authority.digest===outcome.rootAuthority.digest&&rootBoundFresh(authority,job)&&
+          await rootBoundIndexesMatch(env,job,authority,null)&&Date.now()<confirmation.leaseUntil)
+          return{status:'found',shortestVerified:true,chain:outcome.threeHopWitness,nativeFullSearch:true};
+        outcome={deferred:true,reason:'root-bound-expired'};
+      }
+      if(outcome.deferred&&outcome.reason==='chunk-request-limit')
+        return{status:'running',chain:work.best||null,progress:'Continuing the full search in the next background chunk.',pauseMs:0};
+      if(outcome.deferred||!outcome.edges||outcome.edges.truncated) {
+        const deferred=await act('full-bfs-defer',{version:work.version,node:work.node});
+        if(deferred.accepted)resultOf(deferred);
+        return{status:'running',chain:deferred.best||work.best||null,progress:outcome.retryAfter?'Chess.com is throttling requests; full search will resume automatically.':'An archive is unavailable; retaining this player and continuing automatically.',pauseMs:outcome.retryAfter?outcome.retryAfter*1000:1000};
+      }
+      const map=work.side==='forward'?outcome.edges.beatenByMe:outcome.edges.beatMe;
+      const staged=await act('full-bfs-stage',{version:work.version,node:work.node,
+        edges:[...map].map(([username,urls])=>[username,urls[0]]),incomplete:Boolean(outcome.incomplete),
+        observedAt:outcome.edges.archiveCoverage?.observedAt,expiresAt:outcome.edges.archiveCoverage?.expiresAt});
+      if(!staged.accepted)return{status:'running',progress:'Search checkpoint changed; retrying the same work.',pauseMs:1000};
+      work={...staged,staged:true};
+    }
+    const advanced=await act('full-bfs-advance',{version:work.version});
+    if(!advanced.accepted)return{status:'running',progress:'Search checkpoint changed; retrying the same work.',pauseMs:1000};
+    const doneAfter=resultOf(advanced);if(doneAfter)return doneAfter;
+    if(advanced.retry)return{status:'running',chain:advanced.best,progress:'Some archives are unavailable; remaining players and missing histories will be retried.',pauseMs:1000};
+    work=await act('full-bfs-load');
+    if(!work.accepted)return{status:'running',progress:'Search checkpoint is temporarily unavailable; retrying automatically.',pauseMs:1000};
+  }
+  resultOf(work);
+  return{status:'running',chain:work.best||null,progress:`Full-history search checked ${stats.expanded} players; continuing automatically.`,pauseMs:0};
 }
 
 // Scheduling metadata never enters visited maps or completeness certificates.
@@ -1980,7 +2057,7 @@ async function completeSearchJob(env, job, patch, ownerToken = "") {
     : await updateSearchJob(env, job.id, update);
   if (ownerToken && !next) return;
   const completed = next || { ...job, ...preparedPatch };
-  if (completed?.policyVersion !== SEARCH_POLICY_VERSION && completed?.status === "found" && completed.chain?.found) {
+  if (completed?.status === "found" && completed.chain?.found) {
     await writePairChain(env, completed);
     await writeFastLaneFragments(env, completed);
   }
@@ -1989,14 +2066,16 @@ async function completeSearchJob(env, job, patch, ownerToken = "") {
 }
 
 async function failSearchJob(env, id, error, ownerToken = "") {
+  const retryable = isRateLimitError(error) || error instanceof UpstreamHTTPError ||
+    error?.name === 'AbortError' || error?.name === 'TypeError';
   const patch = {
-    status: isRateLimitError(error) ? "timeout" : "failed",
-    outcome: isRateLimitError(error) ? "timeout" : "error",
-    progress: isRateLimitError(error)
-      ? "Chess.com is throttling requests right now."
+    status: retryable ? "running" : "failed",
+    outcome: retryable ? "started" : "error",
+    progress: retryable
+      ? "An upstream request paused; the saved full search will retry automatically."
       : "Search failed before it could finish.",
     error: error?.message || String(error),
-    processingUntil: 0,
+    processingUntil: retryable ? searchPauseUntil(isRateLimitError(error) ? clampRetryAfter(error.retryAfter)*1000 : 5000) : 0,
     processingToken: "",
     updatedAt: Date.now(),
   };
@@ -2835,7 +2914,7 @@ function cacheRangePriority(key) {
 }
 
 async function enrichHopsFromCache(env, hops, archiveLimit, stats = null, sinceMonth = null) {
-  const cleanHops = cleanHopList(hops);
+  const cleanHops = cleanHopList(hops, Array.isArray(hops)?hops.length:0);
   const byFrom = new Map();
   for (const hop of cleanHops) {
     if (!byFrom.has(hop.from)) byFrom.set(hop.from, []);
@@ -2856,7 +2935,7 @@ async function enrichHopsFromCache(env, hops, archiveLimit, stats = null, sinceM
 }
 
 async function enrichHopsFromGames(hops, games) {
-  return cleanHopList(hops).map((hop) => {
+  return cleanHopList(hops, Array.isArray(hops)?hops.length:0).map((hop) => {
     const game = (games || []).find((item) => item.url === hop.url);
     return game ? { ...hop, ...proofDetailsFromGame(game, hop.from, hop.to) } : hop;
   });
@@ -4226,7 +4305,18 @@ async function saveAnalyticsEvent(env, event, options = {}) {
 
 async function readSearchJob(env, id) {
   const durable = await durableSearchJobRequest(env, id, "read", {}, { timeoutMs: SEARCH_DURABLE_READ_TIMEOUT_MS });
-  if (durable.used && durable.job) return durable.job;
+  if (durable.used && durable.job) {
+    const job=durable.job;
+    if((isActiveSearchStatus(job.status)||(job.status==='found'&&job.shortestVerified!==true))&&!job.search.pagedSearchRequested&&!job.search.pagedSearch&&env.SEARCH_JOBS) {
+      // Preserve the incumbent, invalidate the old bounded lease, and restart
+      // traversal from its roots using the new lossless native queue.
+      return await updateSearchJob(env,id,{search:{...initialSearchState(job.start,job.target),
+        profileChecked:job.search.profileChecked,fastLaneChecked:true,pagedSearchRequested:true},
+        status:'running',processingUntil:0,processingToken:'',shortestVerified:false,
+        progress:'Resuming the saved route with a full-history search.'})||job;
+    }
+    return job;
+  }
   const record = await env.GAMES_CACHE.get(searchJobKey(id), { type: "json" });
   return record?.policyVersion === SEARCH_POLICY_VERSION ? searchJobShape(record) : null;
 }
@@ -4365,15 +4455,28 @@ async function readPairChain(env, start, target, range) {
   return pairChainShape(record, start, target, range);
 }
 
+function proofBearingRoute(chain, start, target) {
+  const path=chain?.path,hops=chain?.hops;
+  return chain?.found && Array.isArray(path) && path.length>=2 && path[0]===start && path.at(-1)===target &&
+    new Set(path).size===path.length && Array.isArray(hops) && hops.length===path.length-1 &&
+    hops.every((hop,index)=>hop.from===path[index]&&hop.to===path[index+1]&&/^https:\/\/www\.chess\.com\/game\/live\/[1-9]\d*$/.test(hop.url));
+}
+
+async function readVerifiedPairForDisplay(env,start,target,range) {
+  const pairs=await Promise.all([...new Set([range,'all','auto'])].map(r=>readPairChain(env,start,target,r).catch(()=>null)));
+  return pairs.filter(pair=>pair?.verificationVersion==='server-game-proofs-v1' && Number.isFinite(pair.verifiedAt) &&
+    proofBearingRoute(pair.chain,start,target)).sort((a,b)=>chainStepCount(a.chain)-chainStepCount(b.chain)||b.verifiedAt-a.verifiedAt)[0]||null;
+}
+
 async function writePairChain(env, job) {
   const shaped = searchJobShape(job);
-  if (!shaped?.chain?.found) return null;
+  if (!proofBearingRoute(shaped?.chain,shaped?.start,shaped?.target)) return null;
   await clearStartNoWins(env, shaped.start, shaped.range).catch(() => {});
   const key = pairChainKey(shaped.start, shaped.target, shaped.range);
   const current = await readPairChain(env, shaped.start, shaped.target, shaped.range);
   const currentSteps = chainStepCount(current?.chain);
   const nextSteps = chainStepCount(shaped.chain);
-  const keepCurrent = current?.chain?.found && currentSteps < nextSteps;
+  const keepCurrent = current?.verificationVersion==='server-game-proofs-v1' && proofBearingRoute(current.chain,shaped.start,shaped.target) && currentSteps < nextSteps;
   const record = keepCurrent
     ? {
         ...current,
@@ -4387,6 +4490,8 @@ async function writePairChain(env, job) {
         players: shaped.players || {},
         savedAt: current?.savedAt || Date.now(),
         checkedAt: Date.now(),
+        verifiedAt: Date.now(),
+        verificationVersion: 'server-game-proofs-v1',
       };
   await env.GAMES_CACHE.put(key, JSON.stringify(record), {
     expirationTtl: PAIR_CHAIN_TTL_SECONDS,
@@ -5036,12 +5141,13 @@ function pairChainKey(start, target, range) {
 
 function pairChainShape(record, start, target, range) {
   if (!record || typeof record !== "object") return null;
-  const chain = chainShape(record.chain, target);
+  const trusted=record.verificationVersion==='server-game-proofs-v1';
+  const chain = chainShape(record.chain, target, trusted && Array.isArray(record.chain?.path) ? record.chain.path.length : MAX_CHAIN_NODES);
   if (!chain?.found || !Array.isArray(chain.path) || chain.path.length < 2) return null;
   const normalizedStart = cleanUsername(start || record.start);
   const normalizedTarget = cleanUsername(target || record.target || chain.target);
   const normalizedRange = cleanRange(range || record.range) || "auto";
-  const path = normalizePath(normalizedStart, normalizedTarget, chain.path);
+  const path = trusted ? chain.path : normalizePath(normalizedStart, normalizedTarget, chain.path);
   const hops = Array.isArray(chain.hops)
     ? chain.hops.filter((hop) => hop.from && hop.to && path.includes(hop.from) && path.includes(hop.to))
     : [];
@@ -5062,22 +5168,24 @@ function pairChainShape(record, start, target, range) {
     players: record.players && typeof record.players === "object" ? record.players : {},
     savedAt: Number.isFinite(record.savedAt) ? record.savedAt : Date.now(),
     checkedAt: Number.isFinite(record.checkedAt) ? record.checkedAt : null,
+    verifiedAt: Number.isFinite(record.verifiedAt) ? record.verifiedAt : null,
+    verificationVersion: record.verificationVersion === 'server-game-proofs-v1' ? record.verificationVersion : '',
   };
 }
 
-function chainShape(rawChain, target) {
+function chainShape(rawChain, target, maxNodes=MAX_CHAIN_NODES) {
   if (!rawChain || typeof rawChain !== "object") return null;
   const normalizedTarget = cleanUsername(rawChain.target || target);
   const path = Array.isArray(rawChain.path)
-    ? rawChain.path.slice(0, MAX_CHAIN_NODES).map(cleanUsername).filter(Boolean)
+    ? rawChain.path.slice(0, maxNodes).map(cleanUsername).filter(Boolean)
     : [];
-  const hops = cleanHopList(rawChain.hops);
+  const hops = cleanHopList(rawChain.hops, Math.max(0,maxNodes-1));
   return {
     target: normalizedTarget,
     display: String(rawChain.display || normalizedTarget).slice(0, 80),
     found: Boolean(rawChain.found),
     length: Number.isFinite(rawChain.length)
-      ? Math.max(0, Math.min(MAX_CHAIN_NODES - 1, rawChain.length))
+      ? Math.max(0, Math.min(maxNodes - 1, rawChain.length))
       : Math.max(0, path.length - 1),
     path,
     hops,
@@ -5102,12 +5210,12 @@ function searchJobShape(job) {
         display: String(job.chain.display || job.chain.target || target).slice(0, 80),
         found: Boolean(job.chain.found),
         length: Number.isFinite(job.chain.length)
-          ? Math.max(0, Math.min(MAX_CHAIN_NODES - 1, job.chain.length))
+          ? Math.max(0, job.chain.length)
           : null,
         path: Array.isArray(job.chain.path)
-          ? job.chain.path.slice(0, MAX_CHAIN_NODES).map(cleanUsername).filter(Boolean)
+          ? job.chain.path.map(cleanUsername).filter(Boolean)
           : [],
-        hops: cleanHopList(job.chain.hops),
+        hops: cleanHopList(job.chain.hops, Array.isArray(job.chain.hops)?job.chain.hops.length:0),
         quality: qualityShape(job.chain.quality),
       }
     : null;
@@ -5215,8 +5323,8 @@ function publicSearchJobShape(job) {
   };
 }
 
-function cleanHopList(value) {
-  return Array.isArray(value) ? value.slice(0, MAX_CHAIN_NODES - 1).map((hop) => ({
+function cleanHopList(value, maxHops=MAX_CHAIN_NODES-1) {
+  return Array.isArray(value) ? value.slice(0, maxHops).map((hop) => ({
     from: cleanUsername(hop?.from),
     to: cleanUsername(hop?.to),
     url: cleanUrl(hop?.url),
@@ -5326,7 +5434,14 @@ function searchStateShape(state, start, target) {
     activeNextFrontier: activeSide ? cleanUsernameList(state.activeNextFrontier, SEARCH_NEXT_FRONTIER_LIMIT) : [],
     bestMeeting: activeSide ? cleanUsername(state.bestMeeting) : "",
     bestMeetingLength: activeSide ? cleanNonNegativeNumber(state.bestMeetingLength, SEARCH_MAX_DEPTH * 2 + 2) || 0 : 0,
-    stalledChunks: cleanNonNegativeNumber(state.stalledChunks, SEARCH_MAX_STALLED_CHUNKS) || 0,
+    stalledChunks: cleanNonNegativeNumber(state.stalledChunks, 100000) || 0,
+    pagedSearch: Boolean(state.pagedSearch),
+    pagedSearchRequested: Boolean(state.pagedSearchRequested),
+    pagedStartedAt: Number.isFinite(state.pagedStartedAt)?state.pagedStartedAt:0,
+    pagedVersion: cleanNonNegativeNumber(state.pagedVersion, Number.MAX_SAFE_INTEGER) || 0,
+    pagedStartNegativeComplete: state.pagedStartNegativeComplete===true,
+    pagedRootExpiresAt: Number.isFinite(state.pagedRootExpiresAt)?state.pagedRootExpiresAt:0,
+    pagedExpansionBase: cleanNonNegativeNumber(state.pagedExpansionBase, Number.MAX_SAFE_INTEGER) || 0,
     incomplete: Boolean(state.incomplete),
     historyRetryNodes: cleanUsernameList(state.historyRetryNodes, SEARCH_FRONTIER_LIMIT)
       .filter(node => pendingHistoryNodes.has(node)),
@@ -5350,6 +5465,7 @@ function searchProgressMarker(search, stats) {
     Array.isArray(search?.activeNextFrontier) ? search.activeNextFrontier.length : 0,
     String(search?.sinceMonth || ""),
     Number(search?.stalledChunks || 0),
+    Number(search?.pagedVersion || 0),
   ].join("|");
 }
 
@@ -5683,7 +5799,10 @@ function archiveProviderTTL(response) {
 // Archive coverage travels with cached rows without changing their public JSON.
 function attachArchiveCoverage(value, coverage) {
   if (coverage) Object.defineProperty(value, 'archiveCoverage', {
-    value: { sinceMonth: coverage.sinceMonth, expiresAt: coverage.expiresAt },
+    value: { sinceMonth: coverage.sinceMonth, expiresAt: coverage.expiresAt,
+      ...(Number.isFinite(coverage.observedAt)?{observedAt:coverage.observedAt}:{}),
+      ...(typeof coverage.indexDigest==='string'?{indexDigest:coverage.indexDigest}:{}),
+      ...(coverage.negativeComplete===true?{negativeComplete:true}:{}) },
     enumerable: false, configurable: true,
   });
   return value;
@@ -5696,25 +5815,33 @@ function selectSharedArchives(archives, sinceMonth, archiveLimit) {
   }
   return Number.isFinite(archiveLimit) ? archives.slice(-archiveLimit) : archives;
 }
-async function readArchiveList(env, username, {signal = null, metrics = null} = {}) {
+async function readArchiveList(env, username, {signal = null, metrics = null, minObservedAt = 0} = {}) {
   const check = () => { if (signal?.aborted) throw abortSignalError(signal); };
   check();
   const key = `archives:fetch:v1:${username}`;
   let record = env ? await env.GAMES_CACHE.get(key,{type:'json',cacheTtl:60}).catch(() => null) : null;
   check();
   if (record?.schema === 1 && Number.isFinite(record.ts) && record.ts <= Date.now() &&
+      record.ts>=Number(minObservedAt||0) &&
       Date.now()-record.ts < ARCHIVE_LIST_CACHE_TTL_SECONDS*1000 && Array.isArray(record.archives) &&
       record.archives.every((url,index) => validArchiveURL(url,username) &&
         (!index || archiveMonthFromUrl(url) >= archiveMonthFromUrl(record.archives[index-1])))) return record;
-  let data;
-  try { data = await fetchJSON(`${CHESS_API}${username}/games/archives`,{signal,metrics}); }
-  catch(error) { if (!isMissingArchivesError(error)) throw error; return {schema:1,ts:Date.now(),archives:[]}; }
+  let data, observedAt;
+  try {
+    const url=`${CHESS_API}${username}/games/archives`;
+    const envelope=await shareArchiveFetch(env?.GAMES_CACHE,url,async sharedSignal=>{
+      const data=await fetchJSON(url,{signal:sharedSignal,metrics}),observedAt=Date.now();
+      return{data,observedAt,reuseUntil:observedAt+ARCHIVE_LIST_CACHE_TTL_SECONDS*1000};
+    },{signal,reuseCompleted:!minObservedAt});
+    data=envelope.data;observedAt=envelope.observedAt;
+  }
+  catch(error) { if (!isMissingArchivesError(error)) throw error; return {schema:1,ts:Date.now(),archives:[],missing:true}; }
   check();
   if (!Array.isArray(data.archives) || !data.archives.every(url => validArchiveURL(url,username))) throw new Error('Invalid archive list');
   // Chess.com lists oldest first. Reject disorder rather than selecting a wrong
   // last-N boundary; preserve original ordering/duplicates in valid lists.
   if (data.archives.some((url,index) => index && archiveMonthFromUrl(url) < archiveMonthFromUrl(data.archives[index-1]))) throw new Error('Unordered archive list');
-  record = {schema:1,ts:Date.now(),archives:data.archives};
+  record = {schema:1,ts:observedAt,archives:data.archives};
   if (env) await env.GAMES_CACHE.put(key,JSON.stringify(record),{expirationTtl:ARCHIVE_LIST_CACHE_TTL_SECONDS}).catch(() => {});
   check(); return record;
 }
@@ -5726,13 +5853,18 @@ async function sharedSinceMonth(env, start, target, range, options = {}) {
   // Empty endpoint lists add no games; sentinel remains a consistent graph.
   return oldest[0] || '0000/01';
 }
+async function archiveIndexDigest(list,sinceMonth,archiveLimit) {
+  return certificateDigest('archive-index:v1:'+JSON.stringify(selectSharedArchives(list.archives,sinceMonth,archiveLimit)));
+}
 function sharedWindowCacheKey(parsed) {
   if (!validSinceMonth(parsed.sinceMonth)) throw new Error('Missing shared archive window');
   return `${parsed.username}:since:${parsed.sinceMonth}`;
 }
 function sharedCoverageFresh(record, parsed) {
   return record?.coverage?.sinceMonth === parsed.sinceMonth && validSinceMonth(parsed.sinceMonth) &&
-    Number.isFinite(record.coverage.expiresAt) && record.coverage.expiresAt > Date.now();
+    Number.isFinite(record.coverage.expiresAt) && record.coverage.expiresAt > Date.now() &&
+    (!parsed.requireNegativeProof || (record.coverage.negativeComplete===true &&
+      typeof parsed.indexDigest==='string' && record.coverage.indexDigest===parsed.indexDigest));
 }
 export class DirectWinFound extends Error {
   constructor(game) {
@@ -5755,8 +5887,9 @@ function checkDirectArchiveWin(games, username, directTarget) {
   const game = directArchiveWinGame(games, username, directTarget);
   if (game) throw new DirectWinFound(game);
 }
-async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null, [INTERNAL_TWO_HOP]: certificateHooks = null, [INTERNAL_ALLOW_PARTIAL_HISTORY]: onIncomplete = null, [INTERNAL_MONTH_HISTORY]: monthHistory = null }, env = null) {
-  let incomplete = false;
+async function fetchGames({ username, archiveLimit, signal = null, metrics = null, sinceMonth = null, onCoverage = null, directTarget = null, collectGames = true, onGames = null, requireNegativeProof = false, forceFresh = false, minIndexObservedAt = 0, revalidatedArchiveList = null, [INTERNAL_TWO_HOP]: certificateHooks = null, [INTERNAL_ALLOW_PARTIAL_HISTORY]: onIncomplete = null, [INTERNAL_MONTH_HISTORY]: monthHistory = null }, env = null) {
+  let incomplete = false, negativeComplete=true;
+  if(requireNegativeProof)monthHistory=null;
   const checkAbort = () => { if (signal?.aborted) throw abortSignalError(signal); };
   const optionalCertificateHook = async (name, ...args) => {
     if (!certificateHooks) return;
@@ -5770,7 +5903,9 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     }
   };
   checkAbort();
-  const list = await readArchiveList(env, username, { signal, metrics });
+  const list = revalidatedArchiveList || await readArchiveList(env, username, { signal, metrics,
+    minObservedAt:requireNegativeProof?minIndexObservedAt:0 });
+  if(requireNegativeProof&&list.missing)negativeComplete=false;
   checkAbort();
   const directScan = Boolean(directTarget && cleanUsername(directTarget) === directTarget && directTarget !== username);
   const selected = [...selectSharedArchives(list.archives, sinceMonth, archiveLimit)];
@@ -5814,18 +5949,22 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
   const rows = await runThrottled(selected.map((url, index) => async () => {
     checkAbort();
     const key = `archive:games:v1:${username}:${archiveMonthFromUrl(url)}`;
-    const resumed = await checkpoint('read',url);
+    const resumed = requireNegativeProof?null:await checkpoint('read',url);
     checkAbort();
     if (resumed && resumed.expiresAt > Date.now()) {
+      negativeComplete=false;
       expiresAt=Math.min(expiresAt,resumed.expiresAt);
       onGames?.([],()=>resumed.edges);
       return [];
     }
     const cached = await readMonthCache(key, index);
     checkAbort();
+    const cachedNegative=Boolean(requireNegativeProof&&cached?.negativeProvenance&&await validMonthlyNegativeProvenance(cached,username,url).catch(()=>false));
     if (cached?.schema === 1 && cached.url === url && Number.isFinite(cached.expiresAt) &&
+        (!requireNegativeProof||cachedNegative) &&
         cached.expiresAt > Date.now() && Array.isArray(cached.games) && cached.games.every(validSanitizedArchiveGame)) {
       expiresAt = Math.min(expiresAt, cached.expiresAt);
+      negativeComplete=negativeComplete&&cachedNegative;
       checkDirectArchiveWin(cached.games, username, directTarget);
       let monthEdges; const getMonthEdges = () => monthEdges ??= edgesFromGames(username, cached.games);
       if (certificateHooks) await optionalCertificateHook('month',{url,index,games:cached.games,getMonthEdges,expiresAt:cached.expiresAt,observedAt:Date.now(),source:'cache',negativeInputValid:await validMonthlyNegativeProvenance(cached,username,url).catch(()=>false)});
@@ -5833,11 +5972,18 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
       if(monthHistory?.active===true && !certificateHooks && !directTarget && collectGames===false && cached.games.every(validSanitizedArchiveGame))await checkpoint('month',{url,edges:getMonthEdges(),expiresAt:cached.expiresAt,observedAt:Date.now()});
       return collectGames === false ? [] : cached.games;
     }
-    let providerTTL = 0;
+    let providerTTL = 0, providerObservedAt;
     let data;
-    try { data = await fetchJSON(url, { signal, metrics,
-      onJSONResponse: (response) => { providerTTL = archiveProviderTTL(response); },
-    }); }
+    try {
+      const envelope=await shareArchiveFetch(env?.GAMES_CACHE,url,async sharedSignal=>{
+        let ttl=0;
+        const data=await fetchJSON(url,{signal:sharedSignal,metrics,
+          onJSONResponse:response=>{ttl=archiveProviderTTL(response);}});
+        const observedAt=Date.now(),now=new Date(observedAt),month=`${now.getUTCFullYear()}/${String(now.getUTCMonth()+1).padStart(2,'0')}`;
+        return{data,providerTTL:ttl,observedAt,reuseUntil:observedAt+(archiveMonthFromUrl(url)<month?TTL_SECONDS:ttl)*1000};
+      },{signal,reuseCompleted:!forceFresh});
+      data=envelope.data;providerTTL=envelope.providerTTL;providerObservedAt=envelope.observedAt;
+    }
     catch (error) {
       // Missing responses are never persisted as completed monthly coverage.
       if (isMissingMonthlyArchiveError(error)) {
@@ -5870,13 +6016,17 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     // Historical files remain refreshable under existing 7-day maximum; never
     // claim immutable history. Current/future month requires provider freshness.
     const ttl = archiveMonthFromUrl(url) < currentMonth ? TTL_SECONDS : providerTTL;
-    const observedExpiresAt = Date.now() + ttl * 1000;
+    const observedExpiresAt = providerObservedAt + ttl * 1000;
+    // Fresh complete raw responses form this job's observed snapshot even when
+    // providerTTL0 forbids reuse. Aggregate caching and reusable certificates
+    // still require expiresAt in the future; later jobs fetch that month again.
+    negativeComplete=negativeComplete&&negativeInputValid&&validNegativeGames(username,games);
     expiresAt = Math.min(expiresAt, observedExpiresAt);
     if (env && ttl >= 60 && games.every(validSanitizedArchiveGame)) {
       const cachedMonth={schema:1,url,expiresAt:observedExpiresAt,games};
       // Complete raw-envelope validation; hashes detect corruption, not malicious KV writes.
       if(negativeInputValid && validNegativeGames(username,games)) {
-        const provenance=await createMonthlyNegativeProvenance(cachedMonth,username,Date.now()).catch(()=>null);
+        const provenance=await createMonthlyNegativeProvenance(cachedMonth,username,providerObservedAt).catch(()=>null);
         if(provenance)cachedMonth.negativeProvenance=provenance;
       }
       checkAbort();
@@ -5885,9 +6035,9 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     checkAbort();
     checkDirectArchiveWin(games, username, directTarget);
     let monthEdges; const getMonthEdges = () => monthEdges ??= edgesFromGames(username, games);
-    if (certificateHooks) await optionalCertificateHook('month',{url,index,games,getMonthEdges,expiresAt:observedExpiresAt,observedAt:Date.now(),source:'provider',negativeInputValid});
+    if (certificateHooks) await optionalCertificateHook('month',{url,index,games,getMonthEdges,expiresAt:observedExpiresAt,observedAt:providerObservedAt,source:'provider',negativeInputValid});
     onGames?.(games, getMonthEdges);
-    if(monthHistory?.active===true && !certificateHooks && !directTarget && collectGames===false && games.every(validSanitizedArchiveGame))await checkpoint('month',{url,edges:getMonthEdges(),expiresAt:observedExpiresAt,observedAt:Date.now()});
+    if(monthHistory?.active===true && !certificateHooks && !directTarget && collectGames===false && games.every(validSanitizedArchiveGame))await checkpoint('month',{url,edges:getMonthEdges(),expiresAt:observedExpiresAt,observedAt:providerObservedAt});
     return collectGames === false ? [] : games;
   }), ARCHIVE_CONCURRENCY);
   checkAbort();
@@ -5895,7 +6045,9 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
   checkAbort();
   // Strict callers require every month; job-owned partial input has expiry0
   // and cannot publish an aggregate or a complete absence certificate.
-  const coverage = { sinceMonth, expiresAt };
+  if(requireNegativeProof&&!negativeComplete) {incomplete=true;onIncomplete?.();expiresAt=0;}
+  const coverage = { sinceMonth, expiresAt, observedAt:Date.now(),
+    indexDigest:await archiveIndexDigest(list,sinceMonth,archiveLimit).catch(()=>null),...(negativeComplete?{negativeComplete:true}:{}) };
   // Existing expiry validation controls aggregate caching. A historical input
   // that expires while scanning cannot be promoted by checkpoint reuse.
   onCoverage?.(coverage);

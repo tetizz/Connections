@@ -3,8 +3,10 @@
    ------------------------------------------------------------
    Pure browser JS. Hits the public Chess.com pubapi directly
    (CORS is enabled: Access-Control-Allow-Origin: *).
-   Finds the shortest chain  X -> ... -> TARGET  where each
+   Searches available full histories for X -> ... -> TARGET, where each
    arrow means "beat in a live standard-chess game".
+   Production searches use the durable backend; this local engine reports
+   observed routes without claiming an atomic view of Chess.com's graph.
    Exposes a single ChessChain class with a progress callback.
    ============================================================ */
 
@@ -26,9 +28,9 @@ window.ChessChain = class ChessChain {
     this._fetchTimeout = Number.isFinite(options.fetchTimeout)
       ? Math.max(1000, options.fetchTimeout)
       : 12000;
-    this._archiveLimit = Number.isFinite(options.archiveLimit)
-      ? Math.max(1, options.archiveLimit)
-      : Infinity;
+    // Stale local callers may still supply a former recent-month option.
+    // That option must never silently turn a full search into a shallow one.
+    this._archiveLimit = Infinity;
   }
 
   /** Acquire a concurrency slot without adding artificial request spacing. */
@@ -121,16 +123,11 @@ window.ChessChain = class ChessChain {
   }
 
   _cacheKey(username) {
-    const u = username.toLowerCase();
-    return Number.isFinite(this._archiveLimit)
-      ? `${u}:recent:${this._archiveLimit}`
-      : `${u}:all`;
+    return `${username.toLowerCase()}:all`;
   }
 
   _archiveLabel() {
-    return Number.isFinite(this._archiveLimit)
-      ? `latest ${this._archiveLimit} month${this._archiveLimit === 1 ? "" : "s"}`
-      : "full history";
+    return "full history";
   }
 
   /** Standard-chess games for a user (memory + shared Cloudflare cache). */
@@ -151,16 +148,23 @@ window.ChessChain = class ChessChain {
         return hit;
       }
     }
-    const { archives = [] } = await this.fetchJSON(this.API + u + "/games/archives");
-    const selectedArchives = Number.isFinite(this._archiveLimit)
-      ? archives.slice(-this._archiveLimit)
-      : archives;
+    const index = await this.fetchJSON(this.API + u + "/games/archives");
+    const archivePrefix = this.API + u + "/games/";
+    if (!Array.isArray(index?.archives) || index.archives.some(url =>
+      typeof url !== "string" || !url.startsWith(archivePrefix) ||
+      !/^\d{4}\/(0[1-9]|1[0-2])$/.test(url.slice(archivePrefix.length)))) {
+      throw new Error(`Could not read the game archive index for ${u}.`);
+    }
+    const archives = index.archives;
+    const selectedArchives = archives;
     this.log(`reading ${u}'s ${this._archiveLabel()} (${selectedArchives.length}/${archives.length} archives)…`);
     const games = [];
     // fetch archives — rely on the global _maxInflight gate for throttling
     const tasks = selectedArchives.map((archiveUrl) => async () => {
       try {
-        return { ok: true, data: await this.fetchJSON(archiveUrl), archiveUrl };
+        const data = await this.fetchJSON(archiveUrl);
+        if (!Array.isArray(data?.games)) throw new Error(`Invalid game archive response for ${archiveUrl}`);
+        return { ok: true, data, archiveUrl };
       } catch (error) {
         return { ok: false, error, archiveUrl };
       }
@@ -177,7 +181,7 @@ window.ChessChain = class ChessChain {
     }
     for (const result of results) {
       const data = result.data;
-      for (const g of data.games || []) {
+      for (const g of data.games) {
         if (g.rules !== "chess") continue;  // skip variants
         games.push({
           white: (g.white?.username || "").toLowerCase(),
@@ -229,7 +233,7 @@ window.ChessChain = class ChessChain {
   }
 
   /**
-   * Bidirectional BFS shortest beaten-chain from `start` to `target`.
+   * Bidirectional BFS through downloaded histories from `start` to `target`.
    *
    * Forward search (from `start`): follows "X beat Y" edges.
    * Backward search (from `target`): follows "Y beat target-side" edges,
@@ -240,7 +244,7 @@ window.ChessChain = class ChessChain {
    *
    * @returns { path, hops } or null.
    */
-  async findChain(start, target, maxDepth = 3) {
+  async findChain(start, target, maxDepth = Infinity) {
     start = start.toLowerCase(); target = target.toLowerCase();
     this.stats = { fetched: 0, apiCalls: 0, cached: 0, depth: 0 };
     this.log(`starting ${this._archiveLabel()} search…`);
@@ -267,13 +271,12 @@ window.ChessChain = class ChessChain {
 
       // ---- expand the SMALLER frontier each iteration ----
       const expandForward = forwardFrontier.length <= backwardFrontier.length;
-      const side = expandForward ? "forward" : "backward";
       const frontier = expandForward ? forwardFrontier : backwardFrontier;
       this.log(`step ${depth + 1}: looking through ${frontier.length} player's games ` +
                `(checked ${totalVisited()} so far)`);
 
       if (frontier.length === 0) {
-        this.log(`ran out of players to check — no connection exists.`);
+        this.log("No more reachable players remain in the histories checked.");
         break;
       }
 

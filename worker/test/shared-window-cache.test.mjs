@@ -43,7 +43,11 @@ test('scoped expired games cannot escape via rate-limit stale fallback',async()=
   globalThis.fetch=async()=>new Response('',{status:429,headers:{'Retry-After':'90'}});
   // Force monthly refresh too, while preserving the original complete aggregates.
   for(const k of [...env.GAMES_CACHE.values.keys()])if(k.startsWith('archive:games:'))env.GAMES_CACHE.values.delete(k);
-  await assert.rejects(api.readOrFetchGames(env,parsed),error=>error.status===429);
+  // Expire the bounded two-second raw-response bridge as well. A still-fresh
+  // provider response is valid input even when a separate aggregate expires.
+  const realNow=Date.now;Date.now=()=>realNow()+2100;
+  try {await assert.rejects(api.readOrFetchGames(env,parsed),error=>error.status===429);}
+  finally {Date.now=realNow;}
 });
 test('current-month no-store never becomes seven-day scoped aggregate coverage',async()=>{
   const env={GAMES_CACHE:new KV()};const now=new Date();const month=`${now.getUTCFullYear()}/${String(now.getUTCMonth()+1).padStart(2,'0')}`;

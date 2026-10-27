@@ -14,19 +14,26 @@ window.Leaderboard = (() => {
   let activeCategory = "connectors";
   let tabsWired = false;
   let initialLoadObserver = null;
+  let loadGeneration = 0;
+  let profileController = null;
 
-  /** Auto-submit a found chain. Fire-and-forget; never blocks the UI. */
+  /** Submit a found chain and report whether the server accepted it. */
   async function submit(start, target, length, path, hops = [], range = "auto", serverSearchId = undefined) {
     try {
-      await fetch(WORKER_URL + "/submit", {
+      const response = await fetch(WORKER_URL + "/submit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         keepalive: true,
         body: JSON.stringify({ start, target, length, path, hops, range, ...(serverSearchId ? { serverSearchId } : {}) }),
       });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || data?.ok !== true) {
+        return { ok: false, status: response.status, error: data?.error || `HTTP ${response.status}` };
+      }
+      return { ...data, status: response.status };
     } catch (e) {
-      // worker not deployed yet, or offline — fail silently
       console.debug("leaderboard submit skipped:", e.message);
+      return { ok: false, error: e.message || "Submission unavailable" };
     }
   }
 
@@ -34,6 +41,9 @@ window.Leaderboard = (() => {
   async function load(category = activeCategory) {
     initialLoadObserver?.disconnect();
     initialLoadObserver = null;
+    const generation = ++loadGeneration;
+    profileController?.abort();
+    profileController = null;
     activeCategory = category || "connectors";
     wireTabs();
     setActiveTab(activeCategory);
@@ -50,19 +60,21 @@ window.Leaderboard = (() => {
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const { entries, category: returnedCategory } = await res.json();
+      if (generation !== loadGeneration) return;
       activeCategory = returnedCategory || activeCategory;
       setActiveTab(activeCategory);
-      await render(el, entries, activeCategory);
+      render(el, entries, activeCategory, generation);
     } catch (e) {
+      if (generation !== loadGeneration) return;
       el.innerHTML =
-        '<div class="lb-empty" role="status">Leaderboard isn\'t available right now — ' +
-        'it activates once the worker is deployed.</div>';
+        '<div class="lb-empty" role="status"><p>Couldn\'t load the leaderboard. Try again.</p>' +
+        '<button class="setting__btn" type="button" data-leaderboard-retry>Try again</button></div>';
     } finally {
-      el.setAttribute("aria-busy", "false");
+      if (generation === loadGeneration) el.setAttribute("aria-busy", "false");
     }
   }
 
-  async function render(el, entries, category) {
+  function render(el, entries, category, generation) {
     if (!entries || entries.length === 0) {
       el.innerHTML =
         `<div class="lb-empty" role="status">No ${esc(categoryLabel(category).toLowerCase())} yet.</div>`;
@@ -77,7 +89,26 @@ window.Leaderboard = (() => {
         `<div class="lb-empty" role="status">No ${esc(categoryLabel(category).toLowerCase())} yet.</div>`;
       return;
     }
-    const profiles = await loadProfiles([...new Set(top.flatMap((e) => [e.username, e.target]).filter(Boolean))]);
+    renderRows(el, top, new Map(), category);
+    const controller = new AbortController();
+    profileController = controller;
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    loadProfiles([...new Set(top.map(entry => entry.username))], controller.signal)
+      .then(profiles => {
+        if (generation !== loadGeneration || controller.signal.aborted) return;
+        renderRows(el, top, profiles, category);
+      })
+      .finally(() => {
+        clearTimeout(timeout);
+        if (profileController === controller) profileController = null;
+      });
+  }
+
+  function renderRows(el, top, profiles, category) {
+    const focusedRow = el.contains(document.activeElement)
+      ? document.activeElement.closest("button[data-profile-user]")
+      : null;
+    const focusedUsername = focusedRow?.getAttribute("data-profile-user");
     el.innerHTML = top.map((e, i) => {
       const profile = profiles.get(e.username) || {};
       const rankClass = i === 0 ? " is-gold" : i === 1 ? " is-silver" : i === 2 ? " is-bronze" : "";
@@ -105,11 +136,19 @@ window.Leaderboard = (() => {
           </div>
         </button>`;
     }).join("");
+    if (focusedUsername) {
+      [...el.querySelectorAll("button[data-profile-user]")]
+        .find(row => row.getAttribute("data-profile-user") === focusedUsername)
+        ?.focus({ preventScroll: true });
+    }
   }
 
   function wireTabs() {
     if (tabsWired) return;
     tabsWired = true;
+    document.getElementById("leaderboard-list")?.addEventListener("click", event => {
+      if (event.target.closest("[data-leaderboard-retry]")) load(activeCategory);
+    });
     document.getElementById("leaderboard-tabs")?.addEventListener("click", (event) => {
       const tab = event.target.closest("[data-category]");
       if (!tab) return;
@@ -264,21 +303,25 @@ window.Leaderboard = (() => {
     return false;
   }
 
-  async function loadProfiles(usernames) {
+  async function loadProfiles(usernames, signal) {
     const profiles = new Map();
-    await Promise.all(usernames.map(async (username) => {
-      const key = username.toLowerCase();
-      try {
-        const res = await fetch(`${WORKER_URL}/profile?username=${encodeURIComponent(username)}`, {
-          headers: { "Accept": "application/json" },
-        });
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const data = await res.json();
-        profiles.set(username, data.profile || { username, url: `https://www.chess.com/member/${username}` });
-      } catch {
-        profiles.set(username, { username, url: `https://www.chess.com/member/${username}` });
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < usernames.length && !signal.aborted) {
+        const username = usernames[cursor++];
+        try {
+          const res = await fetch(`${WORKER_URL}/profile?username=${encodeURIComponent(username)}`, {
+            headers: { "Accept": "application/json" }, signal,
+          });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const data = await res.json();
+          profiles.set(username, data.profile || { username, url: `https://www.chess.com/member/${username}` });
+        } catch {
+          profiles.set(username, { username, url: `https://www.chess.com/member/${username}` });
+        }
       }
-    }));
+    };
+    await Promise.all(Array.from({ length: Math.min(3, usernames.length) }, worker));
     return profiles;
   }
 

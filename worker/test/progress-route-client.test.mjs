@@ -13,7 +13,7 @@ function fixture({holdHydration=false}={}){
  const element=key=>{if(!elements.has(key))elements.set(key,{hidden:false,disabled:false,className:'',innerHTML:'',dataset:{},children:[],setAttribute(){},querySelectorAll:()=>key==='#cards'?cards:[],appendChild(x){this.children.push(x);},removeChild(){this.children.shift();},scrollIntoView(){scrolls.push(key);}});return elements.get(key);};
  const context=vm.createContext({state,Date,URL,URLSearchParams,console,location:{href:"https://example.invalid/"},CHAIN_PARAM:"chain",SHORT_CHAIN_PARAM:"c",LEGACY_SHARE_PARAM:"share",encodeSharePayload:chain=>JSON.stringify(context.sharePayload(chain)),
   SEARCH_POLICY_VERSION:'fresh-search-v2',TERMINAL_SEARCH_STATUSES:new Set(['found','not_found','timeout','failed','expired']),SERVER_SEARCH_HARD_LIMIT_MS:360000,SERVER_POLL_RETRY_LIMIT:3,
-  workerBase:()=> 'https://example.invalid',chainKey:path=>path.join('>'),
+  rememberVerifiedRoute:()=>{},workerBase:()=> 'https://example.invalid',chainKey:path=>path.join('>'),
   fetchJsonWithRetry:(url,options)=>new Promise((resolve,reject)=>requests.push({url,options,resolve:job=>resolve({data:{job}}),reject})),
   wait:async()=>{},$:element,document:{createElement:()=>({}),querySelector:element},
   window:{SavedRoutes:{}},esc:String,stepText:n=>`${n} steps`,statusText:String,
@@ -25,7 +25,7 @@ function fixture({holdHydration=false}={}){
   cleanUsernameInput:String,isWorkerUnavailable:()=>false,
  });
  vm.runInContext([
-  section('  async function runServerSearchFlow(', '  async function pollServerSearchJob('),
+  section('  function isSearchComplete(', '  async function pollServerSearchJob('),
   section('  async function pollServerSearchJob(', '  function showServerJobProgress('),
   section('  function searchOptimalityNote(', '  function saveActiveJob('),
   section('  function updateGraphSummary(', '  function renderGraph('),
@@ -40,7 +40,7 @@ function fixture({holdHydration=false}={}){
  return {context,state,requests,renders,events,submissions,statuses,scrolls,clears,hydrations,cards,element,run,poll,reply};
 }
 function chain(path=['alice','mid','other','bob'],offset=0){return {found:true,path,length:path.length-1,hops:path.slice(1).map((to,i)=>({from:path[i],to,url:`https://www.chess.com/game/live/${100+offset+i}`}))};}
-function job(route=null,status='running'){return {id:'job-current',policyVersion:'fresh-search-v2',start:'alice',target:'bob',range:'all',status,progress:'Checking for a shorter route',stats:{expanded:1,requests:2,cached:0},chain:route};}
+function job(route=null,status='running'){return {id:'job-current',policyVersion:'fresh-search-v2',start:'alice',target:'bob',range:'all',status,shortestVerified:status==='found',progress:'Checking for a shorter route',stats:{expanded:1,requests:2,cached:0},chain:route};}
 
 test('ordinary controller displays first running route before terminal, deduplicates polls and commits final once',async()=>{
  const f=fixture(),done=f.run();await f.reply(job());
@@ -101,4 +101,18 @@ test('provisional working status carries incomplete-history warning and never cl
   assert.doesNotMatch(status.text,/Shortest route verified/);
   await f.reply(job(chain(),'found'));await done;
  }
+});
+
+
+test('a terminal route without shortest proof remains provisional and keeps its saved job',async()=>{
+ const f=fixture(),done=f.run();await f.reply(job());await f.reply({...job(chain(),'found'),shortestVerified:false,incomplete:true});await done;
+ assert.equal(f.renders.length,1);assert.equal(f.events.length,0);assert.equal(f.submissions.length,0);assert.deepEqual(f.clears,[]);
+ assert.equal(f.statuses.at(-1).kind,'working');assert.match(f.statuses.at(-1).text,/may not be the shortest/);
+});
+
+test('a server start network failure reports unavailable without requesting a limited fallback',async()=>{
+ const f=fixture(),done=f.run();f.requests[0].reject(new Error('Failed to fetch'));await done;
+ assert.equal(await done,true);assert.equal(f.renders.length,0);
+ assert.match(f.statuses.at(-1).text,/full search service could not connect/);
+ assert.match(f.statuses.at(-1).text,/no limited search was substituted/);
 });

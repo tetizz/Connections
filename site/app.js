@@ -1,8 +1,7 @@
 /* ============================================================
    Chess Connections — app.js
    - Searches each requested pair using verified game histories
-   - Lets the visitor enter their own username + target and runs
-     the BFS search live in the browser (engine.js)
+   - Starts durable full-history searches and resumes their live progress
    - Saves the username in localStorage for next visit
    - Renders results as an animated node graph + hop cards
    ============================================================ */
@@ -21,11 +20,12 @@
   const LS_RANGE_MIGRATION_KEY = "chess-connections:instant-range-default";
   const LS_ACTIVE_JOB_KEY = "chess-connections:active-search-job:v3:full-history-search";
   const SEARCH_POLICY_VERSION = "fresh-search-v2";
+  const LS_VERIFIED_ROUTES_KEY = "chess-connections:verified-routes:v1";
+  const LS_TOP_TRACE_KEY = "chess-connections:top-player-jobs:v1";
   const CHAIN_PARAM = "chain";
   const SHORT_CHAIN_PARAM = "c";
   const LEGACY_SHARE_PARAM = "share";
   const DEFAULT_TARGET = "magnuscarlsen";
-  const AUTO_SEARCH_DEPTH = 5;
   const LEGACY_DEPTH_KEY = "chess-connections:depth";
   const CHESS_LEADERBOARDS_URL = "https://api.chess.com/pub/leaderboards";
   const SUGGEST_MIN_CHARS = 2;
@@ -509,14 +509,46 @@
 
   function topTraceProgress(results) {
     const list = results || [];
-    const checked = list.filter((item) => !["queued", "running"].includes(item.status)).length;
-    const found = list.filter((item) => item.status === "found" && item.job?.chain?.found).length;
-    const unfinished = list.filter((item) => ["error", "failed", "timeout"].includes(item.status)).length;
-    return { checked, found, unfinished, total: list.length };
+    const found = list.filter(item => item.job?.chain?.found).length;
+    const proven = list.filter(item => item.job?.shortestVerified === true).length;
+    const checking = list.filter(item => ["queued", "running"].includes(item.status)).length;
+    const unfinished = list.filter(item => ["paused", "error", "failed", "timeout"].includes(item.status)).length;
+    return { checked: list.length - checking, found, proven, checking, unfinished, total: list.length };
   }
 
-  async function runTopPlayersTrace() {
-    const startRaw = $("#search-start")?.value || "";
+  function saveTopTraceBatch(start, results, options = {}) {
+    try {
+      if (options.batchId && state.topTraceActiveBatchId && options.batchId !== state.topTraceActiveBatchId) return;
+      const signature = JSON.stringify([start, options.batchId || "", results.map(item => [item.player?.username, item.status, item.job?.id,
+        item.job?.shortestVerified === true, serverChainIdentity(item.job?.chain)])]);
+      if (state.topTracePersistedSignature === signature && Date.now() - Number(state.topTracePersistedAt || 0) < 10000) return;
+      localStorage.setItem(LS_TOP_TRACE_KEY, JSON.stringify({ start, policyVersion: SEARCH_POLICY_VERSION,
+        batchId: options.batchId, startedAt: options.startedAt || Date.now(), ts: Date.now(), results: results.map(item => ({ player: item.player, status: item.status,
+          ms: item.ms, steps: item.steps, searchId: item.searchId, error: item.error,
+          job: item.job ? { id: item.job.id, start: item.job.start, target: item.job.target,
+            status: item.job.status, policyVersion: item.job.policyVersion, range: item.job.range,
+            chain: item.job.chain, shortestVerified: item.job.shortestVerified,
+            stats: item.job.stats, progress: item.job.progress, createdAt: item.job.createdAt } : null })) }));
+      state.topTracePersistedSignature = signature;
+      state.topTracePersistedAt = Date.now();
+    } catch { /* Backend jobs continue even when browser storage is unavailable. */ }
+  }
+
+  async function resumeTopPlayersTrace() {
+    try {
+      const record = JSON.parse(localStorage.getItem(LS_TOP_TRACE_KEY) || "null");
+      const foreground = JSON.parse(localStorage.getItem(LS_ACTIVE_JOB_KEY) || "null");
+      if (!record || record.policyVersion !== SEARCH_POLICY_VERSION || !Array.isArray(record.results) ||
+          !cleanUsernameInput(record.start) || Date.now() - Number(record.ts || 0) > 7 * 24 * 60 * 60 * 1000 ||
+          Number(foreground?.ts || 0) > Number(record.startedAt || record.ts || 0) ||
+          !record.results.some(item => !["found", "not_found"].includes(item.status))) return false;
+      void runTopPlayersTrace(record);
+      return true;
+    } catch { return false; }
+  }
+
+  async function runTopPlayersTrace(savedBatch = null) {
+    const startRaw = savedBatch?.start || $("#search-start")?.value || "";
     const start = cleanUsernameInput(startRaw);
     const btn = $("#trace-top-players");
     if (!btn) return;
@@ -528,126 +560,161 @@
     $("#search-start").value = start;
     localStorage.setItem(LS_KEY, start);
     $("#setting-username").value = start;
-    const candidates = topTraceCandidates().filter((player) => player.username !== start);
+    const candidates = savedBatch?.results?.length ? savedBatch.results.map(item => item.player)
+      : topTraceCandidates().filter(player => player.username !== start);
     if (!candidates.length) {
       showStatus("error", "live leaderboard targets are still loading.");
       return;
     }
-
+    resetSearchQueue();
     const runId = ++state.topTraceRunId;
-    const results = candidates.map((player) => ({
-      player,
-      status: "queued",
-      ms: null,
-      steps: null,
-      job: null,
-    }));
+    const batchStartedAt = Number(savedBatch?.startedAt || savedBatch?.ts || Date.now());
+    const batchId = savedBatch?.batchId || `${start}:${batchStartedAt}:${Math.random().toString(36).slice(2)}`;
+    state.topTraceActiveBatchId = batchId;
+    state.activeSearchOwner = `top-players:${runId}`;
+    const results = candidates.map((player, index) => {
+      if (savedBatch?.results?.[index]) return savedBatch.results[index];
+      const preview = savedVerifiedRoute(start, player.username);
+      return { player, status: "queued", ms: null, steps: preview ? preview.path.length - 1 : null,
+        job: preview ? { start, target: player.username, chain: preview, status: "queued", policyVersion: SEARCH_POLICY_VERSION } : null };
+    });
     state.topTraceResults = results;
     btn.disabled = true;
-    showStatus("working", `tracing ${start} to top leaderboard players...`);
-
+    saveTopTraceBatch(start, results, { batchId, startedAt: batchStartedAt });
+    showStatus("working", savedBatch ? "resuming full searches to top players..." : "starting full searches to top players...");
+    let renderedTreeIdentity = "";
+    const showProgressTree = () => {
+      const identity = results.filter(item => item.job?.chain?.found)
+        .map(item => `${item.player.username}:${serverChainIdentity(item.job.chain)}`).sort().join("|");
+      if (!identity || identity === renderedTreeIdentity) return;
+      renderedTreeIdentity = identity;
+      void renderTopTraceCurrentTree(start, results, { scroll: false, progressive: true });
+    };
+    let dispatching = true;
+    const update = (index, item) => {
+      results[index] = item;
+      saveTopTraceBatch(start, results, { batchId, startedAt: batchStartedAt });
+      if (runId !== state.topTraceRunId) return;
+      showProgressTree();
+      const progress = topTraceProgress(results);
+      const accepted = results.filter(row => row.job?.id).length;
+      if (dispatching) {
+        showStatus("working", `Starting full top-player searches: ${plainNumber(accepted)} of ${plainNumber(results.length)} accepted by the server. Accepted searches keep running after you leave.`);
+        return;
+      }
+      showStatus("working", `Full top-player searches: ${plainNumber(progress.found)} routes found, ${plainNumber(progress.proven)} shortest verified, ${plainNumber(progress.checking)} still checking.`);
+    };
     let cursor = 0;
-    const worker = async () => {
+    const dispatchWorker = async () => {
+      // Accept every target before polling can wait on any one route. A later
+      // foreground search only detaches this UI; accepted jobs keep running.
+      while (cursor < results.length) {
+        const index = cursor++;
+        const previous = results[index];
+        if (savedBatch && ((previous.status === "found" && previous.job?.shortestVerified === true) ||
+            (previous.status === "not_found" && previous.job?.incomplete !== true))) continue;
+        update(index, { ...previous, status: "queued" });
+        const next = await traceTopCandidate(start, previous.player, runId, {
+          existing: previous, startOnly: true, onUpdate: item => update(index, item),
+        });
+        update(index, next);
+      }
+    };
+    const pollWorker = async () => {
       while (cursor < results.length && runId === state.topTraceRunId) {
         const index = cursor++;
-        results[index].status = "running";
-        results[index] = await traceTopCandidate(start, results[index].player, runId);
-        const progress = topTraceProgress(results);
-        showStatus("working", `tracing top players... ${plainNumber(progress.checked)} of ${plainNumber(progress.total)} checked, ${plainNumber(progress.found)} branches found.`);
-        if (results[index].status === "found" && results[index].job?.chain?.found) {
-          renderTopTraceCurrentTree(start, results, { scroll: false, progressive: true });
-        }
+        const previous = results[index];
+        if (!previous.job?.id || !["queued", "running"].includes(previous.job.status)) continue;
+        update(index, { ...previous, status: "running" });
+        const next = await traceTopCandidate(start, previous.player, runId, {
+          existing: previous, onUpdate: item => update(index, item),
+        });
+        update(index, next);
       }
     };
     try {
-      await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, results.length) }, worker));
+      showProgressTree();
+      await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, results.length) }, dispatchWorker));
       if (runId !== state.topTraceRunId) return;
-      const found = sortedTopTraceResults(results).find((item) => item.status === "found" && item.job?.chain?.found);
+      dispatching = false;
+      cursor = 0;
+      await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, results.length) }, pollWorker));
+      if (runId !== state.topTraceRunId) return;
       const progress = topTraceProgress(results);
-      if (found) {
-        await renderTopTraceCurrentTree(start, results, { scroll: true });
-        if (progress.unfinished) {
-          showStatus("working", `top-player trace finished with ${plainNumber(progress.found)} branches found and ${plainNumber(progress.unfinished)} unfinished searches.`);
-        }
-      } else {
-        showStatus("error", "no top-player chain finished in this batch.");
+      if (progress.found) await renderTopTraceCurrentTree(start, results, { scroll: true, progressive: Boolean(progress.unfinished || progress.checking) });
+      if (progress.unfinished || progress.checking) {
+        showStatus("working", `${plainNumber(progress.found)} top-player routes found; ${plainNumber(progress.proven)} shortest verified. Live updates paused for ${plainNumber(progress.unfinished + progress.checking)} searches. Saved server jobs keep their progress; reload to resume updates.`);
+      } else if (!progress.found) {
+        showStatus("error", "The full top-player searches finished without a verified route. Open a target to inspect its search.");
       }
     } finally {
-      btn.disabled = false;
+      if (runId === state.topTraceRunId) btn.disabled = false;
     }
   }
 
-  async function traceTopCandidate(start, player, runId) {
+  async function traceTopCandidate(start, player, runId, options = {}) {
     const target = cleanUsernameInput(player?.username);
     const started = performance.now();
-    const id = newSearchEventId();
-    const result = { player, status: "error", ms: null, steps: null, job: null };
+    const id = options.existing?.searchId || newSearchEventId();
+    const result = { player, status: "paused", ms: null, steps: null, job: options.existing?.job || null, searchId: id };
     const remoteBase = workerBase();
     if (!remoteBase || !target || start === target) return { ...result, status: "skipped", ms: 0 };
-    try {
-      const startRes = await fetch(`${remoteBase}/search/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({ start, target, range: $("#search-range")?.value || "auto", searchId: id }),
-      });
-      if (!startRes.ok) throw new Error(`HTTP ${startRes.status}`);
-      let job = (await startRes.json()).job;
-      if (!job?.id) throw new Error("missing job");
-      if (job.chain?.found) {
-        const ms = Math.round(performance.now() - started);
-        const steps = Array.isArray(job.chain?.path) ? Math.max(0, job.chain.path.length - 1) : null;
-        return {
-          player,
-          status: "found",
-          ms,
-          steps,
-          job: { ...job, status: "found" },
-        };
+    let job = options.existing?.job || null;
+    let lastValidJob = null;
+    const update = () => {
+      const current = { ...result, status: ["queued", "running"].includes(job?.status) ? "running" : job?.status || "paused",
+        ms: Math.round(performance.now() - started), steps: job?.chain?.found ? job.chain.path.length - 1 : null, job };
+      if (job?.chain?.found) rememberVerifiedRoute(job);
+      options.onUpdate?.(current);
+      return current;
+    };
+    const validate = (next, expectedId = null) => {
+      if (!next?.id) throw Object.assign(new Error("The search service returned no job."), { code: "SEARCH_PROTOCOL_ERROR" });
+      if (next.policyVersion !== SEARCH_POLICY_VERSION) throw Object.assign(new Error("This job belongs to an older search policy. Start a fresh search."), { code: "SEARCH_POLICY_EXPIRED" });
+      if (next.start !== start || next.target !== target || (expectedId && next.id !== expectedId)) {
+        throw Object.assign(new Error("The search response does not match the requested player pair."), { code: "SEARCH_PROTOCOL_ERROR" });
       }
+      if (next.chain?.found && (window.SavedRoutes?.routeStepCount(next.chain) == null ||
+          next.chain.path[0] !== start || next.chain.path.at(-1) !== target || pathHasBlockedUser(next.chain.path))) {
+        throw Object.assign(new Error("The route proof does not match the requested players."), { code: "SEARCH_PROTOCOL_ERROR" });
+      }
+      lastValidJob = next;
+      return next;
+    };
+    try {
+      if (!job?.id || TERMINAL_SEARCH_STATUSES.has(job.status)) {
+        const { data } = await fetchJsonWithRetry(`${remoteBase}/search/start`, {
+          method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({ start, target, range: "all", searchId: id }),
+        }, { attempts: 3, timeoutMs: 12000, stopOnRateLimit: true });
+        job = validate(data?.job);
+      } else validate(job);
+      const initial = update();
+      if (options.startOnly) return initial;
       let pollAttempt = 0;
       while (["queued", "running"].includes(job.status) && performance.now() - started < TOP_TRACE_HARD_LIMIT_MS && runId === state.topTraceRunId) {
-        if (pollAttempt++ > 0) {
-          await new Promise((resolve) => setTimeout(resolve, TOP_TRACE_POLL_INTERVAL_MS));
-        }
-        const pollRes = await fetch(`${remoteBase}/search/job?id=${encodeURIComponent(job.id)}`, {
+        if (pollAttempt++ > 0) await wait(Math.min(1800, TOP_TRACE_POLL_INTERVAL_MS + pollAttempt * 75));
+        const { data } = await fetchJsonWithRetry(`${remoteBase}/search/job?id=${encodeURIComponent(job.id)}`, {
           headers: { "Accept": "application/json" },
-        });
-        if (!pollRes.ok) throw new Error(`poll ${pollRes.status}`);
-        job = (await pollRes.json()).job || job;
-        if (job.chain?.found) job = { ...job, status: "found" };
+        }, { attempts: 3, timeoutMs: 12000, stopOnRateLimit: true });
+        if (runId !== state.topTraceRunId) return { ...update(), status: "cancelled" };
+        job = validate(data?.job, job.id);
+        update();
       }
-      const ms = Math.round(performance.now() - started);
-      const steps = Array.isArray(job.chain?.path) ? Math.max(0, job.chain.path.length - 1) : null;
-      if (["queued", "running"].includes(job.status)) {
-        return {
-          player,
-          status: runId === state.topTraceRunId ? "timeout" : "cancelled",
-          ms,
-          steps,
-          job,
-        };
-      }
-      return {
-        player,
-        status: job.chain?.found ? "found" : job.status || "not_found",
-        ms,
-        steps,
-        job,
-      };
+      const current = update();
+      if (["queued", "running", "paused"].includes(job.status)) return { ...current, status: runId === state.topTraceRunId ? "paused" : "cancelled" };
+      if (job.chain?.found && job.shortestVerified !== true) return { ...current, status: "paused" };
+      return { ...current, status: job.chain?.found ? "found" : job.status || "not_found" };
     } catch (error) {
-      return {
-        ...result,
-        status: "error",
-        ms: Math.round(performance.now() - started),
-        error: error.message || "failed",
-      };
+      return { ...result, job: error?.code === "SEARCH_POLICY_EXPIRED" ? null : lastValidJob, status: "paused", ms: Math.round(performance.now() - started),
+        error: error?.status === 429 ? "The API is cooling down; this saved search can resume later." : error.message || "Search updates paused." };
     }
   }
 
   function sortedTopTraceResults(results) {
     return [...(results || [])].sort((a, b) => {
-      const aFound = a.status === "found" && a.job?.chain?.found;
-      const bFound = b.status === "found" && b.job?.chain?.found;
+      const aFound = Boolean(a.job?.chain?.found);
+      const bFound = Boolean(b.job?.chain?.found);
       if (aFound !== bFound) return aFound ? -1 : 1;
       const aSteps = Number.isFinite(a.steps) ? a.steps : 999;
       const bSteps = Number.isFinite(b.steps) ? b.steps : 999;
@@ -667,7 +734,7 @@
   async function renderTopTraceCurrentTree(start, results, options = {}) {
     const { scroll = false, progressive = false } = options;
     const foundItems = sortedTopTraceResults(results)
-      .filter((item) => item.status === "found" && item.job?.chain?.found)
+      .filter((item) => item.job?.chain?.found)
       .filter((item) => !pathHasBlockedUser(item.job?.chain?.path))
     const found = foundItems.map((item) => ({
         ...item.job.chain,
@@ -677,6 +744,8 @@
         slotCount: Math.max(1, Number(item.player?.slotCount) || 1),
         slots: item.player?.slots || [],
         ms: item.ms,
+        serverSearchId: item.job.id,
+        shortestVerified: item.job.shortestVerified === true,
       }));
     if (!found.length) return;
     const root = cleanUsernameInput(start || found[0].path?.[0]);
@@ -684,7 +753,7 @@
     const shortest = found.reduce((best, chain) => !best || topTraceStepCount(chain) < topTraceStepCount(best) ? chain : best, null);
     const targetCount = Math.max(results.length, topTraceLeaderboardSlotCount());
     const foundSlotCount = topTraceFoundSlotCount(foundItems);
-    if (!progressive) await hydrateTopTracePlayers(foundItems).catch(() => {});
+    if (!progressive) void hydrateTopTracePlayers(foundItems).catch(() => {});
     $("#search-target").value = shortest?.target || targets[0] || $("#search-target").value;
     setActiveChip($("#search-target").value);
     renderChain({
@@ -1410,7 +1479,7 @@
       range,
       serverSearchId,
     )
-      .then(() => window.Leaderboard && window.Leaderboard.load());
+      .then(result => result?.ok && !result.skipped && window.Leaderboard?.load()).catch(() => {});
   }
 
   async function hydrateTopTracePlayers(items) {
@@ -1459,7 +1528,6 @@
 
   async function submitTopTraceLeaderboardBranches(start, branches) {
     if (!window.Leaderboard || !Array.isArray(branches) || !branches.length) return;
-    showStatus("working", "submitting top-player branches to Top connectors...");
     const queue = [];
     const seen = new Set();
     for (const branch of branches) {
@@ -1479,15 +1547,17 @@
         const item = queue[cursor++];
         state.topTraceSubmittedKeys.add(item.key);
         try {
-          await window.Leaderboard.submit(
+          const outcome = await window.Leaderboard.submit(
             start,
             item.target,
             connectionCount(item.path),
             item.path,
             item.branch.hops || [],
-            "auto",
+            "all",
+            item.branch.serverSearchId,
           );
-          submitted++;
+          if (outcome?.ok && !outcome.skipped) submitted++;
+          else state.topTraceSubmittedKeys.delete(item.key);
         } catch {
           state.topTraceSubmittedKeys.delete(item.key);
         }
@@ -1500,7 +1570,6 @@
       } catch {
         // keep the graph usable even if the leaderboard reload fails
       }
-      showStatus("done", `submitted ${plainNumber(submitted)} top-player branch${submitted === 1 ? "" : "es"} to Top connectors.`);
     }
   }
 
@@ -1878,46 +1947,41 @@
     return window.SavedRoutes?.bridgeSuffixesFor(state.chains, target) || new Map();
   }
 
-  function parseSearchMode(range) {
-    if (range === "auto") {
-      return {
-        key: "auto",
-        archiveLimit: 6,
-        bridgeLimit: 2,
-        label: "automatic search",
-        crawlLabel: "automatic recent search",
-        instantOnly: false,
-      };
-    }
-    if (range === "instant") {
-      return {
-        key: "instant",
-        archiveLimit: 2,
-        bridgeLimit: 2,
-        label: "instant bridge",
-        crawlLabel: "latest 2 months",
-        instantOnly: true,
-      };
-    }
-    if (range === "all") {
-      return {
-        key: "all",
-        archiveLimit: Infinity,
-        bridgeLimit: 2,
-        label: "full history",
-        crawlLabel: "full history",
-        instantOnly: false,
-      };
-    }
-    const archiveLimit = parseInt(range, 10) || 6;
-    return {
-      key: String(archiveLimit),
-      archiveLimit,
-      bridgeLimit: Math.min(archiveLimit, 2),
-      label: `latest ${archiveLimit} months`,
-      crawlLabel: `latest ${archiveLimit} months`,
-      instantOnly: false,
-    };
+  function parseSearchMode() {
+    return { key: "all", archiveLimit: Infinity, bridgeLimit: Infinity,
+      label: "full-history search", crawlLabel: "full history", instantOnly: false };
+  }
+
+  function savedVerifiedRoute(start, target) {
+    try {
+      const stored = JSON.parse(localStorage.getItem(LS_VERIFIED_ROUTES_KEY) || "[]");
+      const records = Array.isArray(stored) ? stored : [];
+      const matches = records.filter(record => record?.serverVerified === true &&
+        record.start === start && record.target === target &&
+        window.SavedRoutes?.routeStepCount(record.chain) != null &&
+        record.chain.path[0] === start && record.chain.path.at(-1) === target &&
+        !pathHasBlockedUser(record.chain.path));
+      matches.sort((a, b) => a.chain.path.length - b.chain.path.length || b.verifiedAt - a.verifiedAt);
+      return matches[0]?.chain || null;
+    } catch { return null; }
+  }
+
+  function rememberVerifiedRoute(job) {
+    if (job?.policyVersion !== SEARCH_POLICY_VERSION || !job.start || !job.target ||
+        window.SavedRoutes?.routeStepCount(job.chain) == null ||
+        job.chain.path[0] !== job.start || job.chain.path.at(-1) !== job.target ||
+        pathHasBlockedUser(job.chain.path)) return;
+    try {
+      const stored = JSON.parse(localStorage.getItem(LS_VERIFIED_ROUTES_KEY) || "[]");
+      const records = Array.isArray(stored) ? stored : [];
+      const previous = records.find(record => record.start === job.start && record.target === job.target);
+      if (previous?.serverVerified && window.SavedRoutes?.routeStepCount(previous.chain) != null &&
+          (previous.chain.path.length < job.chain.path.length || JSON.stringify(previous.chain) === JSON.stringify(job.chain))) return;
+      const next = [{ start: job.start, target: job.target, chain: job.chain,
+        serverVerified: true, verifiedAt: Date.now() },
+        ...records.filter(record => record.start !== job.start || record.target !== job.target)].slice(0, 64);
+      localStorage.setItem(LS_VERIFIED_ROUTES_KEY, JSON.stringify(next));
+    } catch { /* Browsing/storage restrictions must not stop a server search. */ }
   }
 
   async function quickBridge(start, target, targetDisplay, engine, label, logLine) {
@@ -3421,9 +3485,17 @@
     `;
   }
 
+  function isSearchComplete(job) {
+    return job?.status === "found" ? job.shortestVerified === true
+      : job?.status === "not_found" && job.incomplete !== true;
+  }
+
   async function runServerSearchFlow({ start, target, range, analyticsBase, mode, btn, status, logEl, knownChain = null }) {
     const remoteBase = workerBase();
-    if (!remoteBase) return false;
+    if (!remoteBase) {
+      showStatus("error", "The full search service is not configured. No limited search was substituted.");
+      return true;
+    }
     const searchOwner = `search:${analyticsBase.searchId}`;
     const isCurrent = () => state.activeSearchOwner === searchOwner;
 
@@ -3476,15 +3548,19 @@
         let improvedByServer = false;
         const stepsIn = (chain) => window.SavedRoutes?.routeStepCount(chain) ?? 0;
         const showSavedRoute = (message) => {
-          showStatus("done",
-            `✓ showing a saved verified route — ${esc(start)} connects to ${esc(target)} in ` +
+          showStatus("working",
+            `Showing a saved verified route — ${esc(start)} connects to ${esc(target)} in ` +
             `${stepText(stepsIn(displayedChain))}. ${message}`);
         };
         const applyIfShorter = async (finished) => {
           const candidate = finished?.chain;
-          if (!window.SavedRoutes?.isStrictlyShorter(candidate, displayedChain)) return false;
+          const shorter = window.SavedRoutes?.isStrictlyShorter(candidate, displayedChain);
+          const sameProof = serverChainIdentity(candidate) === serverChainIdentity(displayedChain);
+          if (!shorter && !sameProof) return false;
           const applied = await applyServerChain(finished, analyticsBase, {
-            recordOutcome: "found",
+            checking: !isSearchComplete(finished),
+            recordOutcome: isSearchComplete(finished) ? "found" : null,
+            submit: isSearchComplete(finished),
             isCurrent,
           });
           if (applied) {
@@ -3498,11 +3574,13 @@
             clearActiveJob(job.id);
             return;
           }
-          clearActiveJob(job.id);
+          if (isSearchComplete(finished)) clearActiveJob(job.id);
           finishSearchQueue(finished);
           const improved = await applyIfShorter(finished);
           if (!isCurrent() || improved || improvedByServer) return;
-          showSavedRoute("The background check finished without finding a shorter route.");
+          if (isSearchComplete(finished)) {
+            showStatus("done", "Your saved route is still the shortest verified route for this search.");
+          } else showSavedRoute("The full search is not complete. Its progress is saved; reload to resume updates.");
         };
 
         await applyIfShorter(job);
@@ -3513,12 +3591,13 @@
         }
 
         logLine("found a verified route; checking for a shorter route");
-        showSavedRoute("Checking for a shorter route in the background.");
+        showSavedRoute("A full-history search is checking for a shorter route in the background.");
         btn.disabled = false;
         pollServerSearchJob(job.id, {
           analyticsBase,
           logLine,
           background: true,
+          initialChain: displayedChain,
           isCurrent,
         })
           .then(finishKnownRouteCheck)
@@ -3547,9 +3626,10 @@
       let instantChainKey = "";
       if (job.chain?.found) {
         if (TERMINAL_SEARCH_STATUSES.has(job.status)) {
-          clearActiveJob(job.id);
+          if (isSearchComplete(job)) clearActiveJob(job.id);
           finishSearchQueue(job);
-          await applyServerChain(job, analyticsBase, { isCurrent });
+          await applyServerChain(job, analyticsBase, { checking: !isSearchComplete(job),
+            recordOutcome: isSearchComplete(job) ? "found" : null, submit: isSearchComplete(job), isCurrent });
           return true;
         }
         showedInstantChain = true;
@@ -3571,12 +3651,14 @@
         })
           .then(async (finished) => {
             if (!isCurrent()) return;
-            clearActiveJob(job.id);
+            if (isSearchComplete(finished)) clearActiveJob(job.id);
             finishSearchQueue(finished);
             if (finished?.chain?.found) {
               const finalChainKey = chainKey(finished.chain.path || []);
               await applyServerChain(finished, analyticsBase, {
-                recordOutcome: "found",
+                checking: !isSearchComplete(finished),
+                recordOutcome: isSearchComplete(finished) ? "found" : null,
+                submit: isSearchComplete(finished),
                 scroll: finalChainKey !== instantChainKey,
                 isCurrent,
               });
@@ -3596,12 +3678,14 @@
         isCurrent,
       });
       if (!isCurrent()) return true;
-      clearActiveJob(job.id);
+      if (isSearchComplete(finished)) clearActiveJob(job.id);
       finishSearchQueue(finished);
       if (finished?.chain?.found) {
         const finalChainKey = chainKey(finished.chain.path || []);
         await applyServerChain(finished, analyticsBase, {
-          recordOutcome: showedInstantChain && finalChainKey === instantChainKey ? "saved" : "found",
+          checking: !isSearchComplete(finished),
+          recordOutcome: isSearchComplete(finished) ? (showedInstantChain && finalChainKey === instantChainKey ? "saved" : "found") : null,
+          submit: isSearchComplete(finished),
           isCurrent,
         });
       } else {
@@ -3665,9 +3749,11 @@
         recordSearchEvent("error", { ...analyticsBase, error: error.message });
         return true;
       }
-      // Only an unavailable Worker falls through to the existing legacy
-      // engine, whose own profile lookup runs with newly created controllers.
-      return false;
+      showStatus("error", knownChain?.found
+        ? "Your last verified route is still shown. The full search service could not connect; try again to continue looking for a shorter route."
+        : "The full search service could not connect. Try again; no limited search was substituted.");
+      recordSearchEvent("error", { ...analyticsBase, error: error.message });
+      return true;
     } finally {
       if (isCurrent()) btn.disabled = false;
     }
@@ -3884,6 +3970,7 @@
     } = options;
     if (!isCurrent()) return false;
     const chain = job.chain;
+    rememberVerifiedRoute(job);
     const reuseVisible = Boolean(state.currentChain?.found &&
       serverChainIdentity(state.currentChain) === serverChainIdentity(chain));
     state.players = state.players || {};
@@ -4021,7 +4108,7 @@
     } catch {
       clearActiveJob();
     }
-    if (!record?.id || record.policyVersion !== SEARCH_POLICY_VERSION || Date.now() - Number(record.ts || 0) > 2 * 60 * 60 * 1000) {
+    if (!record?.id || record.policyVersion !== SEARCH_POLICY_VERSION || Date.now() - Number(record.ts || 0) > 7 * 24 * 60 * 60 * 1000) {
       clearActiveJob();
       return;
     }
@@ -4034,7 +4121,9 @@
 
     $("#search-start").value = record.start || $("#search-start").value;
     $("#search-target").value = record.target || $("#search-target").value;
-    showStatus("working", "resuming search...");
+    const saved = savedVerifiedRoute(record.start, record.target);
+    if (saved) renderChain(saved);
+    showStatus("working", "resuming full-history search...");
     renderSearchQueue({
       id: record.id,
       status: "running",
@@ -4049,12 +4138,11 @@
           start: record.start,
           target: record.target,
           range: record.range,
-          depth: AUTO_SEARCH_DEPTH,
         },
         isCurrent: ownsResume,
       });
       if (!ownsResume()) return;
-      clearActiveJob(record.id);
+      if (isSearchComplete(job)) clearActiveJob(record.id);
       if (!ownsResume()) return;
       finishSearchQueue(job);
       if (job?.chain?.found) {
@@ -4063,8 +4151,7 @@
           start: record.start,
           target: record.target,
           range: record.range,
-          depth: AUTO_SEARCH_DEPTH,
-        }, { isCurrent: ownsResume });
+        }, { checking: !isSearchComplete(job), recordOutcome: isSearchComplete(job) ? "found" : null, submit: isSearchComplete(job), isCurrent: ownsResume });
       } else if (job) {
         if (!ownsResume()) return;
         showStatus("error", job.progress || "The saved search finished without a connection.");
@@ -4111,8 +4198,8 @@
     const status = $("#search-status");
     const logEl = $("#search-log");
     const btn = $("#trace-chain");
+    range = "all";
     const mode = parseSearchMode(range);
-    const depth = AUTO_SEARCH_DEPTH;
     resetSearchQueue();
 
     if (!start) {
@@ -4136,7 +4223,7 @@
     $("#search-start").value = start;
     $("#search-target").value = target;
     const searchStartedAt = performance.now();
-    const analyticsBase = { searchId: newSearchEventId(), start, target, depth, range };
+    const analyticsBase = { searchId: newSearchEventId(), start, target, range };
     state.activeSearchId = analyticsBase.searchId;
     state.activeSearchOwner = `search:${analyticsBase.searchId}`;
     recordSearchEvent("started", analyticsBase);
@@ -4147,267 +4234,31 @@
     $("#setting-username").value = start;
 
     clearActiveJob();
+    const knownChain = savedVerifiedRoute(start, target);
     state.chains = { chains: [] };
-    renderChain({ target, display: nameOf(target), found: false, pending: true, length: null, path: [], hops: [] });
-    showStatus("working", "starting fresh search...");
+    state.topTraceRunId++;
+    const topButton = $("#trace-top-players");
+    if (topButton) topButton.disabled = false;
+    if (knownChain) {
+      renderChain(knownChain);
+      showStatus("working", "Showing your last verified route while a full search checks for a shorter one.");
+    } else {
+      renderChain({ target, display: nameOf(target), found: false, pending: true, length: null, path: [], hops: [] });
+      showStatus("working", "starting fresh full-history search...");
+    }
     const handledByServer = await runServerSearchFlow({
       start,
       target,
       range,
+      knownChain,
       analyticsBase,
       mode,
       btn,
       status,
       logEl,
     });
-    if (handledByServer) return;
-
-    btn.disabled = true;
-    status.hidden = false;
-    status.className = "search__status is-working";
-    logEl.hidden = false;
-    logEl.innerHTML = "";
-
-    const cache = new window.GameCache();
-    const quickOptions = mode.instantOnly ? { fetchTimeout: 6500, maxRetries: 1 } : {};
-    const engine = new window.ChessChain(cache, {
-      archiveLimit: mode.archiveLimit,
-      ...quickOptions,
-    });
-    const bridgeEngine = new window.ChessChain(cache, {
-      archiveLimit: mode.bridgeLimit,
-      fetchTimeout: 6500,
-      maxRetries: 1,
-    });
-
-    // prominent running log of users scanned + API calls
-    let lastScanMsg = "";
-    const logLine = (msg) => {
-      const div = document.createElement("div");
-      div.className = "log__line";
-      div.textContent = msg;
-      logEl.appendChild(div);
-      // keep only the last 12 lines
-      while (logEl.children.length > 12) logEl.removeChild(logEl.firstChild);
-      logEl.scrollTop = logEl.scrollHeight;
-    };
-    const attachProgress = (activeEngine) => {
-      activeEngine.onProgress = (msg, stats) => {
-      // status line: current action + counters
-        status.innerHTML =
-          `<span class="spinner"></span>${esc(msg)}` +
-          `<span class="counters">scanned <b>${stats.fetched}</b> users · ` +
-          `${stats.apiCalls} requests · ${stats.cached} reused</span>`;
-        // log significant events (filter out only the high-frequency
-        // per-node progress lines to keep the log readable)
-        const isPerNodeLine = /^  (forward|backward) \d+\/\d+ expanded/.test(msg);
-        if (!isPerNodeLine) {
-          if (msg !== lastScanMsg) {
-            lastScanMsg = msg;
-            logLine(`[${new Date().toLocaleTimeString()}] ${msg}  ` +
-              `(scanned ${stats.fetched} users total)`);
-          }
-        }
-      };
-    };
-    attachProgress(engine);
-    attachProgress(bridgeEngine);
-    showStatus("working", "looking up the players…");
-    logLine(`connecting ${start} → ${target}  (${mode.label}${mode.instantOnly ? "" : ", automatic search"})`);
-
-    try {
-      // check both players exist + grab their info for the display
-      const [startLookup, targetLookup] = await Promise.all([
-        lookupFallbackPlayer(engine, start),
-        lookupFallbackPlayer(engine, target),
-      ]);
-      const lookupFailure = [startLookup, targetLookup].find((lookup) => lookup.outcome !== "found");
-      if (lookupFailure) {
-        const username = lookupFailure === startLookup ? start : target;
-        if (lookupFailure.outcome === "missing") {
-          showStatus("error", `couldn't find "${esc(username)}" on Chess.com — check the spelling?`);
-          recordSearchEvent("not_found", {
-            ...analyticsBase,
-            durationMs: performance.now() - searchStartedAt,
-            error: lookupFailure.error?.message || "player not found",
-          });
-          return;
-        }
-        if (lookupFailure.outcome === "timeout") {
-          showStatus("error",
-            `Chess.com timed out while checking "${esc(username)}". ` +
-            "No missing-player result was saved; try the search again.");
-          recordSearchEvent("timeout", {
-            ...analyticsBase,
-            durationMs: performance.now() - searchStartedAt,
-            error: lookupFailure.error?.message || "profile lookup timed out",
-          });
-          return;
-        }
-        showStatus("error",
-          `Chess.com player lookup is temporarily unavailable for "${esc(username)}". ` +
-          "No missing-player result was saved; try again in a moment.");
-        recordSearchEvent("error", {
-          ...analyticsBase,
-          durationMs: performance.now() - searchStartedAt,
-          error: lookupFailure.error?.message || "profile lookup unavailable",
-        });
-        return;
-      }
-      const startMeta = startLookup.profile;
-      const targetMeta = targetLookup.profile;
-      if (!startMeta || !targetMeta) {
-        showStatus("error", "Chess.com player lookup returned an incomplete response. Try again.");
-        recordSearchEvent("error", {
-          ...analyticsBase,
-          durationMs: performance.now() - searchStartedAt,
-          error: "profile lookup returned no profile",
-        });
-        return;
-      }
-      state.players = state.players || {};
-      state.players[start] = metaShape(startMeta);
-      state.players[target] = metaShape(targetMeta);
-
-      showStatus("working", "checking instant bridge…");
-      let bridged = null;
-      try {
-        bridged = await quickBridge(
-          start, target, targetMeta.name || target, bridgeEngine, bridgeEngine._archiveLabel(), logLine);
-      } catch (bridgeError) {
-        logLine(`instant bridge skipped: ${bridgeError.message}`);
-        if (mode.instantOnly) {
-          showStatus("error",
-            `instant bridge timed out for ${esc(start)} → ${esc(target)}. ` +
-            `Chess.com did not answer the small recent-games check fast enough; try again or switch to Recent fast.`);
-          renderChain({
-            target, display: targetMeta.name || target,
-            found: false, length: null, path: [], hops: [],
-          });
-          recordSearchEvent("timeout", {
-            ...analyticsBase,
-            durationMs: performance.now() - searchStartedAt,
-            requests: bridgeEngine.stats.apiCalls,
-            cached: bridgeEngine.stats.cached,
-          });
-          return;
-        }
-      }
-      if (bridged) {
-        await hydratePlayers(bridged.path, bridgeEngine);
-        const bridgeWork = bridgeEngine.stats.apiCalls
-          ? `made ${bridgeEngine.stats.apiCalls} quick requests` +
-            (bridgeEngine.stats.cached ? `, reused ${bridgeEngine.stats.cached}` : "")
-          : bridgeEngine.stats.cached
-            ? `reused ${bridgeEngine.stats.cached} previous result${bridgeEngine.stats.cached === 1 ? "" : "s"}`
-          : "used the saved bridge index";
-        showStatus("done",
-          `✓ found it fast — ${esc(start)} connects to ${esc(target)} in ${stepText(bridged.length)}. ` +
-          `checked ${esc(mode.instantOnly ? mode.label : "the instant bridge first")} and ${bridgeWork}.`);
-        setActiveChip(target);
-        renderChain(bridged);
-        submitLeaderboardChain(start, target, bridged);
-        recordSearchEvent("found", {
-          ...analyticsBase,
-          length: bridged.length,
-          steps: Math.max(0, bridged.path.length - 1),
-          path: bridged.path,
-          durationMs: performance.now() - searchStartedAt,
-          requests: bridgeEngine.stats.apiCalls,
-          cached: bridgeEngine.stats.cached,
-        });
-        document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
-        return;
-      }
-
-      if (mode.instantOnly) {
-        showStatus("error",
-          `no instant bridge found for ${esc(start)} → ${esc(target)}. ` +
-          `I only checked ${esc(mode.crawlLabel)} for a direct win or a known connector; ` +
-          `switch to Recent fast or Full slow for a wider crawl.`);
-        renderChain({
-          target, display: targetMeta.name || target,
-          found: false, length: null, path: [], hops: [],
-        });
-        recordSearchEvent("not_found", {
-          ...analyticsBase,
-          durationMs: performance.now() - searchStartedAt,
-          requests: bridgeEngine.stats.apiCalls,
-          cached: bridgeEngine.stats.cached,
-        });
-        return;
-      }
-
-      showStatus("working", "no instant bridge yet; widening the search…");
-      logLine(`no instant bridge found; continuing with ${mode.crawlLabel}`);
-      const result = await engine.findChain(start, target, depth);
-
-      if (!result) {
-        showStatus("error",
-          `no connection found in this search. ` +
-          (Number.isFinite(mode.archiveLimit)
-            ? `Fast mode only checked the ${esc(mode.crawlLabel)}. Try Full slow if you want a deeper crawl. `
-            : "") +
-          `(looked through ${engine.stats.fetched} players)`);
-        renderChain({
-          target, display: targetMeta.name || target,
-          found: false, length: null, path: [], hops: [],
-        });
-        recordSearchEvent("not_found", {
-          ...analyticsBase,
-          durationMs: performance.now() - searchStartedAt,
-          requests: engine.stats.apiCalls,
-          cached: engine.stats.cached,
-        });
-        return;
-      }
-
-      // grab avatars/titles for the players in between
-      await hydratePlayers(result.path.slice(1, -1), engine);
-
-      showStatus("done",
-        `✓ found it — ${esc(start)} connects to ${esc(target)} in ${stepText(result.path.length - 1)}. ` +
-        `looked at ${engine.stats.fetched} players, made ${engine.stats.apiCalls} requests` +
-        (engine.stats.cached ? `, reused ${engine.stats.cached}` : "") + ".");
-      setActiveChip(target);
-
-      const renderedChain = {
-        target,
-        display: targetMeta.name || target,
-        found: true,
-        length: result.path.length - 1,
-        path: result.path,
-        hops: result.hops,
-      };
-      renderChain(renderedChain);
-      submitLeaderboardChain(start, target, renderedChain);
-      recordSearchEvent("found", {
-          ...analyticsBase,
-          length: renderedChain.length,
-          steps: Math.max(0, renderedChain.path.length - 1),
-          path: renderedChain.path,
-          durationMs: performance.now() - searchStartedAt,
-          requests: engine.stats.apiCalls,
-          cached: engine.stats.cached,
-        });
-      document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
-    } catch (e) {
-      console.debug("showcase data unavailable:", e.message || e);
-      showStatus("error", `something went wrong: ${esc(e.message)}`);
-      recordSearchEvent("error", {
-        ...analyticsBase,
-        durationMs: performance.now() - searchStartedAt,
-      });
-    } finally {
-      btn.disabled = false;
-      const est = await cache.estimate();
-      if (est) {
-        const info = $("#cache-info");
-        info.hidden = false;
-        info.textContent = est.remote
-          ? "Large game histories stay out of this browser."
-          : "Game history is not being stored in this browser.";
-      }
+    if (!handledByServer) {
+      showStatus("error", "The full search service could not start. Try again; no limited search was substituted.");
     }
   }
 
@@ -4790,7 +4641,7 @@
     loadPlayerMetadata().then(async () => {
       const sharedLoaded = await loadSharedChainFromUrl();
       loadLeaderboardTargetsWhenVisible();
-      if (!sharedLoaded) resumeActiveSearchJob();
+      if (!sharedLoaded && !await resumeTopPlayersTrace()) resumeActiveSearchJob();
     });
     // Keep the global leaderboard off the initial critical path.
     if (window.Leaderboard) window.Leaderboard.init();

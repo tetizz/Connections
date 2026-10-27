@@ -74,7 +74,7 @@ test('aggregate remains pending until the final monthly body has parsed complete
   release(); assert.equal((await pending).length, 2);
 });
 
-test('current month uses explicit provider max-age minus Age and expired data is fetched again', async () => {
+test('current month uses explicit provider max-age minus Age and expired data is fetched again', async t => {
   const env = {GAMES_CACHE:new MemoryKV()};
   const now = new Date(); const month = `${now.getUTCFullYear()}/${String(now.getUTCMonth()+1).padStart(2,'0')}`;
   const calls = transport(async url => url === listURL ? response({archives:[base+month]}) :
@@ -86,6 +86,9 @@ test('current month uses explicit provider max-age minus Age and expired data is
   await __test.fetchGames(args, env);
   assert.equal(calls.filter(url => url === base+month).length,1);
   cached.expiresAt = Date.now()-1; env.GAMES_CACHE.values.set(monthKey(month),JSON.stringify(cached));
+  // The separate raw-response bridge must expire too before this fixture
+  // expects a new provider request rather than another valid cached input.
+  const realNow=Date.now;t.mock.method(Date,'now',()=>realNow()+2100);
   await __test.fetchGames(args, env);
   assert.equal(calls.filter(url => url === base+month).length,2);
 });

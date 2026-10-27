@@ -25,7 +25,7 @@ function constant(name) {
   return line;
 }
 
-function fixture({ chains = publicData } = {}) {
+function fixture({ chains = publicData, serverHandled = true } = {}) {
   const events = [], submissions = [], renders = [], cards = [], shares = [], serverCalls = [];
   const timerClears = [], focusCalls = [], scrolls = [];
   const storage = new Map();
@@ -70,16 +70,17 @@ function fixture({ chains = publicData } = {}) {
     renderGraph: (chain, options) => renders.push({ chain, options }),
     renderCards: chain => cards.push(chain),
     updateShareButton: chain => shares.push(chain),
-    runServerSearchFlow: async options => { serverCalls.push(options); return true; },
+    runServerSearchFlow: async options => { serverCalls.push(options); return serverHandled; },
     fetch: () => { throw new Error("Unexpected HTTP in controller fixture"); },
     pollServerSearchJob: async id => { context.polled = id; return { id, policyVersion: "fresh-search-v2", status: "found", chain: { found: true } }; },
     renderSearchQueue: () => {}, finishSearchQueue: () => {},
     applyServerChain: async job => { context.applied = job; },
+    isSearchComplete: job => job?.status === "found",
     Date,
     console,
   });
   vm.runInContext([
-    ...["LS_KEY", "LS_RANGE_KEY", "LS_ACTIVE_JOB_KEY", "SEARCH_POLICY_VERSION", "AUTO_SEARCH_DEPTH", "USERNAME_MAX_LENGTH", "BLOCKED_USERNAMES"].map(constant),
+    ...["LS_KEY", "LS_RANGE_KEY", "LS_ACTIVE_JOB_KEY", "LS_VERIFIED_ROUTES_KEY", "SEARCH_POLICY_VERSION", "USERNAME_MAX_LENGTH", "BLOCKED_USERNAMES"].map(constant),
     section("  const esc =", "  const plainNumber ="),
     section("  const cleanUsernameInput =", "  const wait ="),
     section("  function precomputedChain(", "  async function quickBridge("),
@@ -98,7 +99,7 @@ function fixture({ chains = publicData } = {}) {
 
 const activeKey = "chess-connections:active-search-job:v3:full-history-search";
 
-test("all ordinary pairs discard saved answers and enter one fresh server search", async t => {
+test("ordinary pairs ignore untrusted bundled answers and enter one fresh full-history search", async t => {
   for (const [start, target] of [["fredalsup", "pianoskater"], ["trixize1234", "pianoskater"], ["public-a", "public-b"]]) {
     await t.test(`${start} to ${target}`, async () => {
       const f = fixture();
@@ -107,7 +108,8 @@ test("all ordinary pairs discard saved answers and enter one fresh server search
       const call = f.serverCalls[0];
       assert.equal(call.start, start);
       assert.equal(call.target, target);
-      assert.equal(call.knownChain, undefined);
+      assert.equal(call.knownChain, null);
+      assert.equal(call.range, "all");
       assert.equal(f.state.currentChain.found, false);
       assert.deepEqual(plain(f.state.currentChain.path), []);
       assert.deepEqual(plain(f.cards.at(-1).hops), []);
@@ -115,7 +117,7 @@ test("all ordinary pairs discard saved answers and enter one fresh server search
       assert.deepEqual(plain(f.state.chains), { chains: [] });
       assert.deepEqual(f.events.map(row => row.outcome), ["started"]);
       assert.equal(f.submissions.length, 0);
-      assert.match(f.element("#search-status").innerHTML, /fresh search/);
+      assert.match(f.element("#search-status").innerHTML, /fresh full-history search/);
       assert.equal(f.state.activeSearchOwner, "search:client-test-1");
       assert.deepEqual(f.focusCalls, []);
     });
@@ -158,4 +160,42 @@ test("discovered route wording does not imply an unverified global minimum", () 
   const publication=section("  async function applyServerChain(","  function refreshVisibleChainMetadata(");
   assert.match(publication,/searchOptimalityNote\(job\)/);
   assert.doesNotMatch(publication,/loaded saved connection|shortest possible/i);
+});
+
+test("last server-verified route renders immediately while every new request still starts a full search", async () => {
+  const f = fixture();
+  const route = {found:true,path:["alpha","middle","omega"],hops:[
+    {from:"alpha",to:"middle",url:"https://www.chess.com/game/live/1"},
+    {from:"middle",to:"omega",url:"https://www.chess.com/game/live/2"}]};
+  f.context.rememberVerifiedRoute({start:"alpha",target:"omega",policyVersion:"fresh-search-v2",chain:route});
+  await f.run("alpha","omega","instant");
+  assert.equal(f.serverCalls.length,1);
+  assert.equal(f.serverCalls[0].range,"all");
+  assert.deepEqual(plain(f.serverCalls[0].knownChain.path),route.path);
+  assert.deepEqual(plain(f.state.currentChain.path),route.path);
+  assert.match(f.element("#search-status").innerHTML,/last verified route.*full search/);
+  assert.equal(f.submissions.length,0);
+});
+
+test("malformed or unverified local routes cannot become the saved preview", async () => {
+  const f=fixture();
+  f.storage.set("chess-connections:verified-routes:v1",JSON.stringify([{start:"alpha",target:"omega",serverVerified:true,chain:{found:true,path:["alpha","omega"],hops:[]}}]));
+  await f.run("alpha","omega");
+  assert.equal(f.serverCalls[0].knownChain,null);
+  assert.equal(f.state.currentChain.found,false);
+});
+
+
+test("an unavailable server never silently substitutes a browser search", async () => {
+  const f=fixture({serverHandled:false});
+  await f.run("alpha","omega","auto");
+  assert.equal(f.serverCalls.length,1);
+  assert.match(f.element("#search-status").textContent,/full search service.*no limited search was substituted/i);
+});
+
+test("resumable jobs remain usable after the previous two-hour UI cutoff", async () => {
+  const f=fixture();
+  f.storage.set(activeKey,JSON.stringify({id:"overnight",start:"alpha",target:"omega",policyVersion:"fresh-search-v2",ts:Date.now()-8*60*60*1000}));
+  await f.context.resumeActiveSearchJob();
+  assert.equal(f.context.polled,"overnight");
 });

@@ -400,7 +400,7 @@ test("health identifies the fresh-search release", async () => {
   const body = await result.json();
 
   assert.equal(result.status, 200);
-  assert.equal(body.release, "2026-10-17-proof-bound-search-v7");
+  assert.equal(body.release, "2026-10-26-full-history-paged-search-v8");
 });
 
 test("unknown jobs return 404 with strict KV cache TTL rules", async () => {
@@ -793,7 +793,7 @@ test("caller-owned job ids cannot be reused for another pair", async () => {
   assert.equal(mismatch.status, 409);
 });
 
-test("saved pair answers are absent from new jobs and fresh proofs find a shorter route", async () => {
+test("unmarked legacy pair answers are ignored and fresh shorter proofs replace their cache", async () => {
   const kv = new MemoryKV();
   await kv.put("search:pair:v2:alpha:omega:auto", JSON.stringify({
     start: "alpha",
@@ -839,7 +839,7 @@ test("saved pair answers are absent from new jobs and fresh proofs find a shorte
   assert.deepEqual(job.chain.path, ["alpha", "omega"]);
   assert.equal(job.chain.hops[0].url, "https://www.chess.com/game/live/12");
   assert.deepEqual(JSON.parse(await kv.get("search:pair:v2:alpha:omega:auto")).chain.path,
-    ["alpha", "beta", "omega"], "historical pair is retained but not promoted or overwritten");
+    ["alpha", "omega"], "verified shorter discovery replaces the legacy pair");
 });
 
 test("direct wins beat longer exact fast-lane routes", async () => {
@@ -1957,10 +1957,10 @@ test("failed fresh searches retain outcomes and analytics without a second excep
       // ReferenceError: completed is not defined before writing analytics.
       await assert.doesNotReject(() => __test.runSearchJob({ GAMES_CACHE: kv }, job));
       const stored = JSON.parse(kv.values.get(__test.searchJobKey(job.id)));
-      assert.equal(stored.status, throttled ? "timeout" : "failed");
-      assert.equal(stored.outcome, throttled ? "timeout" : "error");
+      assert.equal(stored.status, throttled ? "running" : "failed");
+      assert.equal(stored.outcome, throttled ? "started" : "error");
       assert.equal(stored.processingToken, "");
-      assert.equal(stored.processingUntil, 0);
+      if(throttled)assert.ok(stored.processingUntil>Date.now());else assert.equal(stored.processingUntil, 0);
       assert.equal(stored.policyVersion, __test.SEARCH_POLICY_VERSION);
       assert.equal(stored.chain, null);
       assert.ok(stored.error);
@@ -1968,7 +1968,7 @@ test("failed fresh searches retain outcomes and analytics without a second excep
       const events = JSON.parse(kv.values.get("analytics:events"));
       assert.equal(events.length, 1);
       assert.equal(events[0].id, job.id);
-      assert.equal(events[0].outcome, throttled ? "timeout" : "error");
+      assert.equal(events[0].outcome, throttled ? "started" : "error");
       assert.deepEqual(events[0].path, []);
       assert.deepEqual(events[0].hops, []);
       assert.equal(warnings.length, 1);

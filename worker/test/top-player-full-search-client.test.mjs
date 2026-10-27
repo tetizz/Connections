@@ -37,3 +37,14 @@ test('a proof path with different endpoints is rejected even when the job labels
  const f=harness([{job:{id:'wrong-route',start:'alpha',target:'omega',status:'found',policyVersion:'fresh-search-v2',shortestVerified:true,chain:route(['alpha','beta'])}}]);
  const result=await f.c.traceTopCandidate('alpha',{username:'omega'},1);assert.notEqual(result.status,'found');assert.equal(result.job,null);assert.match(result.error,/proof|route|requested/i);
 });
+
+test('a fair batch turn fetches only one snapshot from an unfinished job',async()=>{
+ const running={id:'job-1',start:'alpha',target:'omega',status:'running',policyVersion:'fresh-search-v2'};const f=harness([{job:running}]);
+ const result=await f.c.traceTopCandidate('alpha',{username:'omega'},1,{existing:{job:running,searchId:'same'},pollOnce:true});
+ assert.equal(result.status,'running');assert.equal(f.requests.length,1);assert.match(f.requests[0].url,/search\/job/);
+});
+test('a rate-limited batch snapshot keeps its job and observes the complete retry-after cooldown',async()=>{
+ const running={id:'job-1',start:'alpha',target:'omega',status:'running',policyVersion:'fresh-search-v2'};const f=harness([Object.assign(new Error('cooldown'),{status:429,retryAfterMs:300000})]);const before=Date.now();
+ const result=await f.c.traceTopCandidate('alpha',{username:'omega'},1,{existing:{job:running,searchId:'same'},pollOnce:true});
+ assert.equal(result.status,'running');assert.equal(result.job.id,'job-1');assert.ok(result.retryAt>=before+300000);assert.equal(result.pollFailures,1);assert.equal(f.requests.length,1);
+});

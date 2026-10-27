@@ -520,11 +520,11 @@
     try {
       if (options.batchId && state.topTraceActiveBatchId && options.batchId !== state.topTraceActiveBatchId) return;
       const signature = JSON.stringify([start, options.batchId || "", results.map(item => [item.player?.username, item.status, item.job?.id,
-        item.job?.shortestVerified === true, serverChainIdentity(item.job?.chain)])]);
+        item.job?.shortestVerified === true, item.retryAt || 0, serverChainIdentity(item.job?.chain)])]);
       if (state.topTracePersistedSignature === signature && Date.now() - Number(state.topTracePersistedAt || 0) < 10000) return;
       localStorage.setItem(LS_TOP_TRACE_KEY, JSON.stringify({ start, policyVersion: SEARCH_POLICY_VERSION,
         batchId: options.batchId, startedAt: options.startedAt || Date.now(), ts: Date.now(), results: results.map(item => ({ player: item.player, status: item.status,
-          ms: item.ms, steps: item.steps, searchId: item.searchId, error: item.error,
+          ms: item.ms, steps: item.steps, searchId: item.searchId, error: item.error, retryAt: item.retryAt, pollFailures: item.pollFailures,
           job: item.job ? { id: item.job.id, start: item.job.start, target: item.job.target,
             status: item.job.status, policyVersion: item.job.policyVersion, range: item.job.range,
             chain: item.job.chain, shortestVerified: item.job.shortestVerified,
@@ -567,6 +567,8 @@
       return;
     }
     resetSearchQueue();
+    state.topTraceOpenedBranch = null;
+    state.latestTopTraceTree = null;
     const runId = ++state.topTraceRunId;
     const batchStartedAt = Number(savedBatch?.startedAt || savedBatch?.ts || Date.now());
     const batchId = savedBatch?.batchId || `${start}:${batchStartedAt}:${Math.random().toString(36).slice(2)}`;
@@ -620,14 +622,14 @@
         update(index, next);
       }
     };
-    const pollWorker = async () => {
-      while (cursor < results.length && runId === state.topTraceRunId) {
-        const index = cursor++;
+    const pollWorker = async (indices) => {
+      while (cursor < indices.length && runId === state.topTraceRunId) {
+        const index = indices[cursor++];
         const previous = results[index];
         if (!previous.job?.id || !["queued", "running"].includes(previous.job.status)) continue;
         update(index, { ...previous, status: "running" });
         const next = await traceTopCandidate(start, previous.player, runId, {
-          existing: previous, onUpdate: item => update(index, item),
+          existing: previous, pollOnce: true, onUpdate: item => update(index, item),
         });
         update(index, next);
       }
@@ -637,8 +639,22 @@
       await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, results.length) }, dispatchWorker));
       if (runId !== state.topTraceRunId) return;
       dispatching = false;
-      cursor = 0;
-      await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, results.length) }, pollWorker));
+      const pendingIndices = () => results.map((item, index) => ({ item, index }))
+        .filter(({ item }) => item.status !== "paused" && item.job?.id && ["queued", "running"].includes(item.job.status))
+        .map(({ index }) => index);
+      while (runId === state.topTraceRunId) {
+        const pending = pendingIndices();
+        if (!pending.length) break;
+        const ready = pending.filter(index => Number(results[index].retryAt || 0) <= Date.now());
+        cursor = 0;
+        // A worker handles one snapshot per target, never a whole search. Every
+        // ready target gets its turn before another snapshot round begins.
+        await Promise.all(Array.from({ length: Math.min(TOP_TRACE_CONCURRENCY, ready.length) }, () => pollWorker(ready)));
+        if (runId !== state.topTraceRunId || !pendingIndices().length) break;
+        const retryAt = Math.min(...pendingIndices().map(index => Number(results[index].retryAt || 0)));
+        const gap = retryAt > Date.now() ? Math.min(5000, Math.max(1000, retryAt - Date.now())) : 5000;
+        await wait(gap);
+      }
       if (runId !== state.topTraceRunId) return;
       const progress = topTraceProgress(results);
       if (progress.found) await renderTopTraceCurrentTree(start, results, { scroll: true, progressive: Boolean(progress.unfinished || progress.checking) });
@@ -656,7 +672,7 @@
     const target = cleanUsernameInput(player?.username);
     const started = performance.now();
     const id = options.existing?.searchId || newSearchEventId();
-    const result = { player, status: "paused", ms: null, steps: null, job: options.existing?.job || null, searchId: id };
+    const result = { player, status: "paused", ms: null, steps: null, job: options.existing?.job || null, searchId: id, retryAt: options.existing?.retryAt || 0, pollFailures: options.existing?.pollFailures || 0 };
     const remoteBase = workerBase();
     if (!remoteBase || !target || start === target) return { ...result, status: "skipped", ms: 0 };
     let job = options.existing?.job || null;
@@ -696,16 +712,26 @@
         if (pollAttempt++ > 0) await wait(Math.min(1800, TOP_TRACE_POLL_INTERVAL_MS + pollAttempt * 75));
         const { data } = await fetchJsonWithRetry(`${remoteBase}/search/job?id=${encodeURIComponent(job.id)}`, {
           headers: { "Accept": "application/json" },
-        }, { attempts: 3, timeoutMs: 12000, stopOnRateLimit: true });
+        }, { attempts: options.pollOnce ? 1 : 3, timeoutMs: options.pollOnce ? 7000 : 12000, stopOnRateLimit: true });
         if (runId !== state.topTraceRunId) return { ...update(), status: "cancelled" };
         job = validate(data?.job, job.id);
-        update();
+        result.retryAt = 0;
+        result.pollFailures = 0;
+        const snapshot = update();
+        if (options.pollOnce) return job.chain?.found && TERMINAL_SEARCH_STATUSES.has(job.status) && job.shortestVerified !== true
+          ? { ...snapshot, status: "paused" } : snapshot;
       }
       const current = update();
       if (["queued", "running", "paused"].includes(job.status)) return { ...current, status: runId === state.topTraceRunId ? "paused" : "cancelled" };
       if (job.chain?.found && job.shortestVerified !== true) return { ...current, status: "paused" };
       return { ...current, status: job.chain?.found ? "found" : job.status || "not_found" };
     } catch (error) {
+      if (options.pollOnce && lastValidJob && !["SEARCH_POLICY_EXPIRED", "SEARCH_PROTOCOL_ERROR"].includes(error?.code)) {
+        const failures = Number(result.pollFailures || 0) + 1;
+        return { ...result, job: lastValidJob, status: failures < SERVER_POLL_RETRY_LIMIT ? "running" : "paused", pollFailures: failures,
+          retryAt: Date.now() + Math.max(1000, Number(error?.retryAfterMs || 0), Math.min(30000, 3000 * 2 ** (failures - 1))),
+          error: error?.status === 429 ? "The API is cooling down; this search will retry after the cooldown." : "Live updates paused briefly; this saved search will retry." };
+      }
       return { ...result, job: error?.code === "SEARCH_POLICY_EXPIRED" ? null : lastValidJob, status: "paused", ms: Math.round(performance.now() - started),
         error: error?.status === 429 ? "The API is cooling down; this saved search can resume later." : error.message || "Search updates paused." };
     }
@@ -755,26 +781,31 @@
     const targetCount = results.length;
     const foundSlotCount = found.length;
     if (!progressive) void hydrateTopTracePlayers(foundItems).catch(() => {});
-    $("#search-target").value = shortest?.target || targets[0] || $("#search-target").value;
-    setActiveChip($("#search-target").value);
-    renderChain({
-      tree: true,
-      found: true,
-      root,
+    const tree = {
+      tree: true, found: true, root,
       target: shortest?.target || targets[0],
       display: `${foundSlotCount} of ${targetCount} top players`,
-      branchCount: found.length,
-      targetCount,
-      foundSlotCount,
-      length: found.length,
-      path: shortest?.path || found[0].path,
-      hops: shortest?.hops || found[0].hops,
-      chains: found,
-    });
+      branchCount: found.length, targetCount, foundSlotCount, length: found.length,
+      path: shortest?.path || found[0].path, hops: shortest?.hops || found[0].hops, chains: found,
+    };
+    state.latestTopTraceTree = tree;
+    const preserveBranch = state.topTraceOpenedBranch && !state.currentChain?.tree &&
+      state.currentChain?.target === state.topTraceOpenedBranch;
+    if (preserveBranch) {
+      const selected = found.find(branch => branch.target === state.topTraceOpenedBranch);
+      if (selected && (serverChainIdentity(selected) !== serverChainIdentity(state.currentChain) ||
+          selected.shortestVerified !== state.currentChain.shortestVerified)) {
+        renderChain({ ...selected, length: selected.path.length - 1 });
+      }
+    } else {
+      $("#search-target").value = tree.target || $("#search-target").value;
+      setActiveChip($("#search-target").value);
+      renderChain(tree);
+    }
     if (!progressive) submitTopTraceLeaderboardBranches(root, found);
     showStatus(progressive ? "working" : "done",
       `${progressive ? "building" : "✓ built"} a top-player tree — ${esc(root)} has verified routes to ${plainNumber(foundSlotCount)} of ${plainNumber(targetCount)} top players.`);
-    if (scroll) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
+    if (scroll && !preserveBranch) document.querySelector(".graph-section").scrollIntoView({ behavior: "smooth" });
   }
 
   // ---------- username autocomplete ----------
@@ -1046,6 +1077,8 @@
       return;
     }
     state.currentChain = chain;
+    const backToTree = $("#top-tree-back");
+    if (backToTree) backToTree.hidden = !(state.topTraceOpenedBranch && !chain.tree && state.latestTopTraceTree?.found);
     $("#target-name").textContent = chain.display || chain.target;
     $("#chain-length").textContent = chain.tree && chain.targetCount
       ? `${chain.foundSlotCount || chain.branchCount}/${chain.targetCount}`
@@ -1054,6 +1087,17 @@
     renderGraph(chain, { preserveTreeProgress: true });
     renderCards(chain);
     updateShareButton(chain);
+  }
+
+  function showAllTopPlayers() {
+    if (!state.latestTopTraceTree?.found) return;
+    state.topTraceOpenedBranch = null;
+    const backToTree = $("#top-tree-back");
+    if (backToTree) backToTree.hidden = true;
+    $("#search-target").value = state.latestTopTraceTree.target;
+    setActiveChip(state.latestTopTraceTree.target);
+    renderChain(state.latestTopTraceTree);
+    $("#replay")?.focus();
   }
 
   function qualityFromChain(chain) {
@@ -4250,6 +4294,8 @@
     $("#setting-username").value = start;
 
     clearActiveJob();
+    state.topTraceOpenedBranch = null;
+    state.latestTopTraceTree = null;
     const knownChain = savedVerifiedRoute(start, target);
     state.chains = { chains: [] };
     state.topTraceRunId++;
@@ -4483,6 +4529,7 @@
     const spark = svg.querySelector(".edge-spark");
     if (svg.querySelector(".node") && traveller) animateGraph(svg, traveller, spark);
   });
+  $("#top-tree-back")?.addEventListener("click", showAllTopPlayers);
   $("#copy-share")?.addEventListener("click", copyShareLink);
   $("#save-share-image")?.addEventListener("click", saveShareImage);
   $("#graph")?.addEventListener("click", (event) => {
@@ -4507,6 +4554,7 @@
     const target = cleanUsernameInput(open.dataset.treeOpen);
     const branch = (state.currentChain.chains || []).find((item) => cleanUsernameInput(item.target) === target);
     if (!branch) return;
+    state.topTraceOpenedBranch = target;
     renderChain({
       target: branch.target,
       display: branch.display || nameOf(branch.target),
@@ -4515,6 +4563,7 @@
       path: branch.path || [],
       hops: branch.hops || [],
       quality: branch.quality || null,
+      shortestVerified: branch.shortestVerified === true,
     });
     setActiveChip(branch.target);
     document.querySelector(".graph-section")?.scrollIntoView({ behavior: "smooth" });

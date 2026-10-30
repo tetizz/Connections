@@ -52,31 +52,26 @@ function fixture(compact = false) {
   return { svg, graph, context, animations: () => animations };
 }
 
-function assertDirectionalOutput(svg, radius, expectedCenters) {
+function assertCurvedLineOutput(svg, expectedCenters, layout) {
   const all = descendants(svg);
   const lines = all.filter(node => node.tag === 'path' && hasClass(node, 'edge-line'));
   const nodes = all.filter(node => hasClass(node, 'node'));
   assert.equal(lines.length, expectedCenters.length - 1);
   assert.equal(nodes.length, expectedCenters.length);
+  assert.equal(all.some(node => node.tag === 'marker'), false, 'curved-line graphs must not define floating arrowhead markers');
   for (const [index, line] of lines.entries()) {
-    const reference = line.attrs['marker-end'];
-    assert.match(reference || '', /^url\(#.+\)$/, 'each winner-to-loser edge must end in an SVG arrowhead');
-    assert.equal(line.attrs['marker-start'], undefined, 'direction must point toward the next player only');
-    const marker = all.find(node => node.tag === 'marker' && node.attrs.id === reference.slice(5, -1));
-    assert.ok(marker, 'marker reference must resolve to a definition in this SVG');
-    assert.equal(marker.attrs.orient, 'auto');
-    assert.ok(Number(marker.attrs.markerWidth) > 0 && Number(marker.attrs.markerHeight) > 0);
-    assert.ok(descendants(marker).some(node => node.tag === 'path' || node.tag === 'polygon'), 'marker must contain visible arrow geometry');
+    for (const attribute of ['marker-start', 'marker-mid', 'marker-end']) {
+      assert.equal(line.attrs[attribute], undefined, 'winner-to-loser curves must remain line-only');
+    }
+    assert.match(line.attrs.d, /^M .+ [QC] /, 'keep the existing curved animated paths');
     const coords = numbers(line.attrs.d);
-    const start = coords.slice(0, 2), end = coords.slice(-2);
     const a = expectedCenters[index], b = expectedCenters[index + 1];
-    assert.ok(Math.hypot(start[0] - a.x, start[1] - a.y) >= radius + 2, 'source endpoint must clear the avatar circle');
-    assert.ok(Math.hypot(end[0] - b.x, end[1] - b.y) >= radius + 2, 'destination arrow tip must clear the avatar circle');
-    const finalControl = coords.slice(-4, -2);
-    const towardDestination = (end[0] - finalControl[0]) * (b.x - end[0])
-      + (end[1] - finalControl[1]) * (b.y - end[1]);
-    assert.ok(towardDestination > 0, 'terminal tangent and arrowhead must point toward the destination center');
-    assert.ok(Math.hypot(end[0] - b.x, end[1] - b.y) < Math.hypot(end[0] - a.x, end[1] - a.y), 'path end must approach the destination, not the source');
+    const original = layout === 'wide'
+      ? [a.x, a.y, (a.x + b.x) / 2, a.y - 28, b.x, b.y]
+      : layout === 'compact'
+        ? [a.x, a.y, a.x + 28, (a.y + b.y) / 2, b.x + 28, (a.y + b.y) / 2, b.x, b.y]
+        : [100, 150, 265.6, 150, 337.6, 330, 460, 330];
+    assert.deepEqual(coords, original, 'keep the d1d5960 center-to-center curve and its original controls');
     const glow = all.filter(node => hasClass(node, 'edge-glow'))[index];
     assert.equal(glow.attrs.d, line.attrs.d, 'glow and animated visible edge must retain the same path');
   }
@@ -85,27 +80,34 @@ function assertDirectionalOutput(svg, radius, expectedCenters) {
 }
 
 for (const compact of [false, true]) {
-  test(`normal ${compact ? 'compact' : 'wide'} graph emits directional arrowheads outside avatar clipping`, () => {
+  test(`normal ${compact ? 'compact' : 'wide'} graph keeps winner-to-loser curves without arrowheads`, () => {
     const f = fixture(compact);
-    f.context.renderGraph({ found: true, path: ['alpha', 'omega'], hops: [] });
-    assertDirectionalOutput(f.svg, 32, compact ? [{ x: 150, y: 64 }, { x: 150, y: 196 }] : [{ x: 128, y: 196 }, { x: 912, y: 196 }]);
+    const chain = { found: true, path: ['alpha', 'omega'], hops: [
+      { from: 'alpha', to: 'omega', url: 'https://www.chess.com/game/live/123' },
+    ] };
+    const proofBefore = JSON.stringify(chain);
+    f.context.renderGraph(chain);
+    assertCurvedLineOutput(f.svg, compact ? [{ x: 150, y: 64 }, { x: 150, y: 196 }] : [{ x: 128, y: 196 }, { x: 912, y: 196 }], compact ? 'compact' : 'wide');
+    assert.deepEqual(descendants(f.svg).filter(node => hasClass(node, 'node')).map(node => node.attrs['data-profile-user']), chain.path);
+    assert.equal(JSON.stringify(chain), proofBefore, 'visual restoration must preserve route order and proof links');
+    assert.equal(f.context.$('#graph-hint').textContent, 'Every link is a real win from a real game. 1 link in total.');
     assert.equal(f.animations(), 1);
   });
 }
 
-test('tree graph emits parent-to-child arrowheads outside avatar clipping', () => {
+test('tree graph keeps parent-to-child curves without arrowheads', () => {
   const f = fixture();
   f.context.renderGraph({ tree: true, found: true, root: 'alpha', chains: [], branchCount: 1, targetCount: 1 });
-  assertDirectionalOutput(f.svg, 28, [f.graph.positions.get('alpha'), f.graph.positions.get('omega')]);
+  assertCurvedLineOutput(f.svg, [f.graph.positions.get('alpha'), f.graph.positions.get('omega')], 'tree');
   assert.equal(f.animations(), 1);
 });
 
-test('dense wide normal graph keeps all 17 arrowheads pointing toward their destinations', () => {
+test('dense wide normal graph retains the original fixed bow on all 17 links', () => {
   const f = fixture();
   const path = Array.from({ length: 18 }, (_, index) => `player${index}`);
   f.context.renderGraph({ found: true, path, hops: [] });
   const centers = path.map((_, index) => ({ x: 128 + (784 / 17) * index, y: 196 }));
-  assertDirectionalOutput(f.svg, 32, centers);
+  assertCurvedLineOutput(f.svg, centers, 'wide');
   assert.equal(f.animations(), 1);
 });
 
@@ -117,7 +119,7 @@ for (const compact of [false, true]) {
     const hint = f.context.$('#graph-hint').textContent;
     if (compact) assert.match(hint, /Swipe sideways to explore the tree\./);
     else assert.doesNotMatch(hint, /Swipe sideways/);
-    assertDirectionalOutput(f.svg, 28, [f.graph.positions.get('alpha'), f.graph.positions.get('omega')]);
+    assertCurvedLineOutput(f.svg, [f.graph.positions.get('alpha'), f.graph.positions.get('omega')], 'tree');
     assert.equal(f.animations(), 1);
   });
 }
@@ -128,6 +130,6 @@ test('normal phone graph keeps its vertical layout without tree width or sideway
   assert.equal(f.svg.style.properties.has('--tree-graph-width'), false);
   assert.equal(f.svg.style.properties.get('--chain-graph-height'), '420px');
   assert.doesNotMatch(f.context.$('#graph-hint').textContent, /Swipe sideways/);
-  assertDirectionalOutput(f.svg, 32, [{ x: 150, y: 64 }, { x: 150, y: 196 }]);
+  assertCurvedLineOutput(f.svg, [{ x: 150, y: 64 }, { x: 150, y: 196 }], 'compact');
   assert.equal(f.animations(), 1);
 });

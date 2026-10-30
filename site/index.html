@@ -22,7 +22,7 @@
   <style>
     html, body { background: #0d100e; color: #f6efe2; }
   </style>
-  <link rel="stylesheet" href="styles.css?v=connections-refresh-20261030-final" />
+  <link rel="stylesheet" href="styles.css?v=graph-restore-20261030" />
 </head>
 <body class="connections-experience">
   <a class="skip-link" href="#trace-workspace">Skip to trace search</a>
@@ -103,13 +103,12 @@
         </details>
         <div class="cache-info" id="cache-info" hidden></div>
 
-        <details class="target-discovery" id="target-discovery">
-          <summary><span>Or explore connections to the top players</span><span class="target-discovery__hint">Live rankings <span aria-hidden="true">⌄</span></span></summary>
+        <div class="target-discovery" id="target-discovery">
         <div class="quick-targets" aria-labelledby="quick-target-heading">
           <div class="quick-targets__head">
             <div>
-              <span class="quick-label" id="quick-target-heading">Choose your next connection</span>
-              <p>Pick a player, or search the current top players together.</p>
+              <h2 id="quick-target-heading">Connect to the top players</h2>
+              <p>Enter your username above. Pick a player below to search for a connection, or choose <strong>Search top players</strong> to try several at once.</p>
             </div>
             <div class="quick-targets__actions">
               <button class="quick-targets__trace" id="trace-top-players" type="button">Search top players</button>
@@ -118,7 +117,7 @@
           </div>
           <div class="quick-target-groups" id="quick-target-groups" aria-live="polite"></div>
         </div>
-        </details>
+        </div>
       </section>
 
       <section class="graph-section" aria-labelledby="chain-heading">
@@ -295,6 +294,6 @@
   <script src="engine.js?v=feature-expansion-20260627"></script>
   <script src="leaderboard.js?v=pages-api-20261016"></script>
   <script src="saved-routes.js?v=known-win-paths-20261016"></script>
-  <script src="app.js?v=connections-refresh-20261030"></script>
+  <script src="app.js?v=graph-restore-20261030"></script>
 </body>
 </html>

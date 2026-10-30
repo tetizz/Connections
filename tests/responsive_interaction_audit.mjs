@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {pathToFileURL, fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
+import {readGraphAppearance, isRestoredGraph} from './graph_visual_audit.mjs';
 
 // Isolated browser regressions. Every request is fulfilled locally; no server,
 // user browser profile, real search job, analytics write, or real game is used.
@@ -99,10 +100,6 @@ async function fixture(viewport = {width: 1440, height: 900}) {
   });
   async function open(query = '') {
     await page.goto(origin + '/' + query, {waitUntil: 'load'});
-    const discovery = page.locator('#target-discovery');
-    if (await discovery.count() && await discovery.getAttribute('open') === null) {
-      await discovery.locator('summary').click();
-    }
     // Targets intentionally load only when their section becomes visible.
     await page.locator('.quick-targets').scrollIntoViewIfNeeded();
     await page.waitForSelector('.quick-player', {timeout: 7000});
@@ -125,15 +122,7 @@ async function run(name, operation) {
 }
 function record(name, pass, detail) { checks.push({name, pass: Boolean(pass), detail}); }
 async function shot(page, name, fullPage = true) { const filename = path.join(output, name + '.png'); await page.screenshot({path: filename, fullPage}); return filename; }
-async function graphDirections(page) {
-  return page.locator('#graph').evaluate(svg => {
-    const edges = [...svg.querySelectorAll('.edge-line')];
-    return {edges: edges.length, marked: edges.filter(edge => {
-      const id = edge.getAttribute('marker-end')?.match(/^url\(#(.+)\)$/)?.[1];
-      return id && svg.querySelector(`marker[id="${id}"] path`);
-    }).length, labels: [...svg.querySelectorAll('.node__label')].map(label => ({text: label.textContent, renderedHeight: label.getBoundingClientRect().height}))};
-  });
-}
+const graphAppearance = page => page.evaluate(readGraphAppearance);
 
 try {
   for (const viewport of [{width: 320, height: 568}, {width: 390, height: 664}, {width: 768, height: 400}, {width: 1440, height: 900}]) {
@@ -142,9 +131,12 @@ try {
       try {
         await f.open('?c=synthetic-fixture');
         const layout = await f.page.evaluate(() => ({width: innerWidth, scrollWidth: document.documentElement.scrollWidth, graphNodes: document.querySelectorAll('#graph .node').length, targetActions: [...document.querySelectorAll('.quick-targets__actions > *')].map(e => {const r = e.getBoundingClientRect(); return {text: e.textContent.trim(), x: r.x, right: r.right, width: r.width};})}));
-        record(`page-width-${viewport.width}`, layout.scrollWidth <= viewport.width + 1, layout);
-        const directions = await graphDirections(f.page);
-        record(`normal-graph-directions-${viewport.width}`, directions.edges === 2 && directions.marked === directions.edges, directions);
+        const targets = await f.page.locator('#target-discovery').evaluate(section => ({tag: section.tagName, inDetails: Boolean(section.closest('details')), summaries: section.querySelectorAll('summary').length, heading: section.querySelector('h2')?.textContent.trim(), explainer: section.querySelector('.quick-targets__head p')?.textContent.replace(/\s+/g, ' ').trim()}));
+        const expanded = await f.page.locator('#target-discovery').isVisible() && !targets.inDetails && targets.summaries === 0 && targets.heading === 'Connect to the top players' && targets.explainer === 'Enter your username above. Pick a player below to search for a connection, or choose Search top players to try several at once.' && await f.page.locator('#trace-top-players').isVisible();
+        record(`page-width-${viewport.width}`, layout.scrollWidth <= viewport.width + 1 && expanded, {...layout, targets});
+        const appearance = await graphAppearance(f.page);
+        const proofsPreserved = JSON.stringify(appearance.nodeOrder) === JSON.stringify(share.path) && JSON.stringify(appearance.proofs) === JSON.stringify(share.hops.map(hop => hop.url));
+        record(`normal-graph-restored-curves-${viewport.width}`, appearance.nodes === 3 && isRestoredGraph(appearance, 2) && proofsPreserved && appearance.hint === 'Every link is a real win from a real game. 2 links in total.', appearance);
         await shot(f.page, `route-${viewport.width}x${viewport.height}`);
         await f.page.click('#settings-open');
         await f.page.waitForFunction(() => document.activeElement === document.querySelector('#setting-username'));
@@ -177,9 +169,9 @@ try {
         // Renderer-only smoke via the frontend's existing debug hook. This does
         // not certify top-player search, proof cards, or a real verified tree.
         await f.page.evaluate(tree => window.__connectionsDebugRenderGraph(tree), treeFixture);
-        const directions = await graphDirections(f.page);
+        const directions = await graphAppearance(f.page);
         const nodes = await f.page.locator('#graph .tree-node').count();
-        record(`tree-graph-directions-${viewport.width}`, nodes === 6 && directions.edges === 5 && directions.marked === directions.edges, {nodes, ...directions});
+        record(`tree-graph-restored-curves-${viewport.width}`, nodes === 6 && isRestoredGraph(directions, 5), {nodes, ...directions});
         const scroll = await f.page.locator('.graph-wrap').evaluate(wrap => {
           const before = wrap.scrollLeft; wrap.scrollLeft = 120;
           const after = wrap.scrollLeft; wrap.scrollLeft = before;

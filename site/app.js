@@ -2249,7 +2249,6 @@
     const clip = el("clipPath", { id: "clip" });
     clip.appendChild(el("circle", { r: 32, cx: 0, cy: 0 }));
     defs.appendChild(clip);
-    appendGraphArrowhead(defs);
     svg.appendChild(defs);
 
     if (!chain.found) {
@@ -2284,20 +2283,11 @@
     const edgesGroup = el("g");
     for (let i = 0; i < n - 1; i++) {
       const a = positions[i], b = positions[i + 1];
-      // Keep the control beyond the trimmed endpoints in dense wide graphs.
-      const wideBow = Math.max(28, Math.sqrt(Math.max(0, 40 ** 2 - ((b.x - a.x) / 2) ** 2)));
-      const firstControl = compactGraph
-        ? { x: a.x + 28, y: (a.y + b.y) / 2 }
-        : { x: (a.x + b.x) / 2, y: a.y - wideBow };
-      const lastControl = compactGraph
-        ? { x: b.x + 28, y: (a.y + b.y) / 2 } : firstControl;
-      const from = graphEdgeEndpoint(a, firstControl, 38);
-      const to = graphEdgeEndpoint(b, lastControl, 38);
       const d = compactGraph
-        ? `M ${from.x} ${from.y} C ${firstControl.x} ${firstControl.y}, ${lastControl.x} ${lastControl.y}, ${to.x} ${to.y}`
-        : `M ${from.x} ${from.y} Q ${firstControl.x} ${firstControl.y} ${to.x} ${to.y}`;
+        ? `M ${a.x} ${a.y} C ${a.x + 28} ${(a.y + b.y) / 2}, ${b.x + 28} ${(a.y + b.y) / 2}, ${b.x} ${b.y}`
+        : `M ${a.x} ${a.y} Q ${(a.x + b.x) / 2} ${a.y - 28} ${b.x} ${b.y}`;
       edgesGroup.appendChild(el("path", { class: "edge-glow", d }));
-      edgesGroup.appendChild(el("path", { class: "edge-line", d, "marker-end": "url(#edge-arrow)" }));
+      edgesGroup.appendChild(el("path", { class: "edge-line", d }));
     }
     svg.appendChild(edgesGroup);
 
@@ -2374,25 +2364,10 @@
     svg.appendChild(traveller);
 
     $("#graph-hint").textContent =
-      `every arrow is a real win from a real game. ${n - 1} link${n - 1 === 1 ? "" : "s"} in total.`;
+      `Every link is a real win from a real game. ${n - 1} link${n - 1 === 1 ? "" : "s"} in total.`;
 
     loadGraphImagesWhenVisible(svg);
     animateGraph(svg, traveller, spark);
-  }
-
-  function appendGraphArrowhead(defs) {
-    const marker = el("marker", {
-      id: "edge-arrow", viewBox: "0 0 10 10", refX: 10, refY: 5,
-      markerWidth: 10, markerHeight: 10, markerUnits: "userSpaceOnUse", orient: "auto",
-    });
-    marker.appendChild(el("path", { d: "M 0 0 L 10 5 L 0 10 Z", fill: "#b4833a", stroke: "none" }));
-    defs.appendChild(marker);
-  }
-
-  function graphEdgeEndpoint(center, control, radius) {
-    const dx = control.x - center.x, dy = control.y - center.y;
-    const length = Math.hypot(dx, dy) || 1;
-    return { x: center.x + dx * radius / length, y: center.y + dy * radius / length };
   }
 
   if (location.hostname === "127.0.0.1" || location.hostname === "localhost") {
@@ -2441,7 +2416,6 @@
     const clip = el("clipPath", { id: "clip" });
     clip.appendChild(el("circle", { r: 28, cx: 0, cy: 0 }));
     defs.appendChild(clip);
-    appendGraphArrowhead(defs);
     svg.appendChild(defs);
 
     const graph = buildMergedChainTree(treeChain.chains || []);
@@ -2465,9 +2439,7 @@
       const dx = Math.max(1, b.x - a.x);
       const yDelta = b.y - a.y;
       const bow = Math.abs(yDelta) < 8 ? Math.min(12, Math.max(5, dx * .025)) : 0;
-      const from = graphEdgeEndpoint(a, { x: c1x, y: a.y - bow }, 34);
-      const to = graphEdgeEndpoint(b, { x: c2x, y: b.y - bow }, 34);
-      const d = `M ${from.x} ${from.y} C ${c1x} ${a.y - bow} ${c2x} ${b.y - bow} ${to.x} ${to.y}`;
+      const d = `M ${a.x} ${a.y} C ${c1x} ${a.y - bow} ${c2x} ${b.y - bow} ${b.x} ${b.y}`;
       const edgeKey = `${edge.from}|${edge.to}`;
       const depth = Math.max(1, Number(edge.depth || 1));
       edgesGroup.appendChild(el("path", {
@@ -2479,7 +2451,6 @@
       edgesGroup.appendChild(el("path", {
         class: "edge-line tree-edge-line",
         d,
-        "marker-end": "url(#edge-arrow)",
         "data-tree-edge": edgeKey,
         "data-edge-depth": depth,
       }));

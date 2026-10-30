@@ -20,12 +20,13 @@ import { shareArchiveFetch } from './shared-archive-fetch.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-26-full-history-paged-search-v8";
+const WORKER_RELEASE = "2026-10-30-connection-experience-v9";
 const SEARCH_POLICY_VERSION = "fresh-search-v2";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
 const searchDurableName = (id) => `${SEARCH_POLICY_VERSION}:${id}`;
 const CACHE_SCHEMA_VERSION = 2;
+const CACHED_GAMES_OBSERVED_AT = Symbol("cached-games-observed-at");
 const TTL_SECONDS = 7 * 24 * 60 * 60;
 const PROFILE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const PARTIAL_PROFILE_TTL_SECONDS = 60;
@@ -421,7 +422,7 @@ async function handleGames(url, env, metrics = null) {
     return json({ source: "chess.com", key, games });
   } catch (error) {
     if (isRateLimitError(error)) {
-      const retryAfter = await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
+      const retryAfter = await rememberRateLimit(env.GAMES_CACHE, error.retryAfter, error.retryUntil);
       if (cachedGames) {metrics?.count("cache_stale");return staleGames(key, cachedGames, retryAfter);}
       return rateLimited(key, retryAfter);
     }
@@ -505,7 +506,7 @@ async function handleProfile(url, env, metrics = null) {
       }, 404, "no-store");
     }
     if (isRateLimitError(error)) {
-      const retryAfter = await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
+      const retryAfter = await rememberRateLimit(env.GAMES_CACHE, error.retryAfter, error.retryUntil);
       if (cachedProfile) {
         metrics?.count("cache_stale");
         return json({
@@ -560,7 +561,7 @@ async function handleSuggest(url, env) {
   }
 
   await addProfilesFromKV(env, query, seen, limit * 3);
-  await addLeaderboardSuggestions(query, seen, limit * 3);
+  await addLeaderboardSuggestions(query, seen, limit * 3, env);
   await addTitledSuggestions(env, query, seen, limit * 4);
 
   const missingProfiles = [...seen.values()]
@@ -2325,7 +2326,7 @@ async function tryPrimedGraphIndexPair(env, job, stats, savedStepLimit) {
   const startGames = await readOrFetchGames(env, { username: job.start, archiveLimit }, stats).catch(() => null);
   const startEdges = startGames ? edgesFromGames(job.start, startGames) : null;
   if (startEdges) {
-    await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed({ username: job.start, archiveLimit }), { username: job.start, archiveLimit }, startEdges)
+    await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed({ username: job.start, archiveLimit }), { username: job.start, archiveLimit }, startEdges, startGames[CACHED_GAMES_OBSERVED_AT])
       .catch(() => {});
   }
   if (startEdges && edgeMapSize(startEdges.beatenByMe) === 0) {
@@ -2785,7 +2786,7 @@ async function proofTimestampInArchiveRange(
       if (stats) stats.requests = Number(stats.requests || 0) + 1;
       const data = await fetchJSON(
         `${CHESS_API}${cleanUsername(username)}/games/archives`,
-        { signal },
+        { signal, cooldownKV: env.GAMES_CACHE },
       );
       const archiveMonths = Array.isArray(data?.archives)
         ? data.archives.map(archiveMonthFromUrl).filter(Boolean)
@@ -2994,8 +2995,6 @@ async function readOrFetchEdges(env, parsed, stats = null) {
       await putEdgesCache(env.GAMES_CACHE, key, parsed, edges);
       return edges;
     }
-    const activeLimit = await readRateLimit(env.GAMES_CACHE);
-    if (activeLimit) throw new UpstreamHTTPError(429, `${CHESS_API}${parsed.username}/games/archives`, activeLimit.retryAfter);
     const edges = { beatenByMe: new Map(), beatMe: new Map() };
     try {
       if (stats) stats.requests++;
@@ -3021,13 +3020,13 @@ async function readOrFetchEdges(env, parsed, stats = null) {
       if (!incomplete) await putEdgesCache(env.GAMES_CACHE, key, parsed, edges);
       return edges;
     } catch (error) {
-      if (isRateLimitError(error)) await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
+      if (isRateLimitError(error)) await rememberRateLimit(env.GAMES_CACHE, error.retryAfter, error.retryUntil);
       throw error;
     }
   }
   const games = await readOrFetchGames(env, parsed, stats);
   const edges = edgesFromGames(parsed.username, games);
-  await putEdgesCache(env.GAMES_CACHE, key, parsed, edges);
+  await putEdgesCache(env.GAMES_CACHE, key, parsed, edges, games[CACHED_GAMES_OBSERVED_AT]);
   return edges;
 }
 
@@ -3037,7 +3036,7 @@ async function readCachedOrBuildEdges(env, parsed, stats = null) {
   const games = await readCachedGames(env, parsed, stats);
   if (!games) return { beatenByMe: new Map(), beatMe: new Map() };
   const edges = edgesFromGames(parsed.username, games);
-  await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed(parsed), parsed, edges);
+  await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed(parsed), parsed, edges, games[CACHED_GAMES_OBSERVED_AT]);
   return edges;
 }
 
@@ -3049,7 +3048,7 @@ async function readCachedExpansionEdges(env, parsed, stats = null) {
   const games = await readCachedGames(env, parsed, stats);
   if (!games) return { edges: null, source: "miss" };
   const edges = edgesFromGames(parsed.username, games);
-  await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed(parsed), parsed, edges);
+  await putEdgesCache(env.GAMES_CACHE, cacheKeyFromParsed(parsed), parsed, edges, games[CACHED_GAMES_OBSERVED_AT]);
   return { edges, source: "game-cache" };
 }
 
@@ -3058,23 +3057,23 @@ async function readOrFetchGames(env, parsed, stats = null, onStale = null) {
   const kvKey = `games:${key}`;
   const cached = await env.GAMES_CACHE.get(kvKey, { type: "json", cacheTtl: 60 });
   const cachedGames = cached?.schema === CACHE_SCHEMA_VERSION && Array.isArray(cached?.games) &&
-    (parsed.sinceMonth == null || sharedCoverageFresh(cached, parsed))
+    (parsed.sinceMonth == null
+      ? Number.isFinite(cached.ts) && cached.ts <= Date.now()
+      : sharedCoverageFresh(cached, parsed))
     ? cached.games
     : null;
   const cachedAt = Number.isFinite(cached?.ts) ? cached.ts : 0;
   if (!parsed.forceFresh && cachedGames && Date.now() - cachedAt < TTL_SECONDS * 1000) {
     if (stats) stats.cached++;
-    return attachArchiveCoverage(cachedGames, cached.coverage);
+    const games = attachArchiveCoverage(cachedGames, cached.coverage);
+    return parsed.sinceMonth == null ? attachGameObservation(games, cachedAt) : games;
   }
 
   const activeLimit = await readRateLimit(env.GAMES_CACHE);
   if (activeLimit && cachedGames && parsed.sinceMonth == null) {
     if (stats) stats.cached++;
     onStale?.();
-    return cachedGames;
-  }
-  if (activeLimit) {
-    throw new UpstreamHTTPError(429, `${CHESS_API}${parsed.username}/games/archives`, activeLimit.retryAfter);
+    return attachGameObservation(cachedGames, cachedAt);
   }
 
   try {
@@ -3094,11 +3093,11 @@ async function readOrFetchGames(env, parsed, stats = null, onStale = null) {
     return games;
   } catch (error) {
     if (isRateLimitError(error)) {
-      await rememberRateLimit(env.GAMES_CACHE, error.retryAfter);
+      await rememberRateLimit(env.GAMES_CACHE, error.retryAfter, error.retryUntil);
       if (cachedGames && parsed.sinceMonth == null) {
         if (stats) stats.cached++;
         onStale?.();
-        return cachedGames;
+        return attachGameObservation(cachedGames, cachedAt);
       }
     }
     throw error;
@@ -3120,8 +3119,18 @@ async function readCachedGames(env, parsed, stats = null) {
     ? cached.games
     : null;
   if (!cachedGames || (parsed.sinceMonth != null && !sharedCoverageFresh(cached, parsed))) return null;
+  if (parsed.sinceMonth == null && (!Number.isFinite(cached.ts) || cached.ts > Date.now()
+      || Date.now() - cached.ts >= TTL_SECONDS * 1000)) return null;
   if (stats) stats.cached = Number(stats.cached || 0) + 1;
-  return attachArchiveCoverage(cachedGames, cached.coverage);
+  const games = attachArchiveCoverage(cachedGames, cached.coverage);
+  return parsed.sinceMonth == null ? attachGameObservation(games, cached.ts) : games;
+}
+
+function attachGameObservation(games, observedAt) {
+  if (Array.isArray(games) && Number.isFinite(observedAt)) {
+    Object.defineProperty(games, CACHED_GAMES_OBSERVED_AT, { value: observedAt, configurable: true });
+  }
+  return games;
 }
 
 async function readCachedEdges(env, parsed, stats = null) {
@@ -3483,7 +3492,7 @@ async function handleWarm(url, request, env, ctx) {
 async function warmLeaderboardTargets(env) {
   const startedAt = Date.now();
   const players = new Set(COMMON_WARM_TARGETS);
-  const data = await fetchJSON("https://api.chess.com/pub/leaderboards");
+  const data = await fetchJSON("https://api.chess.com/pub/leaderboards", { cooldownKV: env.GAMES_CACHE });
   for (const key of ["live_rapid", "live_blitz", "live_bullet"]) {
     for (const row of (Array.isArray(data?.[key]) ? data[key] : []).slice(0, 10)) {
       const username = cleanUsername(row?.username);
@@ -5830,7 +5839,7 @@ async function readArchiveList(env, username, {signal = null, metrics = null, mi
   try {
     const url=`${CHESS_API}${username}/games/archives`;
     const envelope=await shareArchiveFetch(env?.GAMES_CACHE,url,async sharedSignal=>{
-      const data=await fetchJSON(url,{signal:sharedSignal,metrics}),observedAt=Date.now();
+      const data=await fetchJSON(url,{signal:sharedSignal,metrics,cooldownKV:env?.GAMES_CACHE}),observedAt=Date.now();
       return{data,observedAt,reuseUntil:observedAt+ARCHIVE_LIST_CACHE_TTL_SECONDS*1000};
     },{signal,reuseCompleted:!minObservedAt});
     data=envelope.data;observedAt=envelope.observedAt;
@@ -5977,7 +5986,7 @@ async function fetchGames({ username, archiveLimit, signal = null, metrics = nul
     try {
       const envelope=await shareArchiveFetch(env?.GAMES_CACHE,url,async sharedSignal=>{
         let ttl=0;
-        const data=await fetchJSON(url,{signal:sharedSignal,metrics,
+        const data=await fetchJSON(url,{signal:sharedSignal,metrics,cooldownKV:env?.GAMES_CACHE,
           onJSONResponse:response=>{ttl=archiveProviderTTL(response);}});
         const observedAt=Date.now(),now=new Date(observedAt),month=`${now.getUTCFullYear()}/${String(now.getUTCMonth()+1).padStart(2,'0')}`;
         return{data,providerTTL:ttl,observedAt,reuseUntil:observedAt+(archiveMonthFromUrl(url)<month?TTL_SECONDS:ttl)*1000};
@@ -6116,13 +6125,7 @@ function profileShape(data, fallbackUsername) {
 }
 
 async function fetchProfileDetails(username, env = null, previous = null, metrics = null) {
-  const permit = async (url) => {
-    if (!env) return;
-    const limit = await readRateLimit(env.GAMES_CACHE);
-    if (limit) throw new UpstreamHTTPError(429,url,limit.retryAfter);
-  };
-  await permit(`${CHESS_API}${username}`);
-  const data = await fetchJSON(`${CHESS_API}${username}`, { metrics });
+  const data = await fetchJSON(`${CHESS_API}${username}`, { metrics, cooldownKV: env?.GAMES_CACHE });
   const profile = profileShape(data, username);
   profile.enrichment = {stats:"fresh",recentGames:env?"fresh":"unavailable",retryAfterSeconds:PARTIAL_PROFILE_TTL_SECONDS};
   const failed = async (section,error) => {
@@ -6132,18 +6135,16 @@ async function fetchProfileDetails(username, env = null, previous = null, metric
     profile[section] = retained ? previous[section] : section === "stats" ? {} : [];
     profile.enrichment[section] = retained ? "stale" : "unavailable";
     if (env && isRateLimitError(error))
-      profile.enrichment.retryAfterSeconds = Math.max(PARTIAL_PROFILE_TTL_SECONDS, await rememberRateLimit(env.GAMES_CACHE,error.retryAfter));
+      profile.enrichment.retryAfterSeconds = Math.max(PARTIAL_PROFILE_TTL_SECONDS, await rememberRateLimit(env.GAMES_CACHE,error.retryAfter,error.retryUntil));
   };
   try {
-    await permit(`${CHESS_API}${username}/stats`);
-    const stats = await fetchJSON(`${CHESS_API}${username}/stats`, { metrics });
+    const stats = await fetchJSON(`${CHESS_API}${username}/stats`, { metrics, cooldownKV: env?.GAMES_CACHE });
     profile.stats = statsShape(stats);
   } catch (error) {
     await failed("stats",error);
   }
   if (env) {
     try {
-      await permit(`${CHESS_API}${username}/games/archives`);
       profile.recentGames = await fetchRecentProfileGames(env, username, () => {profile.enrichment.recentGames = "stale";}, metrics);
     } catch (error) {
       await failed("recentGames",error);
@@ -6228,7 +6229,7 @@ async function readOrFetchProfile(env, username, options = {}) {
   const cached = await readCachedProfile(env, username);
   if (cached) return cached;
   try {
-    const data = await fetchJSON(`${CHESS_API}${username}`, { signal: options.signal });
+    const data = await fetchJSON(`${CHESS_API}${username}`, { signal: options.signal, cooldownKV: env.GAMES_CACHE });
     const profile = profileShape(data, username);
     await env.GAMES_CACHE.put(`profile:${username}`, JSON.stringify({ ts: Date.now(), profile }), {
       expirationTtl: KV_RETENTION_SECONDS,
@@ -6265,10 +6266,10 @@ async function addProfilesFromKV(env, query, seen, maxCandidates) {
   } while (cursor && pages < 3 && seen.size < maxCandidates);
 }
 
-async function addLeaderboardSuggestions(query, seen, maxCandidates) {
+async function addLeaderboardSuggestions(query, seen, maxCandidates, env = null) {
   if (seen.size >= maxCandidates) return;
   try {
-    const data = await fetchJSON("https://api.chess.com/pub/leaderboards");
+    const data = await fetchJSON("https://api.chess.com/pub/leaderboards", { cooldownKV: env?.GAMES_CACHE });
     const groups = [
       ["live_rapid", "Rapid leaderboard"],
       ["live_blitz", "Blitz leaderboard"],
@@ -6320,7 +6321,7 @@ async function readTitledPlayers(env, title) {
     // Continue to live fetch.
   }
   try {
-    const data = await fetchJSON(`https://api.chess.com/pub/titled/${title}`);
+    const data = await fetchJSON(`https://api.chess.com/pub/titled/${title}`, { cooldownKV: env.GAMES_CACHE });
     const players = Array.isArray(data?.players) ? data.players.map(cleanUsername).filter(Boolean) : [];
     await env.GAMES_CACHE.put(key, JSON.stringify({ ts: Date.now(), players }), {
       expirationTtl: KV_RETENTION_SECONDS,
@@ -6348,9 +6349,14 @@ function suggestionScore(item, query) {
   return score;
 }
 
-async function fetchJSON(url, { signal = null, metrics = null, onJSONResponse = null } = {}) {
+async function fetchJSON(url, { signal = null, metrics = null, onJSONResponse = null, cooldownKV = null } = {}) {
   for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
     if (signal?.aborted) throw abortSignalError(signal);
+    // This is inside a genuinely new shared fill, so cache hits and existing
+    // subscribers stay usable. Recheck for every physical retry as well.
+    const activeLimit = cooldownKV ? await readRateLimit(cooldownKV) : null;
+    if (signal?.aborted) throw abortSignalError(signal);
+    if (activeLimit) throw Object.assign(new UpstreamHTTPError(429, url, activeLimit.retryAfter), { retryUntil: activeLimit.until });
     const controller = new AbortController();
     const abortFromParent = () => controller.abort(abortSignalError(signal));
     if (signal) signal.addEventListener("abort", abortFromParent, { once: true });
@@ -6384,7 +6390,12 @@ async function fetchJSON(url, { signal = null, metrics = null, onJSONResponse = 
         (response.status >= 500 || (response.status === 429 && retryAfter <= 2));
 
       if (!canRetry) {
-        throw new UpstreamHTTPError(response.status, url, retryAfter);
+        const failure = new UpstreamHTTPError(response.status, url, retryAfter);
+        if (response.status === 429) {
+          failure.retryUntil = Math.min(Number.MAX_SAFE_INTEGER, Date.now() + clampRetryAfter(retryAfter) * 1000);
+          if (cooldownKV) await rememberRateLimit(cooldownKV, retryAfter, failure.retryUntil);
+        }
+        throw failure;
       }
 
       if (retryAfter) await delayWithSignal(retryAfter * 1000, signal);
@@ -6698,6 +6709,7 @@ async function putGamesCache(kv, kvKey, parsed, games) {
     const coverage = games.archiveCoverage;
     if (parsed.sinceMonth != null && !sharedCoverageFresh({ coverage }, parsed)) return;
     const ts = Date.now();
+    if (parsed.sinceMonth == null) attachGameObservation(games, ts);
     await kv.put(kvKey, JSON.stringify({
       schema: CACHE_SCHEMA_VERSION,
       ts,
@@ -6774,26 +6786,35 @@ async function readRateLimit(kv) {
     const record = await kv.get(CHESS_RATE_LIMIT_KEY, { type: "json" });
     if (!record || !Number.isFinite(record.until)) return null;
     const retryAfter = Math.ceil((record.until - Date.now()) / 1000);
-    return retryAfter > 0 ? { retryAfter } : null;
+    return retryAfter > 0 ? { retryAfter, until: record.until } : null;
   } catch {
     return null;
   }
 }
 
-async function rememberRateLimit(kv, retryAfter) {
+async function rememberRateLimit(kv, retryAfter, retryUntil = null) {
   const seconds = clampRetryAfter(retryAfter);
-  const record = { until: Date.now() + seconds * 1000 };
+  const now = Date.now();
+  const existing = await readRateLimit(kv);
+  // Best effort against the observed KV record, not an atomic global maximum.
+  const observedUntil = Number.isFinite(retryUntil)
+    ? retryUntil : Math.min(Number.MAX_SAFE_INTEGER, now + seconds * 1000);
+  if (existing?.until >= observedUntil) {
+    return Math.max(0, Math.ceil((existing.until - Date.now()) / 1000));
+  }
+  const until = Math.max(observedUntil, existing?.until || 0);
+  const record = { until };
   try {
-    await kv.put(CHESS_RATE_LIMIT_KEY, JSON.stringify(record), {
-      expirationTtl: seconds,
-    });
+    // One bounded key expires logically at until. Omitting a physical TTL avoids
+    // deleting a valid long provider deadline earlier than its not-before time.
+    await kv.put(CHESS_RATE_LIMIT_KEY, JSON.stringify(record));
   } catch (error) {
     console.warn(JSON.stringify({
       event: "rate_limit_cache_write_failed",
       message: error?.message || String(error),
     }));
   }
-  return seconds;
+  return Math.max(0, Math.ceil((until - now) / 1000));
 }
 
 function parseRetryAfter(headers) {
@@ -6808,7 +6829,7 @@ function parseRetryAfter(headers) {
 
 function clampRetryAfter(seconds) {
   if (!Number.isFinite(seconds) || seconds <= 0) return RATE_LIMIT_COOLDOWN_SECONDS;
-  return Math.max(15, Math.min(300, Math.ceil(seconds)));
+  return Math.max(15, Math.ceil(seconds));
 }
 
 function isRateLimitError(error) {

@@ -3,37 +3,28 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="color-scheme" content="dark light" />
+  <meta name="color-scheme" content="dark" />
   <title>Chess Connections | Trace real Chess.com win chains</title>
-  <meta name="description" content="Search two Chess.com players and trace the chain of live-game wins that connects them." />
+  <meta name="description" content="Who connects you to Magnus? Trace real Chess.com win chains between players, explore top-player connections, and open the proof game behind every link." />
   <meta name="theme-color" content="#0d100e" />
   <meta property="og:title" content="Chess Connections" />
-  <meta property="og:description" content="Trace a chain of real Chess.com live-game wins between two players." />
+  <meta property="og:description" content="Your wins lead somewhere. Discover a chain of real Chess.com victories and explore the proof behind every connection." />
   <meta property="og:type" content="website" />
-  <meta property="og:url" content="https://tetizz.github.io/Connections/" />
-  <meta name="twitter:card" content="summary" />
+  <meta property="og:url" content="https://tetizz-connections.pages.dev/" />
+  <meta property="og:image" content="https://tetizz-connections.pages.dev/assets/connections-cover.png" />
+  <meta property="og:image:alt" content="A brass path connects two ivory kings across a forest-green chessboard." />
+  <link rel="canonical" href="https://tetizz-connections.pages.dev/" />
+  <meta name="twitter:card" content="summary_large_image" />
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
   <script>
-    try {
-      const themeKey = "chess-connections:theme";
-      const darkDefaultKey = "chess-connections:dark-default:v1";
-      if (!localStorage.getItem(darkDefaultKey) && localStorage.getItem(themeKey) !== "dark") {
-        localStorage.setItem(themeKey, "dark");
-        localStorage.setItem(darkDefaultKey, "1");
-      }
-      document.documentElement.dataset.theme =
-        localStorage.getItem(themeKey) || "dark";
-    } catch {
-      document.documentElement.dataset.theme = "dark";
-    }
+    document.documentElement.dataset.theme = "dark";
   </script>
   <style>
     html, body { background: #0d100e; color: #f6efe2; }
-    html[data-theme="light"], html[data-theme="light"] body { background: #f5f1e8; color: #161814; }
   </style>
-  <link rel="stylesheet" href="styles.css?v=original-design-20260905" />
+  <link rel="stylesheet" href="styles.css?v=connections-refresh-20261029" />
 </head>
-<body>
+<body class="connections-experience">
   <a class="skip-link" href="#trace-workspace">Skip to trace search</a>
   <div class="site-shell">
     <header class="masthead">
@@ -48,15 +39,6 @@
         </a>
         <a href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">GitHub</a>
         <a href="https://www.chess.com/news/view/published-data-api" target="_blank" rel="noopener">Chess.com API</a>
-        <button class="theme-btn" id="theme-toggle" type="button" title="Switch to light mode" aria-label="Switch to light mode" aria-pressed="true">
-          <svg class="theme-btn__moon" viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
-            <path d="M20.3 14.9A7.7 7.7 0 0 1 9.1 3.7 8.6 8.6 0 1 0 20.3 14.9Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
-          </svg>
-          <svg class="theme-btn__sun" viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
-            <path d="M12 7.2a4.8 4.8 0 1 0 0 9.6 4.8 4.8 0 0 0 0-9.6Z" fill="none" stroke="currentColor" stroke-width="1.8"/>
-            <path d="M12 2.5v2.1M12 19.4v2.1M4.6 4.6l1.5 1.5M17.9 17.9l1.5 1.5M2.5 12h2.1M19.4 12h2.1M4.6 19.4l1.5-1.5M17.9 6.1l1.5-1.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-          </svg>
-        </button>
         <button class="settings-btn" id="settings-open" type="button" title="Settings" aria-label="Settings">
           <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
             <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" fill="none" stroke="currentColor" stroke-width="1.8"/>
@@ -69,14 +51,14 @@
     <main id="main-content">
       <section class="command-center" id="trace-workspace" tabindex="-1" aria-labelledby="page-title">
         <div class="command-center__intro">
-          <h1 id="page-title">Find the win chain between any two players</h1>
+          <h1 id="page-title">Find the win chain<br>between any two players</h1>
           <p>Every link is a real Chess.com live win: rapid, blitz, or bullet.</p>
         </div>
 
         <form class="search" id="search-form" autocomplete="off">
           <div class="search__field search__field--username">
             <label for="search-start">Your username</label>
-            <input id="search-start" type="text" role="combobox" placeholder="input your username"
+            <input id="search-start" type="text" role="combobox" placeholder="Your Chess.com username"
                    spellcheck="false" autocapitalize="none" autocomplete="off"
                    aria-autocomplete="list" aria-controls="username-suggest"
                    aria-expanded="false" />
@@ -118,26 +100,29 @@
         <div class="search__log" id="search-log" hidden></div>
         <div class="cache-info" id="cache-info" hidden></div>
 
+        <details class="target-discovery" id="target-discovery">
+          <summary><span>Or explore connections to the top players</span><span class="target-discovery__hint">Live rankings <span aria-hidden="true">⌄</span></span></summary>
         <div class="quick-targets" aria-labelledby="quick-target-heading">
           <div class="quick-targets__head">
             <div>
-              <span class="quick-label" id="quick-target-heading">Chess.com leaderboard targets</span>
-              <p>Click a player to trace yourself to them.</p>
+              <span class="quick-label" id="quick-target-heading">Choose your next connection</span>
+              <p>Pick a player, or search the current top players together.</p>
             </div>
             <div class="quick-targets__actions">
-              <button class="quick-targets__trace" id="trace-top-players" type="button">Trace me to top players</button>
+              <button class="quick-targets__trace" id="trace-top-players" type="button">Search top players</button>
               <a class="quick-targets__source" href="https://www.chess.com/leaderboard" target="_blank" rel="noopener">Live rankings</a>
             </div>
           </div>
           <div class="quick-target-groups" id="quick-target-groups" aria-live="polite"></div>
         </div>
+        </details>
       </section>
 
       <section class="graph-section" aria-labelledby="chain-heading">
         <div class="graph-header">
           <div>
             <p class="eyebrow">Current chain</p>
-            <h2 id="chain-heading"><span id="target-name">…</span></h2>
+            <h2 id="chain-heading"><span id="target-name">Your next connection</span></h2>
           </div>
           <div class="graph-metric">
             <span class="graph-length" id="chain-length">—</span>
@@ -168,7 +153,10 @@
           </button>
         </div>
         <div class="graph-wrap">
-          <svg id="graph" viewBox="0 0 1040 420" preserveAspectRatio="xMidYMid meet" role="group" aria-label="Interactive connection graph" aria-describedby="graph-summary"></svg>
+          <svg id="graph" viewBox="0 0 1040 420" preserveAspectRatio="xMidYMid meet" role="group" aria-label="Interactive connection graph" aria-describedby="graph-summary">
+            <text class="graph-empty-title" x="520" y="190" text-anchor="middle" aria-hidden="true">Your next connection starts here.</text>
+          </svg>
+          <div class="graph-empty-copy"><strong>Your next connection starts here.</strong><p>Enter your Chess.com username above<br>to follow the wins.</p></div>
         </div>
         <p class="sr-only" id="graph-summary" aria-live="polite" aria-atomic="true">No connection is selected yet.</p>
         <p class="graph-hint" id="graph-hint"></p>
@@ -185,12 +173,13 @@
 
       <section class="explain" aria-labelledby="explain-heading">
         <div>
-          <p class="eyebrow">How it works</p>
-          <h2 id="explain-heading">Public games, full search</h2>
+          <p class="eyebrow">The idea</p>
+          <h2 id="explain-heading">A win is a link.<br>The rest is discovery.</h2>
         </div>
         <p>
-          The app reads public Chess.com game archives, filters to standard live games,
-          and keeps large game histories out of your browser.
+          If you beat someone who beat another player, those wins form a path.
+          Connections searches public rapid, blitz and bullet games, then shows the
+          original game behind every step. A route is a story through results, not a claim that one player is stronger.
         </p>
         <a class="text-link" href="https://github.com/tetizz/Connections" target="_blank" rel="noopener">Read the code</a>
       </section>
@@ -247,7 +236,8 @@
         <div class="setting owner-setting">
           <span class="setting__label">Owner debug settings</span>
           <form class="owner-unlock" id="owner-form">
-            <input id="owner-code" type="password" placeholder="owner code"
+            <label class="sr-only" for="owner-code">Owner code</label>
+            <input id="owner-code" aria-describedby="owner-status" type="password" placeholder="owner code"
                    spellcheck="false" autocapitalize="none" autocomplete="off" />
             <button class="setting__btn setting__btn--gold" id="owner-load" type="submit">Unlock</button>
           </form>
@@ -259,10 +249,12 @@
               <option value="timeout">Timeout</option>
               <option value="error">Error</option>
             </select>
+            <div class="owner-filter-field"><label for="owner-filter-username">Username</label>
             <input id="owner-filter-username" type="text" placeholder="filter username"
-                   spellcheck="false" autocapitalize="none" autocomplete="off" />
+                   spellcheck="false" autocapitalize="none" autocomplete="off" /></div>
+            <div class="owner-filter-field"><label for="owner-filter-target">Target</label>
             <input id="owner-filter-target" type="text" placeholder="filter target"
-                   spellcheck="false" autocapitalize="none" autocomplete="off" />
+                   spellcheck="false" autocapitalize="none" autocomplete="off" /></div>
             <select id="owner-filter-range" aria-label="Filter owner debug by time range">
               <option value="">All time</option>
               <option value="24h">Last 24h</option>
@@ -300,6 +292,6 @@
   <script src="engine.js?v=feature-expansion-20260627"></script>
   <script src="leaderboard.js?v=pages-api-20261016"></script>
   <script src="saved-routes.js?v=known-win-paths-20261016"></script>
-  <script src="app.js?v=progress-route-20261017"></script>
+  <script src="app.js?v=connections-refresh-20261030"></script>
 </body>
 </html>

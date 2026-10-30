@@ -211,17 +211,29 @@
     const value = String(response?.headers?.get("Retry-After") || "").trim();
     if (!value) return 0;
     const seconds = Number(value);
-    if (Number.isFinite(seconds)) return Math.max(0, Math.min(5000, Math.ceil(seconds * 1000)));
+    if (Number.isFinite(seconds)) {
+      const milliseconds = Math.ceil(seconds * 1000);
+      return Number.isFinite(milliseconds) ? Math.max(0, milliseconds) : 0;
+    }
     const date = Date.parse(value);
-    return Number.isFinite(date) ? Math.max(0, Math.min(5000, date - Date.now())) : 0;
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
   }
 
   async function fetchJsonWithRetry(url, init = {}, options = {}) {
     const attempts = Math.max(1, Number(options.attempts) || 1);
     const timeoutMs = Math.max(1000, Number(options.timeoutMs) || REQUEST_TIMEOUT_MS);
     let lastError = null;
+    const checkRetry = () => {
+      if (options.isCurrent && !options.isCurrent()) {
+        throw Object.assign(new Error("search was replaced by a newer request"), { code: "SEARCH_SUPERSEDED", retryable: false });
+      }
+      if (options.retryDeadline && Date.now() >= options.retryDeadline) {
+        throw Object.assign(new Error("live updates timed out while the saved search kept running"), { code: "SEARCH_POLL_TIMEOUT", retryable: false });
+      }
+    };
 
     for (let attempt = 0; attempt < attempts; attempt++) {
+      checkRetry();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
       try {
@@ -235,11 +247,14 @@
         const error = new Error(data?.error || `HTTP ${response.status}`);
         error.status = response.status;
         error.retryAfterMs = retryAfterMs(response);
+        if (response.status === 429) {
+          const bodyRetryAfterMs = Number(data?.retryAfter || 0) * 1000;
+          if (Number.isFinite(bodyRetryAfterMs)) error.retryAfterMs = Math.max(error.retryAfterMs, bodyRetryAfterMs);
+        }
         error.retryable = response.status === 408 || response.status === 425 ||
           response.status === 429 || response.status >= 500;
         if (response.status === 429 && options.stopOnRateLimit) {
           error.retryable = false;
-          error.retryAfterMs = Math.max(error.retryAfterMs,Math.min(300000,Math.max(0,Number(data?.retryAfter || 0)*1000)));
         }
         throw error;
       } catch (error) {
@@ -253,7 +268,12 @@
         if (!normalized?.retryable || attempt === attempts - 1) throw normalized;
         const delay = normalized.retryAfterMs ||
           Math.min(1200, 180 * (2 ** attempt));
-        await wait(delay);
+        const retryAt = Date.now() + delay;
+        while (Date.now() < retryAt) {
+          checkRetry();
+          await wait(Math.min(1000, retryAt - Date.now(),
+            options.retryDeadline ? options.retryDeadline - Date.now() : Infinity));
+        }
       } finally {
         clearTimeout(timeout);
       }
@@ -519,7 +539,7 @@
   function saveTopTraceBatch(start, results, options = {}) {
     try {
       if (options.batchId && state.topTraceActiveBatchId && options.batchId !== state.topTraceActiveBatchId) return;
-      const signature = JSON.stringify([start, options.batchId || "", results.map(item => [item.player?.username, item.status, item.job?.id,
+      const signature = JSON.stringify([start, options.batchId || "", results.map(item => [item.player?.username, item.status, item.searchId, item.job?.id,
         item.job?.shortestVerified === true, item.retryAt || 0, serverChainIdentity(item.job?.chain)])]);
       if (state.topTracePersistedSignature === signature && Date.now() - Number(state.topTracePersistedAt || 0) < 10000) return;
       localStorage.setItem(LS_TOP_TRACE_KEY, JSON.stringify({ start, policyVersion: SEARCH_POLICY_VERSION,
@@ -671,7 +691,7 @@
   async function traceTopCandidate(start, player, runId, options = {}) {
     const target = cleanUsernameInput(player?.username);
     const started = performance.now();
-    const id = options.existing?.searchId || newSearchEventId();
+    const id = options.existing?.searchId || options.existing?.job?.id || newSearchEventId();
     const result = { player, status: "paused", ms: null, steps: null, job: options.existing?.job || null, searchId: id, retryAt: options.existing?.retryAt || 0, pollFailures: options.existing?.pollFailures || 0 };
     const remoteBase = workerBase();
     if (!remoteBase || !target || start === target) return { ...result, status: "skipped", ms: 0 };
@@ -699,6 +719,9 @@
     };
     try {
       if (!job?.id || TERMINAL_SEARCH_STATUSES.has(job.status)) {
+        // Save the idempotency key before the server can accept this start.
+        // A reload after an unanswered POST must reuse the same search.
+        options.onUpdate?.({ ...result, status: "queued" });
         const { data } = await fetchJsonWithRetry(`${remoteBase}/search/start`, {
           method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" },
           body: JSON.stringify({ start, target, range: "all", searchId: id }),
@@ -831,13 +854,13 @@
   async function loadUsernameSuggestions(query, field = state.suggest.field) {
     const config = suggestConfig(field);
     const input = $(config.input);
-    if (!input || cleanUsernameInput(input.value) !== query) return;
+    if (!input || !state.suggest.focused || state.suggest.field !== field || cleanUsernameInput(input.value) !== query) return;
     state.suggest.controller?.abort();
     const seq = ++state.suggest.seq;
     const controller = new AbortController();
     state.suggest.controller = controller;
     const remote = await fetchUsernameSuggestions(query, controller.signal).catch(() => []);
-    if (seq !== state.suggest.seq || state.suggest.field !== field || cleanUsernameInput(input.value) !== query) return;
+    if (controller.signal.aborted || !state.suggest.focused || seq !== state.suggest.seq || state.suggest.field !== field || cleanUsernameInput(input.value) !== query) return;
     renderUsernameSuggest(query, mergeUsernameSuggestions(remote, localUsernameSuggestions(query)), {}, field);
   }
 
@@ -917,13 +940,20 @@
     const box = $(config.box);
     const input = $(config.input);
     if (!box || !input || !state.suggest.focused || state.suggest.field !== field || query.length < SUGGEST_MIN_CHARS) return;
+    const selected = state.suggest.query === query && state.suggest.renderedField === field
+      ? state.suggest.items[state.suggest.activeIndex]?.username : null;
     state.suggest.items = items.slice(0, SUGGEST_LIMIT);
+    state.suggest.query = query;
+    state.suggest.renderedField = field;
     // Keep the exact typed handle selected by default. Suggestions only take
     // over after the visitor explicitly moves through them with the arrow keys
     // or clicks one.
-    state.suggest.activeIndex = -1;
+    state.suggest.activeIndex = selected
+      ? state.suggest.items.findIndex((item) => item.username === selected) : -1;
     input.setAttribute("aria-expanded", "true");
-    input.removeAttribute("aria-activedescendant");
+    if (state.suggest.activeIndex >= 0) {
+      input.setAttribute("aria-activedescendant", `username-suggest-option-${field}-${state.suggest.activeIndex}`);
+    } else input.removeAttribute("aria-activedescendant");
     for (const other of ["start", "target"]) {
       if (other !== field) {
         const otherConfig = suggestConfig(other);
@@ -1015,9 +1045,14 @@
 
   function hideUsernameSuggest() {
     clearTimeout(state.suggest.timer);
+    state.suggest.seq++;
+    state.suggest.focused = false;
     state.suggest.controller?.abort();
+    state.suggest.controller = null;
     state.suggest.items = [];
     state.suggest.activeIndex = -1;
+    state.suggest.query = "";
+    state.suggest.renderedField = "";
     for (const field of ["start", "target"]) {
       const config = suggestConfig(field);
       const box = $(config.box);
@@ -1123,6 +1158,14 @@
     const btn = $("#copy-share");
     const imageBtn = $("#save-share-image");
     if (!btn) return;
+    state.shareLinkRequest = null;
+    state.shareImageRequest = null;
+    btn.disabled = false;
+    btn.classList.remove("is-copied");
+    if (imageBtn) {
+      imageBtn.disabled = false;
+      if (imageBtn.lastChild) imageBtn.lastChild.textContent = " Save image";
+    }
     if (chain?.tree || !chain?.found || !Array.isArray(chain.path) || !chain.path.length) {
       btn.hidden = true;
       if (imageBtn) imageBtn.hidden = true;
@@ -1132,7 +1175,6 @@
     btn.hidden = false;
     if (imageBtn) imageBtn.hidden = false;
     btn.dataset.shareUrl = buildLongShareUrl(chain);
-    btn.classList.remove("is-copied");
     btn.lastChild.textContent = " Copy link";
   }
 
@@ -1207,25 +1249,27 @@
     }
   }
 
-  async function loadSharedChainFromUrl() {
+  async function loadSharedChainFromUrl({ isCurrent = () => true } = {}) {
     const params = new URL(location.href).searchParams;
     let shared = null;
     const shortId = params.get(SHORT_CHAIN_PARAM);
     if (shortId) {
       shared = await fetchShortSharedChain(shortId);
+      if (!isCurrent()) return false;
     }
     if (!shared) {
       const encoded = params.get(CHAIN_PARAM) || params.get(LEGACY_SHARE_PARAM);
       const decoded = decodeSharePayload(encoded);
       if (decoded) {
         shared = await verifyLongSharedChain(decoded);
+        if (!isCurrent()) return false;
         if (!shared) {
           showStatus("error", "This shared chain could not be verified.");
           return true;
         }
       }
     }
-    if (!shared) return false;
+    if (!shared || !isCurrent()) return false;
     state.players = state.players || {};
     for (const [username, profile] of Object.entries(shared.players || {})) {
       const key = username.toLowerCase();
@@ -1315,42 +1359,62 @@
 
   async function copyShareLink() {
     const btn = $("#copy-share");
-    let url = btn?.dataset.shareUrl;
-    if (!btn || !url) return;
+    if (!btn || !btn.dataset.shareUrl) return;
     const chain = state.currentChain;
+    const fallbackUrl = buildLongShareUrl(chain);
+    const request = {};
+    state.shareLinkRequest = request;
+    const isCurrent = () => state.shareLinkRequest === request && state.currentChain === chain;
     btn.disabled = true;
+    btn.classList.remove("is-copied");
     btn.lastChild.textContent = " Creating link";
     try {
-      url = await createShortShareUrl(chain) || url;
+      const url = await createShortShareUrl(chain) || fallbackUrl;
+      if (!isCurrent()) return;
       btn.dataset.shareUrl = url;
-    } finally {
-      btn.disabled = false;
-    }
-    try {
-      await navigator.clipboard.writeText(url);
+      try {
+        await navigator.clipboard.writeText(url);
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = url;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        let copied = false;
+        try {
+          ta.select();
+          copied = document.execCommand("copy");
+        } finally {
+          ta.remove();
+        }
+        if (!copied) throw new Error("Clipboard copy failed");
+      }
+      if (!isCurrent()) return;
+      btn.classList.add("is-copied");
+      btn.lastChild.textContent = " Copied";
+      setTimeout(() => {
+        if (!isCurrent()) return;
+        btn.classList.remove("is-copied");
+        btn.lastChild.textContent = " Copy link";
+      }, 1600);
     } catch {
-      const ta = document.createElement("textarea");
-      ta.value = url;
-      ta.setAttribute("readonly", "");
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      ta.remove();
+      if (isCurrent()) {
+        btn.lastChild.textContent = " Copy link";
+        showStatus("error", "Could not copy the link. Try again.");
+      }
+    } finally {
+      if (isCurrent()) btn.disabled = false;
     }
-    btn.classList.add("is-copied");
-    btn.lastChild.textContent = " Copied";
-    setTimeout(() => {
-      btn.classList.remove("is-copied");
-      btn.lastChild.textContent = " Copy link";
-    }, 1600);
   }
 
   async function saveShareImage() {
     const chain = state.currentChain;
     if (!chain?.found || !Array.isArray(chain.path)) return;
     const btn = $("#save-share-image");
+    const request = {};
+    state.shareImageRequest = request;
+    const isCurrent = () => state.shareImageRequest === request && state.currentChain === chain;
     if (btn) {
       btn.disabled = true;
       btn.lastChild.textContent = " Saving";
@@ -1377,8 +1441,10 @@
       a.href = url;
       a.download = `connections-${chain.path[0]}-${chain.path[chain.path.length - 1]}.png`;
       a.click();
+    } catch {
+      if (isCurrent()) showStatus("error", "Could not save the image. Try again.");
     } finally {
-      if (btn) {
+      if (btn && isCurrent()) {
         btn.disabled = false;
         btn.lastChild.textContent = " Save image";
       }
@@ -2183,6 +2249,7 @@
     const clip = el("clipPath", { id: "clip" });
     clip.appendChild(el("circle", { r: 32, cx: 0, cy: 0 }));
     defs.appendChild(clip);
+    appendGraphArrowhead(defs);
     svg.appendChild(defs);
 
     if (!chain.found) {
@@ -2217,11 +2284,20 @@
     const edgesGroup = el("g");
     for (let i = 0; i < n - 1; i++) {
       const a = positions[i], b = positions[i + 1];
+      // Keep the control beyond the trimmed endpoints in dense wide graphs.
+      const wideBow = Math.max(28, Math.sqrt(Math.max(0, 40 ** 2 - ((b.x - a.x) / 2) ** 2)));
+      const firstControl = compactGraph
+        ? { x: a.x + 28, y: (a.y + b.y) / 2 }
+        : { x: (a.x + b.x) / 2, y: a.y - wideBow };
+      const lastControl = compactGraph
+        ? { x: b.x + 28, y: (a.y + b.y) / 2 } : firstControl;
+      const from = graphEdgeEndpoint(a, firstControl, 38);
+      const to = graphEdgeEndpoint(b, lastControl, 38);
       const d = compactGraph
-        ? `M ${a.x} ${a.y} C ${a.x + 28} ${(a.y + b.y) / 2}, ${b.x + 28} ${(a.y + b.y) / 2}, ${b.x} ${b.y}`
-        : `M ${a.x} ${a.y} Q ${(a.x + b.x) / 2} ${a.y - 28} ${b.x} ${b.y}`;
+        ? `M ${from.x} ${from.y} C ${firstControl.x} ${firstControl.y}, ${lastControl.x} ${lastControl.y}, ${to.x} ${to.y}`
+        : `M ${from.x} ${from.y} Q ${firstControl.x} ${firstControl.y} ${to.x} ${to.y}`;
       edgesGroup.appendChild(el("path", { class: "edge-glow", d }));
-      edgesGroup.appendChild(el("path", { class: "edge-line", d }));
+      edgesGroup.appendChild(el("path", { class: "edge-line", d, "marker-end": "url(#edge-arrow)" }));
     }
     svg.appendChild(edgesGroup);
 
@@ -2304,6 +2380,21 @@
     animateGraph(svg, traveller, spark);
   }
 
+  function appendGraphArrowhead(defs) {
+    const marker = el("marker", {
+      id: "edge-arrow", viewBox: "0 0 10 10", refX: 10, refY: 5,
+      markerWidth: 10, markerHeight: 10, markerUnits: "userSpaceOnUse", orient: "auto",
+    });
+    marker.appendChild(el("path", { d: "M 0 0 L 10 5 L 0 10 Z", fill: "#b4833a", stroke: "none" }));
+    defs.appendChild(marker);
+  }
+
+  function graphEdgeEndpoint(center, control, radius) {
+    const dx = control.x - center.x, dy = control.y - center.y;
+    const length = Math.hypot(dx, dy) || 1;
+    return { x: center.x + dx * radius / length, y: center.y + dy * radius / length };
+  }
+
   if (location.hostname === "127.0.0.1" || location.hostname === "localhost") {
     window.__connectionsDebugRenderGraph = renderGraph;
   }
@@ -2350,6 +2441,7 @@
     const clip = el("clipPath", { id: "clip" });
     clip.appendChild(el("circle", { r: 28, cx: 0, cy: 0 }));
     defs.appendChild(clip);
+    appendGraphArrowhead(defs);
     svg.appendChild(defs);
 
     const graph = buildMergedChainTree(treeChain.chains || []);
@@ -2360,6 +2452,7 @@
     const viewWidth = graph.width || 1180;
     const viewHeight = graph.height || 680;
     svg.setAttribute("viewBox", `0 0 ${viewWidth} ${viewHeight}`);
+    svg.style.setProperty("--tree-graph-width", `${viewWidth}px`);
     svg.style.setProperty("--tree-graph-height", `${Math.min(2200, Math.max(620, viewHeight * 0.84))}px`);
 
     const edgesGroup = el("g", { class: "tree-edges" });
@@ -2372,7 +2465,9 @@
       const dx = Math.max(1, b.x - a.x);
       const yDelta = b.y - a.y;
       const bow = Math.abs(yDelta) < 8 ? Math.min(12, Math.max(5, dx * .025)) : 0;
-      const d = `M ${a.x} ${a.y} C ${c1x} ${a.y - bow} ${c2x} ${b.y - bow} ${b.x} ${b.y}`;
+      const from = graphEdgeEndpoint(a, { x: c1x, y: a.y - bow }, 34);
+      const to = graphEdgeEndpoint(b, { x: c2x, y: b.y - bow }, 34);
+      const d = `M ${from.x} ${from.y} C ${c1x} ${a.y - bow} ${c2x} ${b.y - bow} ${to.x} ${to.y}`;
       const edgeKey = `${edge.from}|${edge.to}`;
       const depth = Math.max(1, Number(edge.depth || 1));
       edgesGroup.appendChild(el("path", {
@@ -2384,6 +2479,7 @@
       edgesGroup.appendChild(el("path", {
         class: "edge-line tree-edge-line",
         d,
+        "marker-end": "url(#edge-arrow)",
         "data-tree-edge": edgeKey,
         "data-edge-depth": depth,
       }));
@@ -2434,7 +2530,8 @@
     svg.appendChild(nodesGroup);
 
     $("#graph-hint").textContent =
-      `${treeChain.foundSlotCount || treeChain.branchCount} of ${treeChain.targetCount || treeChain.branchCount} leaderboard targets found from ${treeChain.root}; duplicate players merge into ${treeChain.branchCount} unique branch${treeChain.branchCount === 1 ? "" : "es"}.`;
+      `${treeChain.foundSlotCount || treeChain.branchCount} of ${treeChain.targetCount || treeChain.branchCount} leaderboard targets found from ${treeChain.root}; duplicate players merge into ${treeChain.branchCount} unique branch${treeChain.branchCount === 1 ? "" : "es"}.` +
+      (COMPACT_GRAPH_MEDIA.matches ? " Swipe sideways to explore the tree." : "");
 
     preloadTreeProfiles(graph.nodes);
     animateTreeGraph(svg, { preservedEdges, preservedNodes });
@@ -3388,6 +3485,7 @@
   function renderProfilePopover(profile, username, anchor) {
     const pop = $("#profile-popover");
     if (!pop || !anchor) return;
+    const restoreFocus = pop.contains(document.activeElement);
     const display = profile?.name || profile?.username || username;
     const handle = profile?.username || username;
     const title = profile?.title ? `<span class="profile-popover__title">${esc(profile.title)}</span> ` : "";
@@ -3432,7 +3530,7 @@
     pop.setAttribute("aria-label", `${display} player details`);
     pop.hidden = false;
     positionProfilePopover(pop, anchor);
-    pop.querySelector("[data-profile-close]")?.focus({ preventScroll: true });
+    if (restoreFocus) pop.querySelector("[data-profile-close]")?.focus({ preventScroll: true });
   }
 
   function positionProfilePopover(pop, anchor) {
@@ -3832,7 +3930,7 @@
     let attempt = 0;
     let consecutiveFailures = 0;
     const pollStartedAt = Date.now();
-    for (;;) {
+    const checkPoll = () => {
       if (!isCurrent()) {
         const error = new Error("search was replaced by a newer request");
         error.code = "SEARCH_SUPERSEDED";
@@ -3843,6 +3941,9 @@
         error.code = "SEARCH_POLL_TIMEOUT";
         throw error;
       }
+    };
+    for (;;) {
+      checkPoll();
       const previous = state.searchJobs.get(id);
       const previousStats = previous?.stats || {};
       const params = new URLSearchParams({ id });
@@ -3853,7 +3954,7 @@
         ({ data } = await fetchJsonWithRetry(
           `${remoteBase}/search/job?${params.toString()}`,
           { headers: { "Accept": "application/json" } },
-          { attempts: 2, timeoutMs: 12000 }
+          { attempts: 2, timeoutMs: 12000, isCurrent, retryDeadline: pollStartedAt + SERVER_SEARCH_HARD_LIMIT_MS }
         ));
         if (!isCurrent()) {
           const superseded = new Error("search was replaced by a newer request");
@@ -3864,11 +3965,16 @@
       } catch (error) {
         consecutiveFailures++;
         if (!error?.retryable || consecutiveFailures > SERVER_POLL_RETRY_LIMIT) throw error;
-        const retryDelay = Math.min(3000, error.retryAfterMs || 300 * (2 ** (consecutiveFailures - 1)));
+        const retryDelay = Math.max(Number(error.retryAfterMs || 0), Math.min(3000, 300 * (2 ** (consecutiveFailures - 1))));
         if (logLine) {
           logLine(`connection hiccup; retrying saved search (${consecutiveFailures}/${SERVER_POLL_RETRY_LIMIT})`);
         }
-        await wait(retryDelay);
+        const retryAt = Date.now() + retryDelay;
+        while (Date.now() < retryAt) {
+          checkPoll();
+          await wait(Math.min(1000, retryAt - Date.now(),
+            SERVER_SEARCH_HARD_LIMIT_MS - (Date.now() - pollStartedAt)));
+        }
         continue;
       }
 
@@ -3878,7 +3984,8 @@
       }
       job = mergeSearchJobSnapshot(data?.job);
       if (!job) throw new Error("job missing");
-      if (!background) showServerJobProgress(job);
+      if (background) renderSearchQueue(job);
+      else showServerJobProgress(job);
       if (logLine) logLine(job.progress || statusText(job.status));
       if (TERMINAL_SEARCH_STATUSES.has(job.status)) return job;
       const nextChain = job.chain;
@@ -4382,17 +4489,16 @@
     }
   }
 
-  function applyTheme(theme) {
-    const next = theme === "light" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    localStorage.setItem(LS_THEME_KEY, next);
+  function applyTheme() {
+    document.documentElement.dataset.theme = "dark";
+    try { localStorage.setItem(LS_THEME_KEY, "dark"); } catch { /* Optional preference. */ }
 
     const btn = $("#theme-toggle");
     if (!btn) return;
-    const isDark = next === "dark";
-    btn.setAttribute("aria-pressed", String(isDark));
-    btn.setAttribute("aria-label", isDark ? "Switch to light mode" : "Switch to dark mode");
-    btn.title = isDark ? "Switch to light mode" : "Switch to dark mode";
+    btn.hidden = true;
+    btn.disabled = true;
+    btn.setAttribute("aria-label", "Dark mode");
+    btn.title = "Dark mode";
   }
 
   // ---------- settings modal ----------
@@ -4435,10 +4541,6 @@
 
   $("#settings-open").addEventListener("click", openSettings);
   $("#settings-close").addEventListener("click", closeSettings);
-  $("#theme-toggle").addEventListener("click", () => {
-    const current = document.documentElement.dataset.theme || "dark";
-    applyTheme(current === "dark" ? "light" : "dark");
-  });
   $("#settings-modal").addEventListener("click", (e) => {
     if (e.target.id === "settings-modal") closeSettings(); // click backdrop
   });
@@ -4690,23 +4792,34 @@
   }
 
   document.addEventListener("DOMContentLoaded", () => {
-    applyTheme(localStorage.getItem(LS_THEME_KEY) || document.documentElement.dataset.theme || "dark");
+    const startupOwner = state.activeSearchOwner;
+    const startupTopTraceRunId = state.topTraceRunId;
+    const ownsStartup = () => !startupOwner && state.activeSearchOwner === startupOwner &&
+      state.topTraceRunId === startupTopTraceRunId;
+    applyTheme();
     // only restore the username if they saved one before
     // (don't pre-fill with any default)
-    const saved = localStorage.getItem(LS_KEY);
-    if (saved) $("#search-start").value = saved;
-    localStorage.removeItem(LEGACY_DEPTH_KEY);
-    localStorage.setItem(LS_RANGE_KEY, "auto");
-    localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
+    try {
+      const saved = localStorage.getItem(LS_KEY);
+      if (saved) $("#search-start").value = saved;
+      localStorage.removeItem(LEGACY_DEPTH_KEY);
+      localStorage.setItem(LS_RANGE_KEY, "auto");
+      localStorage.setItem(LS_RANGE_MIGRATION_KEY, "1");
+      // Automatic search now traverses full histories under the current policy.
+      localStorage.removeItem("chess-connections:active-search-job:v1");
+      localStorage.removeItem("chess-connections:active-search-job:v2:fresh-search");
+    } catch { /* Storage is optional; keep startup available when it is blocked. */ }
     $("#search-range").value = "auto";
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
-    // Automatic search now traverses full histories under the current policy.
-    localStorage.removeItem("chess-connections:active-search-job:v1");
-    localStorage.removeItem("chess-connections:active-search-job:v2:fresh-search");
     loadPlayerMetadata().then(async () => {
-      const sharedLoaded = await loadSharedChainFromUrl();
+      if (!ownsStartup()) {
+        loadLeaderboardTargetsWhenVisible();
+        return;
+      }
+      const sharedLoaded = await loadSharedChainFromUrl({ isCurrent: ownsStartup });
       loadLeaderboardTargetsWhenVisible();
-      if (!sharedLoaded && !await resumeTopPlayersTrace()) resumeActiveSearchJob();
+      if (!ownsStartup() || sharedLoaded) return;
+      if (!await resumeTopPlayersTrace() && ownsStartup()) resumeActiveSearchJob();
     });
     // Keep the global leaderboard off the initial critical path.
     if (window.Leaderboard) window.Leaderboard.init();

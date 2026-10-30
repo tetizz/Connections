@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="500" viewBox="0 0 1000 500" role="img" aria-labelledby="title description">
+  <title id="title">A historical three-win chain to Magnus Carlsen</title>
+  <desc id="description">trixize1234 beat FredAlsup, FredAlsup beat pianoskater, and pianoskater beat MagnusCarlsen. Each arrow represents a recorded win. Public proof games: 169295449982, 63496054537, and 115846799987.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L8 4L0 8Z" fill="#e7bb65"/></marker>
+  </defs>
+  <rect width="1000" height="500" fill="#0d100e"/>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="30" y="45" fill="#e7bb65" font-size="15" letter-spacing="1.7">HISTORICAL SAVED EXAMPLE</text>
+    <text x="30" y="91" fill="#f6efe2" font-size="32" font-weight="600">Three recorded wins to Magnus Carlsen</text>
+    <text x="30" y="126" fill="#b9b0a2" font-size="18">Each arrow represents one recorded win.</text>
+    <g fill="#171c17" stroke="#46503e" stroke-width="1.5">
+      <rect x="30" y="170" width="205" height="94" rx="10"/>
+      <rect x="275" y="170" width="205" height="94" rx="10"/>
+      <rect x="520" y="170" width="205" height="94" rx="10"/>
+      <rect x="765" y="170" width="205" height="94" rx="10"/>
+    </g>
+    <g fill="#f6efe2" font-size="24" font-weight="600" text-anchor="middle">
+      <text x="132.5" y="215">trixize1234</text>
+      <text x="377.5" y="215">FredAlsup</text>
+      <text x="622.5" y="215">pianoskater</text>
+      <text x="867.5" y="215">MagnusCarlsen</text>
+    </g>
+    <g fill="#b9b0a2" font-size="14" text-anchor="middle">
+      <text x="132.5" y="244">start</text><text x="377.5" y="244">via</text><text x="622.5" y="244">via</text><text x="867.5" y="244">target</text>
+    </g>
+    <g stroke="#e7bb65" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M242 218H267"/><path d="M487 218H512"/><path d="M732 218H757"/>
+    </g>
+    <g fill="#e7bb65" font-size="13" text-anchor="middle">
+      <text x="255" y="199">beat</text><text x="500" y="199">beat</text><text x="745" y="199">beat</text>
+    </g>
+    <text x="30" y="307" fill="#e7bb65" font-size="16" font-weight="600">Public proof games</text>
+    <g stroke="#303a30" stroke-width="1"><path d="M30 321H970"/><path d="M30 363H970"/><path d="M30 405H970"/><path d="M30 447H970"/></g>
+    <g fill="#b9b0a2" font-size="14"><text x="30" y="348">01</text><text x="30" y="390">02</text><text x="30" y="432">03</text></g>
+    <g fill="#e7bb65" font-family="Consolas, monospace" font-size="17"><text x="66" y="348">169295449982</text><text x="66" y="390">63496054537</text><text x="66" y="432">115846799987</text></g>
+    <g fill="#f6efe2" font-size="18">
+      <text x="245" y="348">trixize1234 won as White · 1–0, resignation</text>
+      <text x="245" y="390">FredAlsup won as Black · 0–1, checkmate</text>
+      <text x="245" y="432">pianoskater won as White · 1–0, resignation</text>
+    </g>
+    <text x="30" y="478" fill="#b9b0a2" font-size="13">Scores are White–Black. Proof: public Chess.com game pages.</text>
+    <text x="970" y="478" text-anchor="end" fill="#b9b0a2" font-size="14">Chess Connections</text>
+  </g>
+</svg>

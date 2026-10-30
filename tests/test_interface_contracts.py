@@ -79,8 +79,10 @@ class InterfaceContractTests(unittest.TestCase):
         self.assertIn("function init()", LEADERBOARD)
         self.assertIn("initialLoadObserver", LEADERBOARD)
 
-    def test_light_theme_and_narrow_layout_do_not_inherit_dark_fallbacks(self):
-        self.assertIn('html[data-theme="light"] body', HTML)
+    def test_dark_only_theme_and_narrow_layout_preserve_readability(self):
+        self.assertIn('<meta name="color-scheme" content="dark" />', HTML)
+        self.assertIn('document.documentElement.dataset.theme = "dark"', HTML)
+        self.assertNotIn('id="theme-toggle"', HTML)
         body_rule = re.search(r"body\s*\{(?P<body>.*?)\n\}", CSS, re.S)
         self.assertIsNotNone(body_rule)
         self.assertIn("color: var(--ink)", body_rule.group("body"))

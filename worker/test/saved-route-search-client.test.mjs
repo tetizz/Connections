@@ -149,7 +149,7 @@ test("metadata startup does not fetch or automatically render showcase answers",
   const startup=section("  async function loadPlayerMetadata(","  function renderShowcaseTabs(");
   assert.match(startup,/players\.json/);assert.doesNotMatch(startup,/chains\.json|selectTarget|renderChain/);
   assert.doesNotMatch(appSource,/loadShowcase\(/);
-  assert.match(appSource,/loadSharedChainFromUrl\(\)/,"Explicit shared links remain supported");
+  assert.match(appSource,/await loadSharedChainFromUrl\(/,"Explicit shared links remain supported");
 });
 test("discovered route wording does not imply an unverified global minimum", () => {
   const context=vm.createContext({});

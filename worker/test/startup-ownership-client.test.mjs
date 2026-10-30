@@ -22,8 +22,9 @@ const batchKey = 'chess-connections:top-player-jobs:v1';
 // controllers. Only service/render boundaries are mocked; no HTTP is performed.
 function fixture({ sharedKind = null } = {}) {
   const storage = new Map(), elements = new Map(), polls = [], starts = [], topStarts = [], renders = [], statuses = [], verifications = [];
-  const state = { activeSearchOwner: '', searchJobs: new Map(), topTraceRunId: 0 };
-  let onReady, releaseMetadata;
+  const state = { activeSearchOwner: '', searchJobs: new Map(), topTraceRunId: 0, players: {} };
+  const startupCalls = [];
+  let onReady, releaseMetadata, rejectMetadata;
   const element = id => {
     if (!elements.has(id)) elements.set(id, { value: '', textContent: '', focus() {} });
     return elements.get(id);
@@ -33,8 +34,8 @@ function fixture({ sharedKind = null } = {}) {
     location: { href: sharedKind ? `https://example.invalid/?${sharedKind === 'short' ? 'c' : 'chain'}=saved-proof` : 'https://example.invalid/' },
     document: { documentElement: { dataset: { theme: 'dark' } }, addEventListener(event, fn) { assert.equal(event, 'DOMContentLoaded'); onReady = fn; } },
     window: {}, localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, String(value)), removeItem: key => storage.delete(key) },
-    fetch: url => { assert.equal(url, '/data/players.json'); return new Promise(resolve => { releaseMetadata = () => resolve({ ok: true, json: async () => ({}) }); }); },
-    applyTheme() {}, loadLeaderboardTargetsWhenVisible() {},
+    fetch: url => { assert.equal(url, '/data/players.json'); return new Promise((resolve, reject) => { releaseMetadata = (players = {}) => resolve({ ok: true, json: async () => players }); rejectMetadata = reject; }); },
+    applyTheme() {}, loadLeaderboardTargetsWhenVisible() { startupCalls.push('visible-targets'); },
     decodeSharePayload: value => value ? { found: true } : null,
     fetchShortSharedChain: () => new Promise(resolve => verifications.push(resolve)),
     verifyLongSharedChain: () => new Promise(resolve => verifications.push(resolve)),
@@ -67,7 +68,7 @@ function fixture({ sharedKind = null } = {}) {
     section('  async function loadSharedChainFromUrl(', '  async function verifyLongSharedChain('),
     section('  document.addEventListener("DOMContentLoaded", () => {', '})();'),
   ].join('\n'), context, { filename: 'actual-startup-user-controllers.js' });
-  return { context, state, storage, polls, starts, topStarts, renders, statuses, verifications, element, ready: () => onReady(), release: async () => { releaseMetadata(); await flush(); } };
+  return { context, state, storage, polls, starts, topStarts, renders, statuses, verifications, startupCalls, element, ready: () => onReady(), release: async players => { releaseMetadata(players); await flush(); }, reject: async () => { rejectMetadata(new Error('optional seed unavailable')); await flush(); } };
 }
 
 test('a foreground search accepted while startup metadata waits retains ownership and its single polling lifecycle', async () => {
@@ -84,8 +85,7 @@ test('a foreground search accepted while startup metadata waits retains ownershi
 test('a saved foreground job present at page load still resumes when the visitor has not started work', async () => {
   const f = fixture();
   f.storage.set(activeKey, JSON.stringify({ id: 'saved-before-load', searchId: 'saved-search', start: 'alice', target: 'bob', policyVersion: 'fresh-search-v2', ts: Date.now() }));
-  f.ready(); assert.equal(f.polls.length, 0);
-  await f.release();
+  f.ready(); await flush();
   assert.equal(f.polls.length, 1); assert.equal(f.polls[0].id, 'saved-before-load');
   assert.equal(f.polls[0].options.isCurrent(), true);
   assert.equal(f.element('#search-start').value, 'alice');
@@ -108,7 +108,7 @@ const sharedProof = { found: true, path: ['shared-start', 'shared-target'], targ
 
 for (const [kind, verified] of [['short', true], ['long', true], ['long', false]]) {
   test(`foreground work survives delayed ${kind} shared-chain verification (${verified ? 'verified' : 'rejected'})`, async () => {
-    const f = fixture({ sharedKind: kind }); f.ready(); await f.release();
+    const f = fixture({ sharedKind: kind }); f.ready(); await flush();
     assert.equal(f.verifications.length, 1, 'startup must be waiting at the actual share verification boundary');
     await f.context.runSearch('alice', 'bob', 'all');
     const owner = f.state.activeSearchOwner, renderCount = f.renders.length, statusCount = f.statuses.length;
@@ -126,9 +126,54 @@ for (const [kind, verified] of [['short', true], ['long', true], ['long', false]
 test('an undisturbed verified shared chain still loads and suppresses saved-job restoration', async () => {
   const f = fixture({ sharedKind: 'short' });
   f.storage.set(activeKey, JSON.stringify({ id: 'saved-before-load', start: 'alice', target: 'bob', policyVersion: 'fresh-search-v2', ts: Date.now() }));
-  f.ready(); await f.release(); f.verifications[0](sharedProof); await flush();
+  f.ready(); await flush();
+  assert.equal(f.verifications.length, 1, 'share verification must start while optional metadata remains pending');
+  f.verifications[0](sharedProof); await flush();
   assert.equal(f.renders.length, 1); assert.equal(f.renders[0], sharedProof);
   assert.equal(f.element('#search-start').value, 'shared-start');
   assert.equal(f.element('#search-target').value, 'shared-target');
   assert.equal(f.statuses.at(-1)[0], 'done'); assert.equal(f.polls.length, 0);
+});
+
+test('visible target setup does not wait for an indefinitely pending player seed', async () => {
+  const f = fixture(); f.ready(); await flush();
+  assert.deepEqual(f.startupCalls, ['visible-targets']);
+});
+
+test('late player seed fills missing fields while preserving fetched and job-authoritative profile fields', async () => {
+  const f = fixture(); f.ready();
+  const stats = { rapid: { rating: 2000 } };
+  f.state.players = { alice: { username: 'alice', name: 'Live Alice', stats, profileComplete: true }, jobonly: { username: 'jobonly', title: 'GM' } };
+  await f.release({ alice: { username: 'alice', name: 'Old seed name', avatar: 'seed-avatar' }, seedonly: { username: 'seedonly', name: 'Seed Only' } });
+  assert.equal(f.state.players.alice.name, 'Live Alice');
+  assert.equal(f.state.players.alice.stats, stats);
+  assert.equal(f.state.players.alice.profileComplete, true);
+  assert.equal(f.state.players.alice.avatar, 'seed-avatar', 'optional seed still fills missing display fields');
+  assert.equal(f.state.players.jobonly.title, 'GM');
+  assert.equal(f.state.players.seedonly.name, 'Seed Only');
+});
+
+test('late optional player-seed failure preserves profiles already fetched by active work', async () => {
+  const f = fixture(); f.ready();
+  const profiles = { alice: { username: 'alice', name: 'Live Alice', stats: { rapid: { rating: 2000 } } } };
+  f.state.players = profiles;
+  await f.reject();
+  assert.equal(f.state.players.alice, profiles.alice);
+  assert.equal(f.state.players.alice.name, 'Live Alice');
+});
+
+test('a user search after automatic restoration retains ownership when optional seed eventually completes', async () => {
+  const f = fixture();
+  f.storage.set(activeKey, JSON.stringify({ id: 'saved-before-load', searchId: 'saved-search', start: 'old-start', target: 'old-target', policyVersion: 'fresh-search-v2', ts: Date.now() }));
+  f.ready(); await flush();
+  assert.equal(f.polls.length, 1, 'saved job must restore before optional seed finishes');
+  assert.equal(f.polls[0].id, 'saved-before-load');
+  await f.context.runSearch('alice', 'bob', 'all');
+  const owner = f.state.activeSearchOwner;
+  assert.equal(f.polls.length, 2);
+  assert.equal(f.polls[0].options.isCurrent(), false);
+  await f.release();
+  assert.equal(f.state.activeSearchOwner, owner);
+  assert.equal(f.polls.length, 2, 'seed completion must not launch a duplicate resume');
+  assert.equal(f.polls[1].options.isCurrent(), true);
 });

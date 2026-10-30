@@ -286,10 +286,15 @@
     state.chains = { chains: [] };
     try {
       const response = await fetch(DATA_BASE + "players.json");
-      state.players = response.ok ? await response.json() : {};
-    } catch {
-      state.players = {};
-    }
+      const players = response.ok ? await response.json() : {};
+      if (!players || typeof players !== "object" || Array.isArray(players)) return;
+      state.players = state.players || {};
+      for (const [username, profile] of Object.entries(players)) {
+        if (!profile || typeof profile !== "object" || Array.isArray(profile)) continue;
+        const key = username.toLowerCase();
+        state.players[key] = { ...profile, ...(state.players[key] || {}) };
+      }
+    } catch { /* Optional seed metadata must not replace current profiles. */ }
   }
   function renderShowcaseTabs() {
     // we keep a lightweight showcase selector below the search for quick swaps
@@ -3334,14 +3339,21 @@
   async function fetchProfile(username) {
     const key = cleanUsernameInput(username);
     if (!key) return null;
+    const failures = state.profileFailureRetryAt || (state.profileFailureRetryAt = new Map());
+    const now = Date.now();
+    for (const [username, retryAt] of failures) {
+      if (retryAt <= now) failures.delete(username);
+    }
     const existing = state.players?.[key];
     if (existing?.profileComplete) return existing;
     if (Number(existing?.profileRetryAt || 0) > Date.now()) return existing;
+    if (Number(failures.get(key) || 0) > now) return existing || null;
     if (state.profilePromises.has(key)) return state.profilePromises.get(key);
 
     const promise = (async () => {
       const remoteBase = String(window.CONNECTIONS_CACHE_API || "").replace(/\/+$/, "");
       let profile = null;
+      let failureDelay = 5000;
       if (/^https?:\/\//.test(remoteBase)) {
         try {
           const { data } = await fetchJsonWithRetry(
@@ -3371,14 +3383,22 @@
           const { data } = await fetchJsonWithRetry(
             `https://api.chess.com/pub/player/${encodeURIComponent(key)}`,
             { headers: { "Accept": "application/json" } },
-            { attempts: 2, timeoutMs: 7000 }
+            { attempts: 2, timeoutMs: 7000, stopOnRateLimit: true }
           );
           profile = data || null;
-        } catch {
+        } catch (error) {
+          const retryAfterMs = Number(error?.retryAfterMs || 0);
+          if (error?.status === 429) {
+            failureDelay = Math.max(60000, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
+          }
           profile = null;
         }
       }
-      if (!profile) return existing || null;
+      if (!profile) {
+        failures.set(key, Date.now() + failureDelay);
+        return state.players?.[key] || existing || null;
+      }
+      failures.delete(key);
       const shaped = metaShape({ username: key, ...(profile || {}) });
       state.players = state.players || {};
       state.players[key] = {
@@ -4782,16 +4802,15 @@
     } catch { /* Storage is optional; keep startup available when it is blocked. */ }
     $("#search-range").value = "auto";
     $("#search-target").value = $("#search-target").value || DEFAULT_TARGET;
-    loadPlayerMetadata().then(async () => {
-      if (!ownsStartup()) {
-        loadLeaderboardTargetsWhenVisible();
-        return;
-      }
+    void loadPlayerMetadata();
+    loadLeaderboardTargetsWhenVisible();
+    const restoreSavedView = async () => {
+      if (!ownsStartup()) return;
       const sharedLoaded = await loadSharedChainFromUrl({ isCurrent: ownsStartup });
-      loadLeaderboardTargetsWhenVisible();
       if (!ownsStartup() || sharedLoaded) return;
       if (!await resumeTopPlayersTrace() && ownsStartup()) resumeActiveSearchJob();
-    });
+    };
+    void restoreSavedView();
     // Keep the global leaderboard off the initial critical path.
     if (window.Leaderboard) window.Leaderboard.init();
   });

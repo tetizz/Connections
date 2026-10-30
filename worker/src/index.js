@@ -20,7 +20,7 @@ import { shareArchiveFetch } from './shared-archive-fetch.js';
  */
 
 const CHESS_API = "https://api.chess.com/pub/player/";
-const WORKER_RELEASE = "2026-10-30-connection-experience-v9";
+const WORKER_RELEASE = "2026-10-30-api-latency-v10";
 const SEARCH_POLICY_VERSION = "fresh-search-v2";
 const searchJobKey = (id) => `search:job:${SEARCH_POLICY_VERSION}:${id}`;
 const searchPublicJobKey = (id) => `search:public:${SEARCH_POLICY_VERSION}:${id}`;
@@ -443,8 +443,12 @@ async function handleGames(url, env, metrics = null) {
 async function handleLeaderboard(url, env) {
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 200);
   const category = cleanLeaderboardCategory(url.searchParams.get("category"));
-  const chains = normalizeEntries(await env.GAMES_CACHE.get("leaderboard:entries", "json") || []);
-  const events = normalizeAnalyticsEvents(await env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json") || []);
+  const [rawChains, rawEvents] = await Promise.all([
+    env.GAMES_CACHE.get("leaderboard:entries", "json"),
+    env.GAMES_CACHE.get(ANALYTICS_EVENTS_KEY, "json"),
+  ]);
+  const chains = normalizeEntries(rawChains || []);
+  const events = normalizeAnalyticsEvents(rawEvents || []);
   const entries = leaderboardForCategory(category, chains, events);
   return json({
     category,
@@ -6124,8 +6128,16 @@ function profileShape(data, fallbackUsername) {
   };
 }
 
+async function fetchBasicProfileJSON(env, username, { signal = null, metrics = null } = {}) {
+  const url = `${CHESS_API}${username}`;
+  const envelope = await shareArchiveFetch(env?.GAMES_CACHE, url, async sharedSignal => ({
+    data: await fetchJSON(url, { signal: sharedSignal, metrics, cooldownKV: env?.GAMES_CACHE }),
+  }), { signal, reuseCompleted: false });
+  return envelope.data;
+}
+
 async function fetchProfileDetails(username, env = null, previous = null, metrics = null) {
-  const data = await fetchJSON(`${CHESS_API}${username}`, { metrics, cooldownKV: env?.GAMES_CACHE });
+  const data = await fetchBasicProfileJSON(env, username, { metrics });
   const profile = profileShape(data, username);
   profile.enrichment = {stats:"fresh",recentGames:env?"fresh":"unavailable",retryAfterSeconds:PARTIAL_PROFILE_TTL_SECONDS};
   const failed = async (section,error) => {
@@ -6229,7 +6241,7 @@ async function readOrFetchProfile(env, username, options = {}) {
   const cached = await readCachedProfile(env, username);
   if (cached) return cached;
   try {
-    const data = await fetchJSON(`${CHESS_API}${username}`, { signal: options.signal, cooldownKV: env.GAMES_CACHE });
+    const data = await fetchBasicProfileJSON(env, username, { signal: options.signal });
     const profile = profileShape(data, username);
     await env.GAMES_CACHE.put(`profile:${username}`, JSON.stringify({ ts: Date.now(), profile }), {
       expirationTtl: KV_RETENTION_SECONDS,

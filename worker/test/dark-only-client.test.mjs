@@ -78,7 +78,7 @@ for (const failStorage of ['getItem', 'setItem', 'removeItem']) {
     const f = fixture({ failStorage });
     assert.doesNotThrow(() => f.ready()); await flush();
     assert.equal(f.document.documentElement.dataset.theme, 'dark');
-    assert.deepEqual(f.calls, ['metadata', 'share', 'targets', 'top-resume', 'foreground-resume']);
+    assert.deepEqual(f.calls, ['metadata', 'targets', 'share', 'top-resume', 'foreground-resume']);
     assert.equal(f.element('#search-range').value, 'auto');
     assert.ok(f.element('#search-target').value);
   });

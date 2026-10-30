@@ -4137,3 +4137,8 @@ html[data-theme="light"] .quick-player__avatar { border-color: var(--line-strong
 .connections-experience .command-center__intro { grid-column: 1 / -1; max-width: none; }
 .connections-experience h1 { max-width: 1140px; font-weight: 800; letter-spacing: -.04em; }
 .connections-experience .command-center__intro > p { max-width: none; font-size: clamp(17px, 2vw, 21px); margin-bottom: 30px; }
+
+.search-details { grid-column: 1 / -1; min-width: 0; }
+.search-details > summary { width: fit-content; padding: 9px 0; color: var(--muted); font-size: 12px; cursor: pointer; }
+.search-details[open] > summary { margin-bottom: 8px; }
+.search-details:has(> #search-queue[hidden]):has(> #search-log[hidden]) { display: none; }

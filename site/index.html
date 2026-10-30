@@ -83,6 +83,8 @@
         </form>
 
         <div class="search__status" id="search-status" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+        <details class="search-details">
+          <summary>Search details</summary>
         <div class="search-queue" id="search-queue" hidden>
           <div class="search-queue__head">
             <span>Live search queue</span>
@@ -98,6 +100,7 @@
           <p id="queue-message" role="status" aria-live="polite" aria-atomic="true">Waiting for the backend job to start.</p>
         </div>
         <div class="search__log" id="search-log" hidden></div>
+        </details>
         <div class="cache-info" id="cache-info" hidden></div>
 
         <details class="target-discovery" id="target-discovery">
